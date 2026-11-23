@@ -32,7 +32,11 @@ cargo fmt --check
 
 ## 编码约定
 
+完整规范见 `.agents/specs/rust-style.md`（本地文档，不入库）。以下为必须遵守的摘要：
+
 - 生产路径不使用 `unwrap()` / `expect()`（启动期配置校验除外），错误用 `thiserror` 定义域内错误类型。
+- lint 统一配置在 `Cargo.toml` 的 `[lints]`，禁止在代码里散落 `#[allow]`。
+- async 里禁止阻塞调用（`std::fs`、`std::process`、`thread::sleep`），见规范第 8 节。
 - 所有对外 HTTP 行为打 `tracing` span，字段至少含 `oid`、`bytes`、`duration_ms`。
 - 调用 `bdpan` 一律走统一的封装层，禁止在 handler 里直接 `Command::new`。
 - 新增依赖先进 `.agents/decisions/` 记一条理由，再改 `Cargo.toml`。
