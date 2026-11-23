@@ -1,0 +1,11 @@
+# 本地 agent 工作区：规划、调研、决策记录，不入库
+/.agents/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# 运行期
+/config.toml
+*.log
+/data/
