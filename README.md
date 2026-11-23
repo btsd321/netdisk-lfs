@@ -5,7 +5,7 @@
 客户端是标准 `git-lfs`，不需要百度账号；服务器上的网关把 LFS 协议的读写翻译成 `bdpan` CLI 调用，
 对象最终落在网盘 `/apps/bdpan/lfs/objects/`。
 
-> 状态：**规划阶段**，代码尚未开始。设计与里程碑见 `.agents/`（本地目录，不入库）。
+> 状态：**规划阶段**，代码尚未开始。设计与里程碑见 `.agents/`（本地目录，不入库），仓库约定见 [`docs/`](docs/)。
 
 ## 它解决什么
 
@@ -31,6 +31,11 @@ netdisk-lfs --config /etc/netdisk-lfs/config.toml
 git config -f .lfsconfig lfs.url https://lfs.example.com/lfs/
 git lfs push --all origin main
 ```
+
+## 开发文档
+
+- [docs/git-workflow.md](docs/git-workflow.md)：分支模型、提交规范、worktree 协作与发布流程
+- [docs/rust-style.md](docs/rust-style.md)：Rust 编码规范、lint 配置与门禁
 
 ## 参考项目
 

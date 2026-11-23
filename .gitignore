@@ -1,6 +1,9 @@
 # 本地 agent 工作区：规划、调研、决策记录，不入库
 /.agents/
 
+# 多 agent 并行用的 worktree，不入库
+/.worktrees/
+
 # Rust
 /target/
 **/*.rs.bk
