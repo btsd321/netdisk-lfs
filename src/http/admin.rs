@@ -35,14 +35,16 @@ use std::collections::HashMap;
 use axum::Extension;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::header::{CONTENT_TYPE, HOST, LOCATION, ORIGIN};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::HeaderMap;
+use axum::http::header::{CONTENT_TYPE, LOCATION};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::auth::AuthUser;
+use super::csrf;
 use super::error::ApiError;
 use super::html::{
     escape_html, format_unix_seconds, html_response, page_shell, parse_form, table, wants_html,
@@ -102,8 +104,8 @@ pub(crate) async fn require_admin(request: Request, next: Next) -> Response {
         return forbidden(&request_id, html_page, "需要管理员权限：当前账户不是管理员");
     }
 
-    if is_write_method(request.method())
-        && let Some(reason) = cross_site_reason(&request)
+    if csrf::is_write_method(request.method())
+        && let Some(reason) = csrf::cross_site_reason(request.headers())
     {
         tracing::warn!(
             request_id = %request_id,
@@ -132,49 +134,6 @@ fn forbidden(request_id: &RequestId, html_page: bool, message: &str) -> Response
     } else {
         ApiError::Forbidden(message.to_owned()).into_response_with(request_id)
     }
-}
-
-/// 会改状态的方法；读方法不参与同站校验。
-fn is_write_method(method: &Method) -> bool {
-    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-}
-
-/// 跨站写请求的原因；`None` 表示可以放行。
-///
-/// `Sec-Fetch-Site` 优先于 `Origin`：现代浏览器一定会带前者，它无法被页面脚本
-/// 伪造；`Origin` 是给不带 Fetch Metadata 的客户端的兜底。
-fn cross_site_reason(request: &Request) -> Option<&'static str> {
-    let headers = request.headers();
-    if let Some(site) = headers.get("sec-fetch-site").and_then(|value| value.to_str().ok()) {
-        return match site.trim().to_ascii_lowercase().as_str() {
-            "same-origin" | "same-site" | "none" => None,
-            _ => Some("sec_fetch_site"),
-        };
-    }
-    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok())?;
-    let origin_host = authority_host(origin);
-    let request_host =
-        headers.get(HOST).and_then(|value| value.to_str().ok()).and_then(authority_host);
-    match (origin_host, request_host) {
-        (Some(origin_host), Some(request_host)) if origin_host == request_host => None,
-        _ => Some("origin_mismatch"),
-    }
-}
-
-/// 从 `Origin` / `Host` 值里取主机名：去掉 scheme、路径与端口，IPv6 保留方括号。
-fn authority_host(value: &str) -> Option<String> {
-    let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
-    let authority = rest.split('/').next()?.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        let end = stripped.find(']')?;
-        format!("[{}]", &stripped[..end])
-    } else {
-        authority.rsplit_once(':').map_or(authority, |(host, _)| host).to_owned()
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// JSON 写端点要求 `application/json`（含 `+json`），否则 415。

@@ -35,6 +35,7 @@ mod account;
 mod admin;
 mod auth;
 mod batch;
+mod csrf;
 mod error;
 mod health;
 mod html;
@@ -244,6 +245,10 @@ pub fn router(state: AppState) -> Router {
         .merge(account_router(state.clone()))
         .merge(admin_router(state.clone()))
         .merge(lfs_router(state.clone()))
+        // 全局会话 CSRF 守卫：必须套在 `request_span` 之内（错误页要用它注入的
+        // request id），同时位于路由处理之外——跨站写请求在认证之前就被挡掉，
+        // 不依赖具体端点自己再判一次。
+        .layer(middleware::from_fn(csrf::guard))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
 }
