@@ -9,6 +9,8 @@ mod error;
 mod load;
 mod model;
 
-pub(crate) use env::{EnvSource, NETDISK_LFS_CONFIG};
-pub(crate) use error::ConfigError;
-pub(crate) use model::{Config, RuntimeEnv};
+pub use env::{EnvSource, NETDISK_LFS_CONFIG};
+pub use error::ConfigError;
+pub use model::{
+    AuthConfig, CacheConfig, Config, Role, RuntimeEnv, ServerConfig, StorageConfig, UserConfig,
+};

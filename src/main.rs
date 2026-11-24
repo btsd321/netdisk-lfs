@@ -1,26 +1,21 @@
 //! netdisk-lfs 二进制入口：加载环境与配置、初始化日志，再启动 HTTP 服务。
 //!
 //! 启动期的文件读取（`.env`、TOML）与日志初始化都在 tokio runtime 之前完成，
-//! 避免在 async 上下文里做阻塞 IO（见 docs/rust-style.md 第 8 节）。
+//! 避免在 async 上下文里做阻塞 IO（见 docs/rust-style.md 第 8 节）。配置、路由与
+//! 存储层实现都在 `netdisk_lfs` 库里，本文件只做启动编排。
 
 mod cli;
-mod config;
-mod http;
-mod logging;
-
-#[cfg(test)]
-mod test_support;
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
+use netdisk_lfs::{Config, ConfigError, EnvSource, init_logging, router};
 use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::cli::Cli;
-use crate::config::{Config, ConfigError, EnvSource};
 
 /// `.env` 只放机器相关值；缺失时由真实环境变量提供。
 const DOTENV_FILE: &str = ".env";
@@ -49,7 +44,7 @@ fn bootstrap() -> Result<Config, StartupError> {
     let env = EnvSource::load(Path::new(DOTENV_FILE))?;
     let config_path = cli.config_path(&env);
     let config = Config::load_with(&config_path, &env)?;
-    logging::init(config.runtime_env)?;
+    init_logging(config.runtime_env)?;
 
     let data_dir = config
         .data_dir
@@ -95,7 +90,7 @@ async fn run(config: Config) -> Result<(), StartupError> {
     let bound = listener.local_addr().unwrap_or(addr);
     info!(address = %bound, "开始监听");
 
-    axum::serve(listener, http::router())
+    axum::serve(listener, router())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(StartupError::Serve)?;

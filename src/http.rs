@@ -21,7 +21,7 @@ static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// 构造路由表。
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new().route("/healthz", get(healthz)).layer(middleware::from_fn(request_span))
 }
 

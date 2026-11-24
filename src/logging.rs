@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::config::RuntimeEnv;
 
 /// 按运行环境安装全局 subscriber；重复初始化会返回错误（测试里各自建 subscriber）。
-pub(crate) fn init(runtime_env: RuntimeEnv) -> Result<(), tracing_subscriber::util::TryInitError> {
+pub fn init(runtime_env: RuntimeEnv) -> Result<(), tracing_subscriber::util::TryInitError> {
     // 允许用 RUST_LOG 临时调级；未设置时按环境给默认值。
     let default_filter = match runtime_env {
         RuntimeEnv::Dev => "netdisk_lfs=debug,info",
