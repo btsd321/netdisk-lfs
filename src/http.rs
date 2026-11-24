@@ -36,9 +36,10 @@ mod error;
 mod health;
 mod limits;
 mod metrics;
+mod register;
 mod transfer;
 
-use limits::{LOGIN_WINDOW, SlidingWindowLimiter};
+use limits::{LOGIN_WINDOW, REGISTRATION_WINDOW, SlidingWindowLimiter};
 
 pub use error::ApiError;
 pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
@@ -70,8 +71,9 @@ pub struct AppState {
     /// SQLite 账户库；`None` 表示未接入（嵌入用法/既有测试），此时认证只查
     /// `[auth.users]`，`/account/*` 一律 503。
     accounts: Option<Arc<UserStore>>,
-    /// 登录失败限速（按小写用户名）；进程内状态，重启清零。
+    /// 登录失败限速（按小写用户名）与注册限速（按来源地址）；进程内状态，重启清零。
     login_limits: Arc<SlidingWindowLimiter>,
+    register_limits: Arc<SlidingWindowLimiter>,
 }
 
 impl AppState {
@@ -95,6 +97,7 @@ impl AppState {
             probe: None,
             accounts: None,
             login_limits: Arc::new(SlidingWindowLimiter::new(LOGIN_WINDOW)),
+            register_limits: Arc::new(SlidingWindowLimiter::new(REGISTRATION_WINDOW)),
         }
     }
 
@@ -157,6 +160,11 @@ impl AppState {
     pub(crate) fn login_limits(&self) -> &SlidingWindowLimiter {
         &self.login_limits
     }
+
+    /// 注册限速器；注册端点用它按来源地址计数。
+    pub(crate) fn register_limits(&self) -> &SlidingWindowLimiter {
+        &self.register_limits
+    }
 }
 
 /// 构造路由表。
@@ -168,9 +176,15 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(metrics::metrics))
+        .merge(register_router())
         .merge(lfs_router(state.clone()))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
+}
+
+/// 公开的注册路由：注册页与注册提交都不需要认证（否则没人能注册）。
+fn register_router() -> Router<AppState> {
+    Router::new().route("/account/register", get(register::page).post(register::submit))
 }
 
 /// `/lfs` 子路由：认证统一挂这里，后续分支新增的 PUT/GET/verify 自动继承。
@@ -316,6 +330,31 @@ pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> 
         },
         Err(error) => {
             tracing::error!(request_id = %request_id, error = %error, "序列化 LFS 响应失败");
+            ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
+        },
+    }
+}
+
+/// 账户类端点的 JSON 响应：`application/json`（不是 LFS 媒体类型），带请求 id。
+pub(crate) fn json_with_status<T: Serialize>(
+    status: StatusCode,
+    value: &T,
+    request_id: &RequestId,
+) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(body));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            *response.status_mut() = status;
+            response
+        },
+        Err(error) => {
+            tracing::error!(request_id = %request_id, error = %error, "序列化账户响应失败");
             ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
         },
     }

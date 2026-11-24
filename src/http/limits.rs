@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 /// 登录失败窗口：5 分钟。
 pub(crate) const LOGIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 
+/// 注册窗口：1 小时。
+pub(crate) const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
+
 /// 键数量上限：超过后顺手清理全部过期键，避免被大量随机用户名/伪造 IP 撑大内存。
 const MAX_KEYS: usize = 4096;
 
