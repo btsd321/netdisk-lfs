@@ -79,14 +79,27 @@ impl SlidingWindowLimiter {
     /// [`Self::record`] 的可注入时间版本。
     fn record_at(&self, key: &str, now: Instant) {
         let mut entries = lock(&self.entries);
-        if entries.len() >= MAX_KEYS && !entries.contains_key(key) {
+        if !entries.contains_key(key) && entries.len() >= MAX_KEYS {
             let window = self.window;
             entries.retain(|_, stamps| {
                 prune(stamps, now, window);
                 !stamps.is_empty()
             });
+            if entries.len() >= MAX_KEYS {
+                // 键池满了且都还在窗口内：拒绝记账而不是让 map 无限增长。
+                // 代价是「新出现的 key 这段时间不被限速」——比被大量随机用户名/
+                // 伪造 IP 打爆内存好，而且已有 key 的限速不受影响。
+                tracing::warn!(tracked_keys = entries.len(), "限速键池已满，放弃记录新的限速键");
+                return;
+            }
         }
         entries.entry(key.to_owned()).or_default().push_back(now);
+    }
+
+    /// 当前跟踪的键数量；只给单测验证键池上限用。
+    #[cfg(test)]
+    pub(crate) fn tracked_keys(&self) -> usize {
+        lock(&self.entries).len()
     }
 }
 
@@ -113,7 +126,7 @@ fn lock(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::SlidingWindowLimiter;
+    use super::{MAX_KEYS, SlidingWindowLimiter};
 
     fn limiter() -> SlidingWindowLimiter {
         SlidingWindowLimiter::new(Duration::from_secs(300))
@@ -168,6 +181,25 @@ mod tests {
         limiter.reset("alice");
 
         assert_eq!(limiter.blocked_for("alice", 3), None, "成功登录后计数清零");
+    }
+
+    #[test]
+    fn given_more_keys_than_cap_when_record_then_key_pool_stays_bounded() {
+        let now = Instant::now();
+        let limiter = limiter();
+
+        for index in 0..(MAX_KEYS + 10) {
+            limiter.record_at(&format!("key-{index}"), now);
+        }
+
+        assert!(
+            limiter.tracked_keys() <= MAX_KEYS,
+            "键池不得无限增长，实际 {} 个",
+            limiter.tracked_keys()
+        );
+        // 已在池里的 key 继续正常计数。
+        limiter.record_at("key-0", now);
+        assert!(limiter.blocked_for_at("key-0", 2, now).is_some());
     }
 
     #[test]

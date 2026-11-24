@@ -465,7 +465,9 @@ pub(crate) fn client_key(state: &AppState, parts: &axum::http::request::Parts) -
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
-        return format!("xff:{first}");
+        // 头值长度由客户端决定（最长可到 8 KiB），截断后再当键，避免键池被
+        // 单个请求撑大；IPv6 最长 45 个字符，64 足够容纳真实地址。
+        return format!("xff:{}", first.chars().take(64).collect::<String>());
     }
     // 只取 IP 不取端口：源端口每次连接都变，用它做键等于不限速。
     if let Some(axum::extract::ConnectInfo(addr)) =
