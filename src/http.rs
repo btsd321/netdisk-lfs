@@ -14,14 +14,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::HeaderValue;
+use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Serialize;
-use tracing::{Instrument, field, info_span};
+use tracing::{Instrument, Span, field, info_span};
 
 use crate::config::Config;
 use crate::store::{ObjectStore, Oid};
@@ -29,6 +30,7 @@ use crate::store::{ObjectStore, Oid};
 mod auth;
 mod batch;
 mod error;
+mod transfer;
 
 pub use error::ApiError;
 
@@ -85,9 +87,27 @@ pub fn router(state: AppState) -> Router {
 
 /// `/lfs` 子路由：认证统一挂这里，后续分支新增的 PUT/GET/verify 自动继承。
 fn lfs_router(state: AppState) -> Router<AppState> {
+    // 对象内容端点按配置放开请求体上限；axum 默认 2 MiB，不放开会让 4 GiB 对象
+    // 在框架层就被截断。batch 单独一条路由，继续受默认 2 MiB 保护（它的 body 只是
+    // 一次 JSON 协商，不该有 MB 级体积）。
+    //
+    // 该层只对走提取器（`Bytes`/`Json` 等）的 handler 生效；`transfer::put` 直接消费
+    // `Body` 流，真正的逐块上限由它按同一个 `max_object_bytes` 计数并返回 422，
+    // 两层上限取同一份配置，不会出现「框架放行、业务拒绝」口径不一。
+    let body_limit =
+        DefaultBodyLimit::max(body_limit_bytes(state.config().storage.max_object_bytes));
     Router::new()
         .route("/lfs/objects/batch", post(batch::handle))
+        .route("/lfs/objects/{oid}", put(transfer::put).layer(body_limit))
         .route_layer(middleware::from_fn_with_state(state, auth::require))
+}
+
+/// 把 `max_object_bytes` 换成 axum 请求体上限的 `usize`。
+///
+/// 服务器是 64 位，4 GiB 的默认上限可以精确表示；32 位平台装不下时退化为
+/// `usize::MAX`，此时业务层按 `u64` 计数仍会先于框架拒绝。
+fn body_limit_bytes(max_object_bytes: u64) -> usize {
+    usize::try_from(max_object_bytes).unwrap_or(usize::MAX)
 }
 
 /// `/healthz` 响应体：`{"status":"ok"}`。
@@ -123,6 +143,76 @@ impl RequestId {
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// 传输 span 的 `outcome`：请求成功完成。
+pub(crate) const OUTCOME_OK: &str = "ok";
+/// 4xx：客户端可纠正（oid 非法、哈希不符、超限、未找到、角色不足）。
+pub(crate) const OUTCOME_REJECTED: &str = "rejected";
+/// 5xx：服务端或存储后端失败。
+pub(crate) const OUTCOME_FAILED: &str = "failed";
+/// 客户端中途断开或 future 被取消，没走完正常返回路径。
+pub(crate) const OUTCOME_ABORTED: &str = "aborted";
+
+/// 按 HTTP 状态码归类 `outcome`，避免每个 handler 各写一份 match。
+pub(crate) fn outcome_for_status(status: StatusCode) -> &'static str {
+    if status.is_success() {
+        OUTCOME_OK
+    } else if status.is_client_error() {
+        OUTCOME_REJECTED
+    } else {
+        OUTCOME_FAILED
+    }
+}
+
+/// 传输 handler 的耗时/结果守卫：Drop 时记录 `duration_ms` 与 `outcome`，并补发完成事件。
+///
+/// 为什么用 Drop 而不是在返回路径上直接 record：客户端中途断开时 axum 会丢弃
+/// handler future，返回路径上的代码不会执行；只有 Drop 能兜底，把这次请求记为
+/// `aborted` 并留下已传输字节数，否则日志里会出现「请求开始但永不结束」的黑洞。
+///
+/// 正常结束必须调用 [`Self::finish`]：初始 outcome 是 `aborted`，不覆盖就会被
+/// 误记成中断。
+pub(crate) struct DurationGuard {
+    span: Span,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl DurationGuard {
+    /// 绑定一个已建好的 span；初始 outcome 为 `aborted`。
+    pub(crate) fn new(span: Span) -> Self {
+        Self { span, started: Instant::now(), outcome: OUTCOME_ABORTED }
+    }
+
+    /// span 句柄，供 handler 补记 `oid` 等本层才知道的字段。
+    pub(crate) fn span(&self) -> &Span {
+        &self.span
+    }
+
+    /// 记录当前已处理的字节数；可重复调用，span 里保留最新值。
+    ///
+    /// 边收边记而不是结束时一次性记：future 被丢弃时也要留下已传输的量，
+    /// 否则大对象传到一半断连只会看到 `bytes` 缺失。
+    pub(crate) fn record_bytes(&self, bytes: u64) {
+        self.span.record("bytes", bytes);
+    }
+
+    /// 正常结束：设置 outcome，随后由 Drop 统一落耗时与完成事件。
+    pub(crate) fn finish(mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for DurationGuard {
+    fn drop(&mut self) {
+        let duration_ms = self.started.elapsed().as_secs_f64() * 1_000.0;
+        self.span.record("duration_ms", duration_ms);
+        self.span.record("outcome", self.outcome);
+        // fmt layer 只在事件发生时渲染 span 字段：record 之后必须再发一条事件，
+        // 否则 duration_ms/outcome 不会落盘（B4 已踩过这个坑）。
+        self.span.in_scope(|| tracing::info!(outcome = self.outcome, "传输处理结束"));
     }
 }
 
@@ -205,11 +295,23 @@ fn next_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{object_href, verify_href};
+    use axum::http::StatusCode;
+
+    use super::{
+        OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, object_href, outcome_for_status, verify_href,
+    };
     use crate::store::Oid;
 
     fn oid() -> Oid {
         Oid::parse(&"0123456789abcdef".repeat(4)).expect("合法 oid")
+    }
+
+    #[test]
+    fn given_status_code_when_outcome_for_status_then_classified_by_class() {
+        assert_eq!(outcome_for_status(StatusCode::OK), OUTCOME_OK);
+        assert_eq!(outcome_for_status(StatusCode::NOT_FOUND), OUTCOME_REJECTED);
+        assert_eq!(outcome_for_status(StatusCode::UNPROCESSABLE_ENTITY), OUTCOME_REJECTED);
+        assert_eq!(outcome_for_status(StatusCode::BAD_GATEWAY), OUTCOME_FAILED);
     }
 
     #[test]
