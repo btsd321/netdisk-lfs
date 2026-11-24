@@ -42,10 +42,17 @@ pub struct StorageConfig {
     pub tmp_root: String,
     /// `bdpan` CLI 绝对路径。
     pub bdpan_bin: PathBuf,
-    /// 单对象上限（字节），超限直接拒绝。
+    /// 单对象上限（字节）；`0` 表示不限制（推荐——实际大小只受网盘与本地磁盘约束）。
+    ///
+    /// 非 0 时超限在 batch 与 PUT 两处都直接拒绝（422），不做分片。
     pub max_object_bytes: u64,
     /// 同时存在的 `bdpan` 子进程上限。
     pub max_bdpan_procs: usize,
+    /// 单次 `bdpan` 命令超时（秒）；`0` 表示不设超时。
+    ///
+    /// 大对象上传耗时随上行带宽线性增长（实测约 5 MiB/s：50 GiB ≈ 3 小时），
+    /// 超时是「卡死保护」而不是业务上限，默认给到 6 小时。
+    pub bdpan_timeout_secs: u64,
 }
 
 /// `[cache]` 段。

@@ -198,6 +198,7 @@ fn test_config(data_dir: &Path, cache_max_bytes: u64) -> Config {
             bdpan_bin: "/bin/true".into(),
             max_object_bytes: MAX_OBJECT_BYTES,
             max_bdpan_procs: 1,
+            bdpan_timeout_secs: 21_600,
         },
         cache: CacheConfig { dir: data_dir.join("cache"), max_bytes: cache_max_bytes },
         auth: AuthConfig { users: auth_users },

@@ -138,8 +138,13 @@ fn lfs_router(state: AppState) -> Router<AppState> {
     // 该层只对走提取器（`Bytes`/`Json` 等）的 handler 生效；`transfer::put` 直接消费
     // `Body` 流，真正的逐块上限由它按同一个 `max_object_bytes` 计数并返回 422，
     // 两层上限取同一份配置，不会出现「框架放行、业务拒绝」口径不一。
-    let body_limit =
-        DefaultBodyLimit::max(body_limit_bytes(state.config().storage.max_object_bytes));
+    let max_object_bytes = state.config().storage.max_object_bytes;
+    // `0` = 不限制：彻底关掉框架层限制（业务层也不再计数拒绝）。
+    let body_limit = if max_object_bytes == 0 {
+        DefaultBodyLimit::disable()
+    } else {
+        DefaultBodyLimit::max(body_limit_bytes(max_object_bytes))
+    };
     Router::new()
         .route("/lfs/objects/batch", post(batch::handle))
         .route("/lfs/objects/{oid}", put(transfer::put).get(transfer::get).layer(body_limit))
@@ -149,8 +154,9 @@ fn lfs_router(state: AppState) -> Router<AppState> {
 
 /// 把 `max_object_bytes` 换成 axum 请求体上限的 `usize`。
 ///
-/// 服务器是 64 位，4 GiB 的默认上限可以精确表示；32 位平台装不下时退化为
-/// `usize::MAX`，此时业务层按 `u64` 计数仍会先于框架拒绝。
+/// 调用方已把 `0`（不限制）路由到 [`DefaultBodyLimit::disable`]；64 位平台可精确
+/// 表示到 `u64::MAX` 的一半，32 位平台装不下时退化为 `usize::MAX`，业务层按 `u64`
+/// 计数仍会先于框架拒绝。
 fn body_limit_bytes(max_object_bytes: u64) -> usize {
     usize::try_from(max_object_bytes).unwrap_or(usize::MAX)
 }
@@ -394,6 +400,7 @@ mod tests {
                 bdpan_bin: "/bin/true".into(),
                 max_object_bytes: 1024,
                 max_bdpan_procs: 1,
+                bdpan_timeout_secs: 21_600,
             },
             cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
             auth: AuthConfig::default(),

@@ -21,12 +21,13 @@ fn given_shipped_example_when_loaded_then_valid_and_deploy_shaped() {
         .expect("config.toml.example 必须能被真实配置解析器加载");
 
     assert_eq!(config.server.listen.to_string(), "127.0.0.1:9001", "只监听回环");
-    assert_eq!(config.server.public_base, "", "反代部署用相对 href");
+    assert_eq!(config.server.public_base, "", "留空时按请求 Host/协议推导绝对 href");
     assert_eq!(config.storage.objects_root, "/apps/bdpan/lfs");
     assert_eq!(config.storage.tmp_root, "/apps/bdpan/lfs/tmp");
     assert_eq!(config.storage.bdpan_bin, Path::new("/home/lixinlong/.local/bin/bdpan"));
-    assert_eq!(config.storage.max_object_bytes, 4_294_967_296, "单对象上限 4 GiB");
+    assert_eq!(config.storage.max_object_bytes, 0, "0 = 不限制单对象大小");
     assert_eq!(config.storage.max_bdpan_procs, 4);
+    assert_eq!(config.storage.bdpan_timeout_secs, 21_600, "bdpan 超时默认 6 小时");
     assert_eq!(config.cache.dir, Path::new("/var/lib/netdisk-lfs/cache"));
     assert_eq!(config.cache.max_bytes, 214_748_364_800, "缓存预算 200 GiB");
     assert_eq!(config.auth.users.len(), 2, "示例给一个读写、一个只读账号");

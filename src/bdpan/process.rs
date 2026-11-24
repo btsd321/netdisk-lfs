@@ -208,8 +208,8 @@ impl Default for RetryPolicy {
 pub struct BdpanClientConfig {
     /// `bdpan` 可执行文件路径。
     pub bin: PathBuf,
-    /// 单次命令超时。
-    pub timeout: Duration,
+    /// 单次命令超时；`None` 表示不设超时（大对象上传可能数小时）。
+    pub timeout: Option<Duration>,
     /// 重试策略。
     pub retry: RetryPolicy,
     /// 同时存在的 `bdpan` 子进程上限（信号量许可数）。
@@ -224,31 +224,36 @@ pub struct BdpanClientConfig {
 impl BdpanClientConfig {
     /// 单次命令的默认超时：600s。
     ///
-    /// 4 GiB 对象按实测 4.5 MiB/s 的上行需要约 15 分钟，600s 只够 2.7 GiB——所以
-    /// 默认值不是「够用」而是「先有一个明确的界」，M4 大对象实测后按需调大。
+    /// 这是「卡死保护」的保守缺省；生产由 `[storage] bdpan_timeout_secs` 覆盖
+    /// （缺省 6 小时，`0` 表示不设超时），大对象上传按上行带宽可能需要数小时。
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// 用默认超时、默认重试与 4 个并发许可构造。
     pub fn new(bin: impl Into<PathBuf>) -> Self {
         Self {
             bin: bin.into(),
-            timeout: Self::DEFAULT_TIMEOUT,
+            timeout: Some(Self::DEFAULT_TIMEOUT),
             retry: RetryPolicy::default(),
             max_procs: 4,
             env: Vec::new(),
         }
     }
 
-    /// 从 `[storage]` 配置构造：可执行路径与并发许可数取配置值；
-    /// 超时与重试策略用默认值（CLI 侧暂无对应配置项，需要调整时用
-    /// [`with_timeout`](Self::with_timeout) / [`BdpanClientConfig::with_retry`] 覆盖）。
+    /// 从 `[storage]` 配置构造：可执行路径、并发许可数与命令超时都取配置值。
+    ///
+    /// `bdpan_timeout_secs = 0` 映射为「不设超时」；重试策略仍用默认值
+    /// （需要调整时用 [`BdpanClientConfig::with_retry`] 覆盖）。
     pub fn from_storage(storage: &StorageConfig) -> Self {
-        Self { max_procs: storage.max_bdpan_procs, ..Self::new(storage.bdpan_bin.clone()) }
+        let timeout = match storage.bdpan_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
+        Self { max_procs: storage.max_bdpan_procs, timeout, ..Self::new(storage.bdpan_bin.clone()) }
     }
 
     /// 覆盖单次命令超时。
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = Some(timeout);
         self
     }
 
@@ -301,7 +306,7 @@ struct ProcessOutput {
 #[derive(Debug)]
 pub struct BdpanClient {
     bin: PathBuf,
-    timeout: Duration,
+    timeout: Option<Duration>,
     retry: RetryPolicy,
     env: Vec<(OsString, OsString)>,
     permits: Arc<Semaphore>,
@@ -559,12 +564,24 @@ impl BdpanClient {
         for (key, value) in &self.env {
             child.env(key, value);
         }
-        let output = match tokio::time::timeout(self.timeout, child.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(source)) => {
-                return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+        let output = match self.timeout {
+            Some(limit) => match tokio::time::timeout(limit, child.output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(source)) => {
+                    return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+                },
+                Err(_elapsed) => {
+                    return Err(BdpanError::Timeout { command, timeout: limit });
+                },
             },
-            Err(_elapsed) => return Err(BdpanError::Timeout { command, timeout: self.timeout }),
+            // 不设超时：大对象上传期间只受 Ctrl+C / 进程被杀影响，
+            // `kill_on_drop` 仍保证 future 被取消时子进程一起结束。
+            None => match child.output().await {
+                Ok(output) => output,
+                Err(source) => {
+                    return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+                },
+            },
         };
         Ok(ProcessOutput {
             code: output.status.code(),

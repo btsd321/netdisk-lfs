@@ -103,6 +103,7 @@ fn config_with_users(users: &[(&str, Role)]) -> Config {
             bdpan_bin: "/bin/true".into(),
             max_object_bytes: MAX_OBJECT_BYTES,
             max_bdpan_procs: 1,
+            bdpan_timeout_secs: 21_600,
         },
         cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
         auth: AuthConfig { users: auth_users },
@@ -437,6 +438,23 @@ async fn given_forwarded_proto_when_batch_then_href_uses_https() {
         parsed["objects"][0]["actions"]["upload"]["href"].as_str(),
         Some(format!("https://{TEST_HOST}/lfs/objects/{oid}").as_str())
     );
+}
+
+#[tokio::test]
+async fn given_unlimited_max_bytes_when_batch_declares_huge_object_then_no_422() {
+    // max_object_bytes = 0：不限制单对象大小，50 GiB 的声明也不应被对象级 422 拒绝。
+    let mut config = config_with_users(USERS);
+    config.storage.max_object_bytes = 0;
+    let app = TestApp::from_config(config);
+    let oid = missing_oid('9');
+    let body = batch_body("upload", &[object_json(&oid, 50 * 1024 * 1024 * 1024)]);
+    let auth = basic_header("alice", PASSWORD);
+
+    let (status, _, parsed) = app.send_json(batch_request(Some(&auth), &body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(parsed["objects"][0].get("error").is_none(), "不限制时不应有对象级错误");
+    assert!(parsed["objects"][0]["actions"]["upload"]["href"].is_string());
 }
 
 #[tokio::test]
