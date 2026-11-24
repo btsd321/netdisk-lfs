@@ -154,6 +154,8 @@ fn test_config(root: &Path, users: &[(&str, Role)]) -> Config {
             bdpan_bin: fixture_bin(),
             max_object_bytes: MAX_OBJECT_BYTES,
             max_bdpan_procs: 1,
+            bdpan_timeout_secs: 300,
+            bdpan_min_throughput_bytes_per_sec: 102_400,
         },
         cache: CacheConfig { dir: root.join("cache"), max_bytes: CACHE_MAX_BYTES },
         auth: AuthConfig { users: auth_users },

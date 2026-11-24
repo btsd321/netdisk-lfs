@@ -157,7 +157,8 @@ async fn receive(
         };
         received = received.saturating_add(chunk.len() as u64);
         // 超限即中止：不继续落盘，也不把这次请求当作完整对象。临时文件由守卫删除。
-        if received > max_object_bytes {
+        // `max_object_bytes = 0` 表示不限制，只受磁盘与网盘约束。
+        if max_object_bytes > 0 && received > max_object_bytes {
             return Err(ApiError::Unprocessable(format!(
                 "对象超过单文件上限 {max_object_bytes} 字节"
             )));

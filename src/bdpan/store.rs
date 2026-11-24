@@ -189,7 +189,7 @@ impl BdpanStore {
 
         let remote = self.remote_object(oid);
         let outcome = async {
-            self.client.download(&remote, dest).await.map_err(backend)?;
+            self.client.download(&remote, dest, meta.size).await.map_err(backend)?;
             // bdpan 已知缺陷：进度 100% 后可能报 403/20013 却仍提示成功。判定标准是哈希，
             // 不是退出码，也不是 CLI 的 JSON——这里是坏对象进入缓存的唯一防线。
             let digest = hash_file(dest).await.map_err(|err| StoreError::io(dest, err))?;

@@ -188,7 +188,7 @@ async fn negotiate(
     let store = state.store();
     let mut probes = JoinSet::new();
     for (index, (oid, size)) in parsed.iter().enumerate() {
-        if *size > max_object_bytes {
+        if max_object_bytes > 0 && *size > max_object_bytes {
             continue;
         }
         let store = Arc::clone(&store);
@@ -206,7 +206,7 @@ async fn negotiate(
     let mut objects = Vec::with_capacity(parsed.len());
     for (index, (oid, size)) in parsed.iter().enumerate() {
         // 超限是单对象问题，不影响同批次其它对象：按 api.md 放 objects[].error(422)。
-        if *size > max_object_bytes {
+        if max_object_bytes > 0 && *size > max_object_bytes {
             objects.push(ObjectResponse::with_error(
                 oid,
                 *size,

@@ -208,8 +208,10 @@ impl Default for RetryPolicy {
 pub struct BdpanClientConfig {
     /// `bdpan` 可执行文件路径。
     pub bin: PathBuf,
-    /// 单次命令超时。
-    pub timeout: Duration,
+    /// 非传输命令的固定超时，也是传输命令的启动宽限；`None` 表示不设超时。
+    pub timeout: Option<Duration>,
+    /// 传输类命令的最低吞吐（字节/秒）；`0` = 不按文件大小放大超时。
+    pub min_throughput_bytes_per_sec: u64,
     /// 重试策略。
     pub retry: RetryPolicy,
     /// 同时存在的 `bdpan` 子进程上限（信号量许可数）。
@@ -222,33 +224,46 @@ pub struct BdpanClientConfig {
 }
 
 impl BdpanClientConfig {
-    /// 单次命令的默认超时：600s。
+    /// 非传输命令的默认超时 / 传输的默认启动宽限：300s。
     ///
-    /// 4 GiB 对象按实测 4.5 MiB/s 的上行需要约 15 分钟，600s 只够 2.7 GiB——所以
-    /// 默认值不是「够用」而是「先有一个明确的界」，M4 大对象实测后按需调大。
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+    /// 传输命令的最终超时按文件大小与最低吞吐放大，固定值只需覆盖启动与握手。
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// 传输命令默认的最低吞吐：100 KiB/s。
+    pub const DEFAULT_MIN_THROUGHPUT: u64 = 102_400;
 
     /// 用默认超时、默认重试与 4 个并发许可构造。
     pub fn new(bin: impl Into<PathBuf>) -> Self {
         Self {
             bin: bin.into(),
-            timeout: Self::DEFAULT_TIMEOUT,
+            timeout: Some(Self::DEFAULT_TIMEOUT),
+            min_throughput_bytes_per_sec: Self::DEFAULT_MIN_THROUGHPUT,
             retry: RetryPolicy::default(),
             max_procs: 4,
             env: Vec::new(),
         }
     }
 
-    /// 从 `[storage]` 配置构造：可执行路径与并发许可数取配置值；
-    /// 超时与重试策略用默认值（CLI 侧暂无对应配置项，需要调整时用
-    /// [`with_timeout`](Self::with_timeout) / [`BdpanClientConfig::with_retry`] 覆盖）。
+    /// 从 `[storage]` 配置构造：可执行路径、并发许可数、命令超时与最低吞吐都取配置值。
+    ///
+    /// `bdpan_timeout_secs = 0` 映射为「不设超时」；重试策略仍用默认值
+    /// （需要调整时用 [`BdpanClientConfig::with_retry`] 覆盖）。
     pub fn from_storage(storage: &StorageConfig) -> Self {
-        Self { max_procs: storage.max_bdpan_procs, ..Self::new(storage.bdpan_bin.clone()) }
+        let timeout = match storage.bdpan_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
+        Self {
+            max_procs: storage.max_bdpan_procs,
+            timeout,
+            min_throughput_bytes_per_sec: storage.bdpan_min_throughput_bytes_per_sec,
+            ..Self::new(storage.bdpan_bin.clone())
+        }
     }
 
     /// 覆盖单次命令超时。
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = Some(timeout);
         self
     }
 
@@ -301,7 +316,8 @@ struct ProcessOutput {
 #[derive(Debug)]
 pub struct BdpanClient {
     bin: PathBuf,
-    timeout: Duration,
+    timeout: Option<Duration>,
+    min_throughput_bytes_per_sec: u64,
     retry: RetryPolicy,
     env: Vec<(OsString, OsString)>,
     permits: Arc<Semaphore>,
@@ -313,6 +329,7 @@ impl BdpanClient {
         Self {
             bin: config.bin,
             timeout: config.timeout,
+            min_throughput_bytes_per_sec: config.min_throughput_bytes_per_sec,
             retry: config.retry,
             env: config.env,
             // 0 个许可会让第一个调用永久挂起，比「少限流」严重得多，这里静默抬到 1；
@@ -324,6 +341,23 @@ impl BdpanClient {
     /// 从 `[storage]` 配置构造。
     pub fn from_storage(storage: &StorageConfig) -> Self {
         Self::new(BdpanClientConfig::from_storage(storage))
+    }
+
+    /// 按调用规模推导超时：`启动宽限 + 字节数 / 最低吞吐`。
+    ///
+    /// - 非传输命令（`bytes = None`）或未配置吞吐（`0`）：返回固定超时；
+    /// - 传输命令：固定超时作宽限，再按文件大小放大——4.5 GiB @ 100 KiB/s 约 13 小时，
+    ///   只有平均速度低于下限才会触发，正常传输（实测 ~5 MiB/s）不会误杀；
+    /// - 固定超时为 `None`（`bdpan_timeout_secs = 0`）时，若吞吐仍配置则只按大小计算，
+    ///   否则完全不设超时。
+    pub fn timeout_for(&self, bytes: Option<u64>) -> Option<Duration> {
+        match (self.min_throughput_bytes_per_sec, bytes) {
+            (0, _) | (_, None) => self.timeout,
+            (throughput, Some(size)) => {
+                let transfer = Duration::from_secs(size.div_ceil(throughput));
+                Some(self.timeout.unwrap_or(Duration::ZERO) + transfer)
+            },
+        }
     }
 
     /// 列目录；目录不存在时返回 `Ok(None)`。
@@ -419,13 +453,19 @@ impl BdpanClient {
     ///
     /// CLI 的进度条与 JSON 结果混流，且出现过「报成功但内容截断」的静默失败，所以
     /// 返回值只代表「CLI 认为成功」；内容是否完整必须由调用方用 sha256 校验。
-    pub async fn download(&self, remote: &str, local: &Path) -> Result<(), BdpanError> {
+    pub async fn download(
+        &self,
+        remote: &str,
+        local: &Path,
+        expected_bytes: u64,
+    ) -> Result<(), BdpanError> {
         let local_arg = utf8_path("download", local)?;
         let args = vec![remote.to_owned(), local_arg.to_owned()];
+        // 期望大小用于按吞吐下限推导超时：大文件下载不该被固定超时误杀。
         self.invoke(
             "download",
             &args,
-            CallSite { remote: Some(remote), local: Some(local), bytes: None },
+            CallSite { remote: Some(remote), local: Some(local), bytes: Some(expected_bytes) },
         )
         .await
         .map(|_| ())
@@ -493,7 +533,7 @@ impl BdpanClient {
             loop {
                 span_for_record.record("attempt", u64::from(attempt + 1));
                 let started = Instant::now();
-                let outcome = self.call_once(command, args).await;
+                let outcome = self.call_once(command, args, site.bytes).await;
                 let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 tracing::debug!(
                     cmd = command,
@@ -528,22 +568,27 @@ impl BdpanClient {
         &self,
         command: &'static str,
         args: &[String],
+        bytes: Option<u64>,
     ) -> Result<serde_json::Value, BdpanError> {
         let permit = self.permits.acquire().await.map_err(|_| BdpanError::Unexpected {
             command,
             detail: "并发信号量已关闭".to_owned(),
         })?;
-        let output = self.spawn(command, args).await;
+        let output = self.spawn(command, args, bytes).await;
         // 进程已结束（或已被杀），先还许可再解析，别让纯 CPU 的 JSON 解析占着许可。
         drop(permit);
         interpret(command, &output?)
     }
 
     /// 起子进程并等它结束；超时则杀进程并报 [`BdpanError::Timeout`]。
+    ///
+    /// `bytes` 是本次传输的期望字节数：传输命令按「启动宽限 + 大小/最低吞吐」放大
+    /// 超时，非传输命令用固定超时（见 [`Self::timeout_for`]）。
     async fn spawn(
         &self,
         command: &'static str,
         args: &[String],
+        bytes: Option<u64>,
     ) -> Result<ProcessOutput, BdpanError> {
         let mut child = Command::new(&self.bin);
         child
@@ -559,12 +604,25 @@ impl BdpanClient {
         for (key, value) in &self.env {
             child.env(key, value);
         }
-        let output = match tokio::time::timeout(self.timeout, child.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(source)) => {
-                return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+        let timeout = self.timeout_for(bytes);
+        let output = match timeout {
+            Some(limit) => match tokio::time::timeout(limit, child.output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(source)) => {
+                    return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+                },
+                Err(_elapsed) => {
+                    return Err(BdpanError::Timeout { command, timeout: limit });
+                },
             },
-            Err(_elapsed) => return Err(BdpanError::Timeout { command, timeout: self.timeout }),
+            // 不设超时：大对象上传期间只受 Ctrl+C / 进程被杀影响，
+            // `kill_on_drop` 仍保证 future 被取消时子进程一起结束。
+            None => match child.output().await {
+                Ok(output) => output,
+                Err(source) => {
+                    return Err(BdpanError::Spawn { bin: self.bin.clone(), command, source });
+                },
+            },
         };
         Ok(ProcessOutput {
             code: output.status.code(),
@@ -645,7 +703,10 @@ fn utf8_path<'a>(command: &'static str, path: &'a Path) -> Result<&'a str, Bdpan
 
 #[cfg(test)]
 mod tests {
-    use super::{BdpanError, ProcessOutput, RetryPolicy, classify, interpret, whoami_flag};
+    use super::{
+        BdpanClient, BdpanClientConfig, BdpanError, ProcessOutput, RetryPolicy, classify,
+        interpret, whoami_flag,
+    };
 
     use std::path::PathBuf;
     use std::time::Duration;
@@ -668,6 +729,44 @@ mod tests {
             let err = whoami_flag(&broken, "authenticated").expect_err("非布尔应报形状错误");
             assert!(matches!(err, BdpanError::Unexpected { .. }), "实际错误：{err}");
         }
+    }
+
+    #[test]
+    fn given_size_and_throughput_when_timeout_for_then_scales_by_floor() {
+        let config = BdpanClientConfig::new("/bin/true").with_timeout(Duration::from_secs(300));
+        // 吞吐在构造后按需覆盖（生产由配置注入）。
+        let client = BdpanClient::new(config);
+        // 默认 100 KiB/s：10 MiB → 300 + ceil(102.4)=103s；非传输命令用固定 300s。
+        assert_eq!(
+            client.timeout_for(Some(10 * 1024 * 1024)),
+            Some(Duration::from_secs(300 + 103))
+        );
+        assert_eq!(client.timeout_for(None), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn given_zero_throughput_when_timeout_for_then_fixed_timeout() {
+        let mut config = BdpanClientConfig::new("/bin/true");
+        config.min_throughput_bytes_per_sec = 0;
+        let client = BdpanClient::new(config);
+
+        // 关闭按大小计算后，大文件也用固定超时。
+        assert_eq!(
+            client.timeout_for(Some(50 * 1024 * 1024 * 1024)),
+            Some(BdpanClientConfig::DEFAULT_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn given_no_base_timeout_but_throughput_when_timeout_for_then_size_only() {
+        let mut config = BdpanClientConfig::new("/bin/true");
+        config.timeout = None;
+        let client = BdpanClient::new(config);
+
+        // bdpan_timeout_secs = 0 且配置了吞吐：只按大小/吞吐计算。
+        assert_eq!(client.timeout_for(Some(102_400)), Some(Duration::from_secs(1)));
+        // 完全关闭（传输类仍受大小时限，非传输不限）。
+        assert_eq!(client.timeout_for(None), None);
     }
 
     #[test]
