@@ -10,18 +10,20 @@
 //! 但附带 `verify` 让客户端补一次校验。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, State};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use super::error::ApiError;
 use super::{AppState, RequestId, json_response};
 use crate::config::Role;
-use crate::store::Oid;
+use crate::store::{ObjectMeta, Oid, StoreError};
 
 /// batch 单次最多对象数，见 `specs/storage.md`「并发与限流」。
 const MAX_BATCH_OBJECTS: usize = 100;
@@ -107,10 +109,14 @@ pub(crate) async fn handle(
     );
     let outcome = negotiate(&state, role, &request_id, &body).instrument(span.clone()).await;
     span.record("duration_ms", started.elapsed().as_secs_f64() * 1_000.0);
-    match outcome {
+    let response = match outcome {
         Ok(response) => json_response(&response, &request_id),
         Err(error) => error.into_response_with(&request_id),
-    }
+    };
+    // 完成事件必须在 span 内发出：fmt layer 只在事件发生时渲染 span 字段，
+    // 若 record 之后再无事件，`duration_ms` 就永远不会落盘（与 request_span 一致）。
+    span.in_scope(|| tracing::info!(status = response.status().as_u16(), "batch 处理完成"));
+    response
 }
 
 /// 解析并协商整批对象；返回体只表达成功路径，整体失败用 [`ApiError`]。
@@ -168,39 +174,60 @@ async fn negotiate(
     }
 
     let max_object_bytes = state.config().storage.max_object_bytes;
+
+    // 并发探测：每个 exists 在 BdpanStore 上是一次 bdpan 子进程 + 网络往返，
+    // 100 个对象串行会让 push/pull 的首字节延迟叠加到分钟级。并发度由 BdpanClient
+    // 内部的信号量（max_bdpan_procs）兜底，这里不再另造限流器；结果按索引回填，
+    // 保证响应顺序与请求一致。超限对象不探测，直接给对象级 422。
+    let store = state.store();
+    let mut probes = JoinSet::new();
+    for (index, (oid, size)) in parsed.iter().enumerate() {
+        if *size > max_object_bytes {
+            continue;
+        }
+        let store = Arc::clone(&store);
+        let oid = oid.clone();
+        probes.spawn(async move { (index, store.exists(&oid).await) });
+    }
+    let mut probed: Vec<Option<Result<Option<ObjectMeta>, StoreError>>> =
+        parsed.iter().map(|_| None).collect();
+    while let Some(joined) = probes.join_next().await {
+        let (index, result) =
+            joined.map_err(|error| ApiError::Internal(format!("探测任务异常：{error}")))?;
+        probed[index] = Some(result);
+    }
+
     let mut objects = Vec::with_capacity(parsed.len());
-    for (oid, size) in parsed {
+    for (index, (oid, size)) in parsed.iter().enumerate() {
         // 超限是单对象问题，不影响同批次其它对象：按 api.md 放 objects[].error(422)。
-        if size > max_object_bytes {
+        if *size > max_object_bytes {
             objects.push(ObjectResponse::with_error(
-                &oid,
-                size,
+                oid,
+                *size,
                 422,
                 format!("对象 {oid} 大小 {size} 字节超过单文件上限 {max_object_bytes} 字节"),
             ));
             continue;
         }
 
-        let existing = state.store().exists(&oid).await?;
-        let response = match operation {
-            Operation::Download => match existing {
-                Some(_) => ObjectResponse::for_download(&oid, size),
-                None => ObjectResponse::with_error(&oid, size, 404, "object not found".to_owned()),
+        let existing = match probed[index].take() {
+            Some(result) => result.map_err(ApiError::from)?,
+            // 每个非超限对象都排进了探测任务，缺结果说明内部状态与探测计划不一致。
+            None => return Err(ApiError::Internal("探测结果缺失".to_owned())),
+        };
+        // 存储层返回的对象大小是服务端权威值：客户端声明的 size 可能来自过期的
+        // pointer 文件，不能原样回显——客户端用它当下载预期大小。
+        let response = match (operation, existing) {
+            (Operation::Download, Some(meta)) => ObjectResponse::for_download(oid, meta.size),
+            (Operation::Download, None) => {
+                ObjectResponse::with_error(oid, *size, 404, "object not found".to_owned())
             },
-            Operation::Upload => match existing {
-                Some(_) => ObjectResponse::for_existing_upload(&oid, size),
-                None => ObjectResponse::for_upload(&oid, size),
-            },
+            (Operation::Upload, Some(meta)) => ObjectResponse::for_existing_upload(oid, meta.size),
+            (Operation::Upload, None) => ObjectResponse::for_upload(oid, *size),
         };
         objects.push(response);
     }
 
-    tracing::debug!(
-        request_id = %request_id,
-        operation = %request.operation,
-        objects = objects.len(),
-        "batch 协商完成"
-    );
     Ok(BatchResponse { transfer: TRANSFER_BASIC, objects })
 }
 

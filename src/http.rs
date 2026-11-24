@@ -57,9 +57,12 @@ impl AppState {
         Self { store, config }
     }
 
-    /// 对象存储后端。
-    pub fn store(&self) -> &dyn ObjectStore {
-        self.store.as_ref()
+    /// 对象存储后端句柄。
+    ///
+    /// 返回 `Arc` 克隆而非借用：batch 需要对多个 oid 并发探测，探测任务必须
+    /// 拥有自己的句柄才能 move 进 `JoinSet`。
+    pub fn store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
     }
 
     /// 运行期配置。

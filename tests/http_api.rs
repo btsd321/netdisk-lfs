@@ -288,6 +288,21 @@ async fn given_readonly_user_when_download_batch_then_ok() {
 }
 
 #[tokio::test]
+async fn given_stale_declared_size_when_download_batch_then_response_uses_stored_size() {
+    let app = TestApp::new(USERS);
+    let contents = b"authoritative size";
+    let oid = app.put_object(contents).await;
+    // 客户端声明一个过期/错误的大小：响应必须回存储层的权威值，而不是原样回显。
+    let body = batch_body("download", &[object_json(&oid, 999_999)]);
+    let auth = basic_header("alice", PASSWORD);
+
+    let (status, _, parsed) = app.send_json(batch_request(Some(&auth), &body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["objects"][0]["size"].as_u64(), Some(contents.len() as u64));
+}
+
+#[tokio::test]
 async fn given_existing_object_when_download_batch_then_relative_href_and_size() {
     let app = TestApp::new(USERS);
     let contents = b"download me";

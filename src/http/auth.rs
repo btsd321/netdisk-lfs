@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::ApiError;
 use super::{AppState, RequestId};
-use crate::config::{Role, UserConfig};
+use crate::config::Role;
 
 /// 所有 401 共用的文案：不区分「没带凭据」「用户不存在」「口令错误」。
 const AUTH_FAILURE_MESSAGE: &str = "需要 HTTP Basic 认证";
@@ -92,14 +92,24 @@ pub(crate) async fn require(
     }
 }
 
+/// 未知用户也照常走一遍摘要与常量时间比较用的占位摘要（64 个 0）。
+///
+/// 若未知用户提前返回，攻击者可凭响应时间差枚举用户名是否存在（CWE-208）；
+/// 用占位摘要让两条路径成本一致。真实配置里不会出现全 0 摘要的可用口令。
+const DUMMY_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// 校验 `Authorization` 头，返回调用方角色。
 fn authenticate(state: &AppState, header: Option<&HeaderValue>) -> Result<Role, AuthFailure> {
     let (username, password) = parse_basic(header)?;
-    let user = state.config().auth.users.get(&username).ok_or(AuthFailure::UnknownUser)?;
-    if !credentials_match(user, &password) {
-        return Err(AuthFailure::WrongPassword);
+    let user = state.config().auth.users.get(&username);
+    // 未知用户名也付一次摘要+比较的开销，避免计时差泄漏用户名是否存在。
+    let expected = user.map_or(DUMMY_DIGEST, |user| user.password_sha256.as_str());
+    let matched = password_matches(&password, expected);
+    match user {
+        Some(user) if matched => Ok(user.role),
+        Some(_) => Err(AuthFailure::WrongPassword),
+        None => Err(AuthFailure::UnknownUser),
     }
-    Ok(user.role)
 }
 
 /// 解析 `Basic <base64>`：只切第一个 `:`，口令本身允许含冒号。
@@ -120,14 +130,13 @@ fn parse_basic(header: Option<&HeaderValue>) -> Result<(String, Vec<u8>), AuthFa
     Ok((username, decoded[separator + 1..].to_vec()))
 }
 
-/// 对明文口令做 sha256，与配置里的十六进制摘要做常量时间比较。
+/// 对明文口令做 sha256，与期望的十六进制摘要做常量时间比较。
 ///
 /// 允许配置里的摘要是大写十六进制（统一转小写后再比），也允许摘要长度不合法——
 /// 那种情况比较必然失败，等价于该用户不可登录，不会误放行。
-fn credentials_match(user: &UserConfig, password: &[u8]) -> bool {
+fn password_matches(password: &[u8], expected_hex: &str) -> bool {
     let actual = hex::encode(Sha256::digest(password));
-    let configured = user.password_sha256.to_ascii_lowercase();
-    constant_time_eq(actual.as_bytes(), configured.as_bytes())
+    constant_time_eq(actual.as_bytes(), expected_hex.to_ascii_lowercase().as_bytes())
 }
 
 /// 常量时间字节比较：逐字节异或累加，不在第一个不同字节处提前返回。
@@ -151,18 +160,13 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    use super::{AuthFailure, constant_time_eq, credentials_match, parse_basic};
-    use crate::config::{Role, UserConfig};
+    use super::{AuthFailure, constant_time_eq, parse_basic, password_matches};
     use crate::store::Sha256Writer;
 
     fn digest(password: &str) -> String {
         let mut writer = Sha256Writer::new();
         writer.update(password.as_bytes());
         writer.finish()
-    }
-
-    fn user(password_sha256: &str) -> UserConfig {
-        UserConfig { password_sha256: password_sha256.to_owned(), role: Role::Readwrite }
     }
 
     fn header(payload: &str) -> HeaderValue {
@@ -188,31 +192,25 @@ mod tests {
     }
 
     #[test]
-    fn given_matching_password_when_credentials_match_then_true() {
-        let configured = user(&digest("s3cret"));
-
-        assert!(credentials_match(&configured, b"s3cret"));
+    fn given_matching_password_when_password_matches_then_true() {
+        assert!(password_matches(b"s3cret", &digest("s3cret")));
     }
 
     #[test]
-    fn given_wrong_password_when_credentials_match_then_false() {
-        let configured = user(&digest("s3cret"));
-
-        assert!(!credentials_match(&configured, b"wrong"));
+    fn given_wrong_password_when_password_matches_then_false() {
+        assert!(!password_matches(b"wrong", &digest("s3cret")));
     }
 
     #[test]
-    fn given_uppercase_configured_digest_when_credentials_match_then_accepts() {
-        let configured = user(&digest("s3cret").to_uppercase());
-
-        assert!(credentials_match(&configured, b"s3cret"));
+    fn given_uppercase_configured_digest_when_password_matches_then_accepts() {
+        assert!(password_matches(b"s3cret", &digest("s3cret").to_uppercase()));
     }
 
     #[test]
-    fn given_broken_configured_digest_when_credentials_match_then_rejects() {
+    fn given_broken_configured_digest_when_password_matches_then_rejects() {
         // 长度不对 / 含非十六进制字符都必须失败（fail closed），不能 panic。
-        assert!(!credentials_match(&user("abc"), b"s3cret"));
-        assert!(!credentials_match(&user(&"z".repeat(64)), b"s3cret"));
+        assert!(!password_matches(b"s3cret", "abc"));
+        assert!(!password_matches(b"s3cret", &"z".repeat(64)));
     }
 
     #[test]
