@@ -9,6 +9,7 @@
 pub mod config;
 pub mod http;
 pub mod logging;
+pub mod store;
 
 #[cfg(test)]
 mod test_support;
@@ -16,3 +17,4 @@ mod test_support;
 pub use config::{Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, RuntimeEnv};
 pub use http::router;
 pub use logging::init as init_logging;
+pub use store::{Oid, OidError, Sha256Writer, hash_file};
