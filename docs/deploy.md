@@ -523,5 +523,5 @@ sudo sqlite3 /var/lib/netdisk-lfs/accounts.db \
 | 注册成功但登录 401 | `approval` 策略下账户还是 `pending`，到 `/admin` 批准；`closed` 下不会有新账户 |
 | 登录 429 | 该用户名 5 分钟内失败次数超 `login_failures_per_5min`；等窗口滑出，或管理员确认没有爆破 |
 | `/admin` 403 | 当前账户不是 `admin`：改 `[auth.users]` 的 `role` 后重启；检查是否已有其他 admin 生效 |
-| 引导管理员突然登不上 | 有人用同名注册了账户（注册只与账户库查重，库优先）。用另一个未入库的 config admin 登录删掉那条库记录，或按 accounts.md 8.4 改库 |
+| 引导管理员突然登不上 | 新版本已拒绝用 `[auth.users]` 保留名自助注册（409）；若库里已有历史同名记录（旧版本遗留），用另一个未入库的 config admin 登录删掉它，或按 accounts.md 8.4 改库 |
 | 改了 config 口令却登不上 | 该账户已入库，库优先；用旧口令或管理员重置（见 accounts.md 7.2） |

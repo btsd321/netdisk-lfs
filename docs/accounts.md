@@ -70,6 +70,10 @@ maintainer = { password_sha256 = "<sha256>", role = "admin" }
 
 注册页与结果页都是无脚本的静态 HTML，内联样式、不引外部资源，也不回显口令。
 
+**保留用户名**：`[auth.users]` 里已有的用户名不能自助注册（409）。否则账户库优先会让
+原 config 账户——通常就是引导管理员——再也登不上，属于可被利用的抢占路径。管理员在
+`POST /admin/users` 显式创建同名账户不受限，那是迁移动作。
+
 ### 4.2 管理员视角
 
 浏览器打开 `https://lfs.example.com/admin`（会弹 Basic 认证框，用 admin 账户登录）。
@@ -98,6 +102,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 |---|---|---|
 | `approval`（默认） | 202 | 建 `pending`，等管理员批准 |
 | `open` | 201 | 建 `active`，立即可登录 |
+| 用户名已存在，或在 `[auth.users]` 里保留 | 409 | 换一个用户名 |
+| 用户名/口令不合法 | 400 | 按提示修正；口令至少 `min_password_len` 位 |
+| 超过注册限速 | 429 | 按 `Retry-After` 等待 |
 | `closed` | 403 | 自助注册关闭，只能由管理员开户 |
 | 用户名已被占用 | 409 | 账户库里已有同名账户（不与 `[auth.users]` 查重，见第 10 节） |
 | 输入不合法 | 400 | 用户名规则、口令策略、两次口令不一致 |
@@ -196,10 +203,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' -u "$AUTH" -X DELETE \
 | 规则 | 结果 |
 |---|---|
 | 删除自己 | 拒绝（改用 `DELETE /account`） |
+| 改/删自己 | 409（删除自己请走 `DELETE /account`，需要旧口令） |
 | 删除/降级/禁用最后一个 `active` admin | 409：先加另一个 admin 或保留 config 引导管理员 |
 | 删除库里有、`[auth.users]` 也有同名条目的账户 | 409：删掉库行会让旧 config 口令复活，先移除配置条目 |
 | 非 admin 访问 `/admin` 或 `/admin/*` | 403 |
-| 账户不存在 | 404 |
+| 账户不存在，或只在 `[auth.users]`、尚未登录升级入库 | 404（提示先登录一次完成入库） |
 
 最后一个 admin 的判定同时看账户库与 `[auth.users]`；config 里的**同名**条目不算
 「另一个管理员」（删掉库行只是同一个人重新拿到 config 权限）。
@@ -208,7 +216,22 @@ curl -sS -o /dev/null -w '%{http_code}\n' -u "$AUTH" -X DELETE \
 
 `GET /admin` 需要 Basic 认证（admin），页面提供批准、启用、禁用、删除、改角色、重置
 口令的表单。适合手机或临时处理；批量操作、脚本化仍建议用 JSON API，两者改的是同一份
-账户库。
+账户库、同一套保护规则。
+
+表单提交到这些**便捷端点**（只接受表单 POST，成功一律 `303 → /admin[?status=…]`，
+失败页状态码与 JSON 一致）：
+
+| 方法与路径 | 表单字段 | 作用 |
+|---|---|---|
+| `POST /admin/users/{name}/approve` | — | `pending → active` |
+| `POST /admin/users/{name}/disable` | — | `active → disabled` |
+| `POST /admin/users/{name}/enable` | — | `disabled → active` |
+| `POST /admin/users/{name}/role` | `role` | 改角色 |
+| `POST /admin/users/{name}/password-form` | `password` | 重置口令 |
+| `POST /admin/users/{name}/delete` | `confirm`（必填勾选） | 删除账户 |
+
+页面上的时间按 **UTC** 显示；每页最多 100 行、暂时没有翻页 UI，更多用 JSON API 的
+`offset`。
 
 ## 7. 配置
 
@@ -355,7 +378,8 @@ curl -fsS http://127.0.0.1:9001/healthz
 - **口令不要复用**：这是存在 LFS 客户端里的第三方口令，泄露影响面要按「网盘里所有
   对象」评估。
 - **管理员越少越好**，改完权限后过一眼审计日志。
-- **审计日志走 journald**：
+- **审计日志走 journald**（写操作 `actor/action/target/request_id`，`action` 取
+  `user.create` / `user.update` / `user.delete` / `user.reset_password`，口令不落日志）：
 
   ```bash
   # 注册、登录失败、改密、注销、config 用户懒升级
