@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use axum::body::Body;
-use axum::http::header::{ACCEPT, CONTENT_TYPE, LOCATION};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
@@ -88,12 +88,16 @@ pub(crate) fn page_shell(title: &str, body: &str) -> String {
     )
 }
 
-/// 构造 HTML 响应（`text/html; charset=utf-8`）。
+/// 构造 HTML 响应（`text/html; charset=utf-8`），并统一加 `Cache-Control: no-store`。
+///
+/// 页面里会出现用户名、角色、创建/最后登录时间、账户列表：共享浏览器、反代缓存或
+/// 「后退」都可能把上一个人的页面交给下一个人。这些页面没有任何可缓存的理由，
+/// 统一 no-store 比逐个端点记着加更不容易漏。
 pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
     let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     *response.status_mut() = status;
     response
 }
@@ -110,22 +114,38 @@ pub(crate) fn wants_html(headers: &HeaderMap) -> bool {
 }
 
 /// 303 See Other：浏览器按 GET 跟随目标，不会把原来的 POST 再提交一次。
-///
-/// 回跳地址由本服务构造（登录页的 `?next=` 只保留站内路径），正常情况下一定合法；
-/// 万一不是合法头值（含控制字符等）就只记日志、不发 `Location`——宁可少一个跳转，
-/// 也不能让脏值进响应头。
 pub(crate) fn see_other(location: &str) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::SEE_OTHER;
-    match HeaderValue::from_str(location) {
+    response.headers_mut().insert(LOCATION, location_header(location));
+    response
+}
+
+/// 把回跳地址变成合规的 `Location` 头值。
+///
+/// 注意 `HeaderValue::from_str` **不**能当校验用：按 RFC 7230，它接受 obs-text
+/// （0x80–0xff），所以 UTF-8 路径（`/account?q=中文`）能通过 `from_str`，却把非 ASCII
+/// 原始字节写进了 `Location`——`Location` 是 URI 引用，只能是 ASCII，部分代理与浏览器
+/// 会直接丢掉这条头，页面就停在空白页。因此这里先自己判「是否全为可见 ASCII」，
+/// 不是就先编码（只编非可见 ASCII 字节，保留 `?`、`&`、`=`、`/` 这些结构字符）。
+///
+/// 编码后仍失败时回落 `/`：宁可回首页，也不要 303 一个没有目标的响应。
+fn location_header(location: &str) -> HeaderValue {
+    let printable_ascii = location.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
+    if printable_ascii && let Ok(value) = HeaderValue::from_str(location) {
+        return value;
+    }
+    let encoded = percent_encode_location(location);
+    match HeaderValue::from_str(&encoded) {
         Ok(value) => {
-            response.headers_mut().insert(LOCATION, value);
+            tracing::debug!(location = %location, encoded = %encoded, "回跳地址含非 ASCII 字节，已百分号编码");
+            value
         },
         Err(error) => {
-            tracing::error!(location = %location, error = %error, "回跳地址不是合法的响应头值");
+            tracing::error!(location = %location, error = %error, "回跳地址无法编成响应头值，回落到首页");
+            HeaderValue::from_static("/")
         },
     }
-    response
 }
 
 /// 渲染一张表：表头按纯文本转义，单元格是**已渲染的 HTML 片段**。
@@ -200,16 +220,43 @@ pub(crate) fn parse_form(body: &str) -> Result<HashMap<String, String>, ApiError
 /// `&`、`=` 都必须编码，否则原地址会被当成外层查询串的一部分（`?next=/account?tab=x`
 /// 里的 `tab=x` 就成了外层参数）。
 pub(crate) fn percent_encode(raw: &str) -> String {
-    let mut encoded = String::with_capacity(raw.len());
+    // 每个字节的转义要追加 3 个字符，先按最坏情况预留，避免反复扩容。
+    let mut encoded = String::with_capacity(raw.len() * 3);
     for byte in raw.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(char::from(byte));
             },
-            other => encoded.push_str(&format!("%{other:02X}")),
+            other => push_hex_escape(&mut encoded, other),
         }
     }
     encoded
+}
+
+/// 只编码非可见 ASCII 字节，保留 `?`、`&`、`=`、`/` 这些 URI 结构字符。
+///
+/// 与 [`percent_encode`] 的分工：那个用于「`next` 参数的值」，必须把 `/`、`?`、`&`、
+/// `=` 一并编码；这个用于「已经是一条地址」的场景，只处理放不进响应头的字节。
+fn percent_encode_location(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if (0x21..=0x7e).contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            push_hex_escape(&mut encoded, byte);
+        }
+    }
+    encoded
+}
+
+/// 百分号转义用的大写十六进制数字表：查表比每个字节一次 `format!` 分配便宜得多。
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+/// 把一个字节按 `%XX`（大写）追加到 `encoded`。
+fn push_hex_escape(encoded: &mut String, byte: u8) {
+    encoded.push('%');
+    encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+    encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
 }
 
 /// 百分号与 `+` 解码；非法转义或非 UTF-8 都报 400。
@@ -251,8 +298,8 @@ pub(crate) fn percent_decode(raw: &str) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        civil_from_days, escape_html, format_unix_seconds, parse_form, percent_decode, table,
-        wants_html,
+        civil_from_days, escape_html, format_unix_seconds, location_header, parse_form,
+        percent_decode, percent_encode, table, wants_html,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -324,6 +371,26 @@ mod tests {
             HeaderValue::from_static("text/html,application/xhtml+xml;q=0.9"),
         );
         assert!(wants_html(&headers), "浏览器表单一定带 text/html");
+    }
+
+    #[test]
+    fn given_component_with_delimiters_when_percent_encode_then_only_unreserved_kept() {
+        // `?`、`&`、`=`、`/` 与中文都必须编码，否则会变成外层查询串或非 ASCII 头值。
+        assert_eq!(percent_encode("/a/b?c=d&e=f 中"), "%2Fa%2Fb%3Fc%3Dd%26e%3Df%20%E4%B8%AD");
+        assert_eq!(percent_encode("AZaz09-._~"), "AZaz09-._~");
+    }
+
+    #[test]
+    fn given_non_ascii_location_when_location_header_then_percent_encoded_not_dropped() {
+        // `HeaderValue` 只接受可见 ASCII：不编码就会得到一条没有 Location 的 303。
+        let value = location_header("/account?q=中文");
+        assert_eq!(value.to_str().expect("编码后应是合法头值"), "/account?q=%E4%B8%AD%E6%96%87");
+    }
+
+    #[test]
+    fn given_ascii_location_when_location_header_then_unchanged() {
+        let value = location_header("/admin?status=pending");
+        assert_eq!(value.to_str().expect("合法头值"), "/admin?status=pending");
     }
 
     #[test]
