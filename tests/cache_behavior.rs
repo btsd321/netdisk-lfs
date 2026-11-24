@@ -635,3 +635,40 @@ async fn given_degraded_cache_when_sweep_then_stale_transient_part_removed() {
     assert!(!stale.exists(), "降级模式的超龄中转文件必须被清理");
     assert!(report.stale_parts >= 1, "清理计数应包含该文件");
 }
+
+#[tokio::test]
+async fn given_hits_misses_and_evictions_when_observed_then_counters_are_exact() {
+    // `/metrics` 的数据源：命中/未命中记在 `get` 上，驱逐记在真正删掉对象时。
+    let workspace = FakeStore::new();
+    let config = CacheConfig { dir: workspace.root().join("cache"), max_bytes: 200 };
+    let cache = Cache::open(&config).await;
+    assert_eq!(cache.hits_total(), 0);
+    assert_eq!(cache.misses_total(), 0);
+    assert_eq!(cache.evictions_total(), 0);
+
+    let a = insert_into_cache(&cache, vec![b'a'; 100]).await;
+    assert_eq!(cache.misses_total(), 0, "fetch_once 内部查询不算未命中，否则冷读被记两次");
+
+    assert!(cache.get(&a).await.is_some(), "第一次查是命中");
+    let missing = Oid::parse(&"ef".repeat(32)).expect("合法 oid");
+    assert!(cache.get(&missing).await.is_none(), "不存在的 oid 是未命中");
+    assert_eq!((cache.hits_total(), cache.misses_total()), (1, 1));
+
+    // 预算 200：a、b 填满；插入 c 时淘汰最久未访问的 a（b、c 都比它新）。
+    let b = insert_into_cache(&cache, vec![b'b'; 100]).await;
+    let c = insert_into_cache(&cache, vec![b'c'; 100]).await;
+
+    assert_eq!(cache.evictions_total(), 1, "超预算应驱逐一个对象");
+    assert!(!cache_path(cache.root(), &a).exists(), "被驱逐的应是最久未访问的 a");
+    assert!(cache_path(cache.root(), &b).exists(), "b 比 a 新，应留在缓存里");
+    assert!(cache_path(cache.root(), &c).exists(), "刚插入的 c 必须在缓存里");
+    assert_eq!(cache.len(), 2, "淘汰后索引里应剩两个对象");
+
+    // 降级模式不读写缓存，也不记账：否则「缓存没开」会被算成 100% 未命中。
+    let blocked = workspace.root().join("cache-is-a-file");
+    tokio::fs::write(&blocked, b"not a directory").await.expect("占位文件");
+    let degraded = Cache::open(&CacheConfig { dir: blocked, max_bytes: 4096 }).await;
+    assert!(!degraded.is_enabled(), "目录不可用时应降级");
+    assert!(degraded.get(&a).await.is_none());
+    assert_eq!((degraded.hits_total(), degraded.misses_total()), (0, 0), "降级模式不计数");
+}
