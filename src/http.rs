@@ -124,6 +124,8 @@ pub struct AppState {
     /// SQLite 账户库；`None` 表示未接入（嵌入用法/既有测试），此时认证只查
     /// `[auth.users]`，`/account/*` 一律 503。
     accounts: Option<Arc<UserStore>>,
+    /// 浏览器会话表（进程内）；无状态构造，不需要配置，重启即清空。
+    sessions: Arc<SessionStore>,
     /// 登录失败限速（按小写用户名）与注册限速（按来源地址）；进程内状态，重启清零。
     login_limits: Arc<SlidingWindowLimiter>,
     register_limits: Arc<SlidingWindowLimiter>,
@@ -149,6 +151,7 @@ impl AppState {
             cache,
             probe: None,
             accounts: None,
+            sessions: Arc::new(SessionStore::new()),
             login_limits: Arc::new(SlidingWindowLimiter::new(LOGIN_WINDOW)),
             register_limits: Arc::new(SlidingWindowLimiter::new(REGISTRATION_WINDOW)),
         }
@@ -207,6 +210,14 @@ impl AppState {
     /// 账户库；未接入时为 `None`（此时 `/account/*` 返回 503，认证只查配置）。
     pub fn accounts(&self) -> Option<&UserStore> {
         self.accounts.as_deref()
+    }
+
+    /// 浏览器会话表；登录端点建会话、认证中间件查会话、管理端撤销会话都走它。
+    ///
+    /// 返回借用而非 `Arc` 克隆：会话表本身不跨任务 move，`AppState` 已经用 `Arc`
+    /// 让各 handler 共享同一份。
+    pub fn sessions(&self) -> &SessionStore {
+        &self.sessions
     }
 
     /// 登录失败限速器；认证中间件用它按用户名计数。
