@@ -25,6 +25,7 @@
 #   FAKE_BDPAN_SILENT_TRUNCATE 非空：download 写出截断文件却报成功（模拟静默截断）
 #   FAKE_BDPAN_SLEEP           每个子命令先睡 N 秒（配合超时用例）
 #   FAKE_BDPAN_CRASH           非空：以退出码 3 失败且不输出 JSON（模拟 CLI 崩溃）
+#   FAKE_BDPAN_FAIL_AUTH       非空：whoami 报登录态失效（token 过期），供 /healthz 用例
 set -uo pipefail
 
 root="${FAKE_BDPAN_ROOT:-}"
@@ -256,6 +257,10 @@ cmd_quota() {
 }
 
 cmd_whoami() {
+  if [[ -n "${FAKE_BDPAN_FAIL_AUTH:-}" ]]; then
+    printf '{"code":1,"data":null,"error":"token 已过期，请重新登录"}\n'
+    return 0
+  fi
   printf '{"code":0,"data":{"name":"fake-bdpan","uid":3208457042}}\n'
 }
 

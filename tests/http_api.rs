@@ -169,14 +169,19 @@ fn assert_error_contract(headers: &HeaderMap, body: &Value) {
 }
 
 #[tokio::test]
-async fn given_healthz_when_get_then_ok_with_request_id() {
+async fn given_no_bdpan_probe_when_healthz_then_degraded_503_with_request_id() {
+    // 测试应用没有注入 bdpan 探活器（`AppState::new` 不探测）：宁可报降级，也不谎报
+    // 健康。探活成功/失败的完整矩阵在 tests/health_metrics.rs。
     let app = TestApp::new(USERS);
 
     let (status, headers, body) =
         app.send_json(request(Method::GET, "/healthz", None, None, String::new())).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({ "status": "ok" }));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({ "status": "degraded", "bdpan": "unavailable", "cache_enabled": true })
+    );
     assert!(!header_str(&headers, "x-request-id").is_empty());
 }
 
@@ -194,8 +199,9 @@ async fn given_unknown_route_when_get_then_404_with_request_id() {
 #[tokio::test]
 async fn given_client_supplied_request_id_when_request_then_server_id_wins() {
     let app = TestApp::new(USERS);
+    // 用 /metrics 做载体：它和 /healthz 一样不挂认证且恒回 200，断言不受后端影响。
     let request = Request::builder()
-        .uri("/healthz")
+        .uri("/metrics")
         .header("x-request-id", "client-controlled")
         .body(Body::empty())
         .expect("构造请求");
