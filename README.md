@@ -31,6 +31,11 @@
 - 自助注册：`GET/POST /account/register`（HTML 表单或 JSON）。策略 `approval`（默认，
   需管理员审批）/ `open`（立即生效）/ `closed`（关闭注册）。
 - 自身账户：`GET /account/me`、`POST /account/password`、`DELETE /account`。
+- **浏览器登录**：根路径 `/` 是登录页（用户名 + 口令，含「注册账号」入口）；登录后管理页 `/admin`、
+  普通用户页 `/account`，可退出。登录态用服务端内存会话 + `HttpOnly; SameSite=Lax` Cookie，
+  空闲 12h/绝对 7d，重启失效；改密/禁用/删除/改角色会立即踢下线。
+- git-lfs/curl 仍走 HTTP Basic，浏览器与 Basic 两条通道互不影响；未登录访问 `/admin` 的
+  浏览器请求会 `303 /?next=…`，API 仍是 `401`。详见 [docs/accounts.md](docs/accounts.md) 第 12 节。
 - 管理员：`/admin` HTML 管理页，或 `/admin/users` JSON API（列表 / 创建 / 改角色 /
   禁用 / 删除 / 重置口令）。
 - 删除账户**不删除任何 LFS 对象**（对象全局共享、内容寻址）。
@@ -43,6 +48,8 @@
 - 不是通用对象存储网关，只实现 LFS 需要的那几个端点。
 
 ## 快速开始
+
+浏览器入口：`https://<你的域名>/`（登录页）。
 
 ```bash
 # 服务器（systemd unit 会以普通用户运行它，只监听 127.0.0.1）

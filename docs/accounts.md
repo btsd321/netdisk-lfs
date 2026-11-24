@@ -454,3 +454,46 @@ curl -fsS http://127.0.0.1:9001/healthz
   重置。
 
 未迁移的旧账户行为不变，可以长期与账户库并存：库里有就查库，库里没有就回落到 config。
+
+## 12. 浏览器登录与会话
+
+### 12.1 登录页
+
+浏览器直接打开站点根路径 `https://lfs.example.com/`：
+
+- 输入**用户名 + 口令**提交（表单登录，不再弹浏览器原生 Basic 框）；
+- 页面上有「注册账号」链接到 `/account/register`；`approval` 策略下会提示「注册后需管理员审批」；
+- 已登录（带有效会话 Cookie）再访问 `/` 会直接跳到 `/admin`（admin）或 `/account`（其他角色）；
+- 失败统一显示「用户名或口令错误，或账户未激活」，不区分用户不存在/口令错/未激活；登录失败按用户名限速（`login_failures_per_5min`）。
+
+`POST /login` 接受表单，成功后 `303` 并下发会话 Cookie；`403` 表示跨站请求被拒（登录 CSRF 防护），`429` 表示限速，`503` 表示账户库故障。
+
+### 12.2 会话
+
+| 项 | 值 |
+|---|---|
+| Cookie 名 | `netdisk_lfs_session` |
+| 属性 | `HttpOnly; SameSite=Lax; Path=/`，HTTPS 时加 `Secure` |
+| 有效期 | 空闲 12 小时 / 绝对 7 天 |
+| 存储 | 进程内存；**重启服务后所有浏览器需要重新登录** |
+| 上限 | 每用户最多 10 个会话，全库 4096 个，超出淘汰最旧 |
+
+- 每次请求都会回账户库确认账户仍为 `active`、角色以库为准；改角色立即生效；
+- 改口令、管理员重置口令、禁用、退回 `pending`、删除账户、显式退出 → **相关会话立即失效**；
+- Basic 认证仍然保留给 git-lfs/curl/CI，浏览器与 Basic 两条通道互不影响；同一请求同时带 `Authorization` 与 Cookie 时以 Basic 为准。
+
+**Secure Cookie 的前提**：反代必须把原始 `Host` 与 `X-Forwarded-Proto: https` 传进来，并且服务端 `[accounts] trust_proxy = true`（或把 `[server] public_base` 设为 `https://…`）。否则服务端按 http 处理，登录 Cookie 不带 `Secure`。
+
+### 12.3 账户页与退出
+
+`GET /account`（登录后）显示用户名、角色、状态、创建/最后登录时间、LFS 端点与 `.lfsconfig` 片段；admin 额外显示管理入口。页面响应带 `Cache-Control: no-store`。
+
+- 会话登录的用户会看到「退出登录」按钮（`POST /logout`）：撤销当前会话、清 Cookie、`303` 回 `/`；
+- 用 Basic 认证打开该页时**不显示退出按钮**，页面会提示「Basic 凭据由浏览器保存，退出需关闭浏览器或清除站点凭据」——服务器无法注销浏览器缓存的 Basic。
+- 退出是幂等操作，没有 Cookie 也返回 `303`。
+
+### 12.4 未登录访问
+
+- 浏览器（`Accept: text/html`）访问 `/admin*`、`/account*`：`303` 到 `/?next=<原路径>`，登录后回到原页面（`next` 仅接受单个 `/` 开头、非 `//`、无反斜杠、无控制字符、≤2048 的站内路径）；
+- 同一路径但**没有** `Accept: text/html`（curl、脚本、git-lfs）：保持 `401` + `WWW-Authenticate`/`lfs-authenticate`，行为与以前一致；
+- 写请求（POST/PATCH/DELETE）即使带 HTML `Accept` 也不跳转，保持 `401`，避免登录后 GET 一个 POST-only 路由得到 405。

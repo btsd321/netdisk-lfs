@@ -508,6 +508,16 @@ sudo sqlite3 /var/lib/netdisk-lfs/accounts.db \
 - 注册页与 `/admin` 都是普通 HTTP 端点，经同一个 Caddy 站点即可，不要额外叠 Basic Auth
   （见 5.3）。
 
+### 13.3.1 浏览器登录对反代的要求
+
+登录页与 `/account` 依赖会话 Cookie。要让 Cookie 正确带 `Secure`，反代必须：
+
+- 透传原始 `Host`（Caddy 默认满足；不要改写成上游地址）；
+- 设置 `X-Forwarded-Proto: https`；
+- 服务端 `[accounts] trust_proxy = true`，或 `[server] public_base = "https://<你的域名>"`。
+
+不满足时登录仍可用，但 Cookie 不带 `Secure`，且注册/登录限速会退化成共享桶（按反代地址计数）。会话在内存里，**重启 `netdisk-lfs` 会让所有浏览器掉线**，需要重新登录。
+
 ### 13.4 升级与回滚
 
 - 从「纯 config 账户」升级：现有用户继续可用，首次登录自动升级为 Argon2id；建议把
@@ -515,7 +525,20 @@ sudo sqlite3 /var/lib/netdisk-lfs/accounts.db \
 - 回滚到不认识 `[accounts]` 的旧二进制前，先注释掉该段（配置是 `deny_unknown_fields`，
   否则启动失败）；`accounts.db` 可以留在原地，旧版本不读它。
 
-### 13.5 账户相关排障
+### 13.5 浏览器登录排障
+
+| 现象 | 原因与处理 |
+|---|---|
+| 打开域名还是 404 | 旧版本没有 `/` 登录页；确认部署的是含登录页的版本（`GET /` 应 200） |
+| 以前 `/admin` 弹 Basic 框，现在直接是登录页 | 这是新行为：浏览器走表单登录；curl/脚本仍可用 Basic |
+| 登录成功但下一个请求又回登录页 | 反代没传 `Host`/`X-Forwarded-Proto`，或 `trust_proxy` 未开导致 Cookie 属性不一致；检查 Caddy 配置与 `[accounts]` |
+| 登录后 Cookie 丢失 | HTTPS 站点下反代未设 `X-Forwarded-Proto` 且未配 `public_base`，`Secure` 判定不一致；二者至少配一个 |
+| 退出后仍保持登录 | 用的是 Basic 认证（浏览器缓存的凭据无法由服务端注销），关闭浏览器或清除站点凭据；会话登录的退出按钮才有效 |
+| 重启服务后要重新登录 | 会话在内存，属预期行为 |
+| 登录 POST 返回 403 | 跨站来源被拒（登录 CSRF 防护）；浏览器正常表单不会触发，脚本请勿伪造 `Origin` |
+| 登录 POST 返回 415 | `/login` 只接受 `application/x-www-form-urlencoded` 表单 |
+
+### 13.6 账户相关排障
 
 | 现象 | 原因与处理 |
 |---|---|
