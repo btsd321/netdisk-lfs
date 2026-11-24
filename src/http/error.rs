@@ -46,6 +46,16 @@ pub enum ApiError {
     /// 404：对象不存在。
     #[error("{0}")]
     NotFound(String),
+    /// 416：`Range` 语法合法但起点越界（RFC 9110 §15.5.17）。
+    ///
+    /// `api.md` 的状态码表没有 416（它只约束「单区间 206 / 多区间 200」），但把越界
+    /// 请求当 200 全量返回会欺骗按区间续传的客户端；这里按 HTTP 语义回 416 并带
+    /// `Content-Range: bytes */{total}`。
+    #[error("Range 越界：请求起点超出对象大小（对象共 {total} 字节）")]
+    RangeNotSatisfiable {
+        /// 对象总字节数，用于回写 `Content-Range`。
+        total: u64,
+    },
     /// 422：超出单对象上限，或哈希/大小不符。
     #[error("{0}")]
     Unprocessable(String),
@@ -68,6 +78,7 @@ impl ApiError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -86,6 +97,8 @@ impl ApiError {
             | Self::BadGateway(message)
             | Self::Unavailable(message)
             | Self::Internal(message) => message,
+            // 具体字节数只在日志/Display 里给出，回给客户端的 message 保持简短。
+            Self::RangeNotSatisfiable { .. } => "Range 越界：请求起点超出对象大小",
         }
     }
 
@@ -115,8 +128,18 @@ impl ApiError {
         if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
             headers.insert(REQUEST_ID_HEADER, value);
         }
-        if matches!(self, Self::Unauthorized(_)) {
-            headers.insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+        match &self {
+            Self::Unauthorized(_) => {
+                headers
+                    .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+            },
+            Self::RangeNotSatisfiable { total } => {
+                // RFC 9110：416 必须告诉客户端「当前表示有多大」，客户端据此重算区间。
+                if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                    headers.insert(header::CONTENT_RANGE, value);
+                }
+            },
+            _ => {},
         }
         *response.status_mut() = status;
         response

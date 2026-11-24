@@ -9,30 +9,32 @@
 //! - **临时文件必须回收**：本地缓冲由 [`TempPath`] 守卫，正常返回、失败、
 //!   future 被丢弃（客户端断连）三条路径都会删除。
 //!
-//! 本分支的 GET 每次经 `store.fetch` 落一个临时文件再流式返回；缓存与 Range 归
-//! 缓存分支，届时替换 `prepare_get` 的取数来源即可，路由与响应形态不变。
+//! 本分支的 GET 取数走本地缓存：命中直接读缓存文件，未命中由缓存层的单飞锁触发
+//! 一次 `store.fetch`（同 oid 并发只下载一次），Range 只读取区间对应的字节。
 
 use std::future::poll_fn;
 use std::io;
+use std::io::SeekFrom;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::{Body, HttpBody};
 use axum::extract::{Extension, Path, State};
-use axum::http::HeaderValue;
 use axum::http::header;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 use tracing::Instrument;
 
 use super::error::ApiError;
 use super::{
-    AppState, DurationGuard, OUTCOME_ABORTED, OUTCOME_FAILED, OUTCOME_OK, RequestId,
-    outcome_for_status,
+    AppState, DurationGuard, OUTCOME_ABORTED, OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED,
+    RequestId, outcome_for_status,
 };
+use crate::cache::CachedFile;
 use crate::config::{Config, Role};
 use crate::store::{HASH_BUFFER_BYTES, Oid, Sha256Writer, StoreError};
 
@@ -57,7 +59,10 @@ const MAX_VERIFY_BODY_BYTES: usize = 8 * 1024;
 /// 分开清理。未配置 `NETDISK_LFS_DATA_DIR` 时退回系统临时目录，让 `cargo run`
 /// 与一次性实验不必先建目录；代价是临时目录可能被重启清空、容量也偏小，
 /// 因此只适合开发与测试，生产部署必须配置本地数据根。
-fn upload_dir(config: &Config) -> PathBuf {
+///
+/// 对外导出（`http::upload_dir`）是给启动清理用的：`main` 要清的是同一批目录，
+/// 路径推导只能有一份实现，否则清理会漏掉某个回退分支。
+pub fn upload_dir(config: &Config) -> PathBuf {
     config.data_dir.as_ref().map_or_else(
         || std::env::temp_dir().join(UPLOAD_DIR_FALLBACK),
         |root| root.join(UPLOAD_DIR),
@@ -239,17 +244,19 @@ fn remove_with_retry(path: &FsPath) {
     }
 }
 
-/// `GET /lfs/objects/{oid}`：把对象整份流式返回。
+/// `GET /lfs/objects/{oid}`：把对象流式返回，缓存命中时不触发后端下载。
 ///
-/// 本分支不做 Range 与缓存：`Range` 请求头按「忽略并回全量 200」处理（与
-/// `specs/api.md`「多区间不支持，回 200 全量」一致），缓存命中/单飞下载留给
-/// 缓存分支，届时只需替换 [`prepare_get`] 的取数来源。
+/// `Range` 只支持单区间：`bytes=a-b`、`bytes=a-`、`bytes=-n` 回 `206` +
+/// `Content-Range`；多区间与语法非法按 `specs/api.md`「多区间不支持，回 200 全量」
+/// 忽略（不报 400）；语法合法但起点越界按 HTTP 语义回 416，见
+/// [`ApiError::RangeNotSatisfiable`]。
 ///
 /// 两种角色都允许下载。
 pub(crate) async fn get(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Path(raw_oid): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let span = tracing::info_span!(
         "lfs.get",
@@ -257,64 +264,248 @@ pub(crate) async fn get(
         bytes = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
+        cache_hit = tracing::field::Empty,
+        range = tracing::field::Empty,
     );
     let guard = DurationGuard::new(span.clone());
-    // fetch 阶段也要在 `lfs.get` 里：否则 BdpanStore 的 store(op=fetch) 子 span
-    // 会挂到外层 http.request 上，GET 与 PUT/verify 的 trace 结构不一致。
-    let prepared = prepare_get(&state, &request_id, &raw_oid, &span).instrument(span.clone()).await;
-    match prepared {
-        Ok((file, temp, size)) => {
-            // 遥测交给响应体读取器：直到流真正结束（或客户端断开）才落 duration_ms，
-            // 这样慢客户端的大对象下载也能看到真实传输耗时。
-            let reader = BodyReader::new(file, temp, guard);
-            let stream = ReaderStream::with_capacity(reader, HASH_BUFFER_BYTES);
-            let mut response = Response::new(Body::from_stream(stream));
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM));
-            // `Content-Length` 必填（api.md）；u64 的十进制形式是合法头值，转换不会失败。
-            response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(size));
-            response
-        },
+    // 取数阶段也要在 `lfs.get` 里：否则缓存与 `store(op=fetch)` 的子 span 会挂到
+    // 外层 http.request 上，GET 与 PUT/verify 的 trace 结构不一致。
+    let prepared = prepare_get(&state, &raw_oid, &span).instrument(span.clone()).await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             guard.finish(outcome_for_status(error.status()));
-            error.into_response_with(&request_id)
+            return error.into_response_with(&request_id);
         },
+    };
+
+    let total = prepared.size;
+    let spec = parse_range(headers.get(header::RANGE), total);
+    guard.span().record("range", range_label(spec, total));
+    let (start, length, status) = match spec {
+        RangeSpec::Full => (0, total, StatusCode::OK),
+        RangeSpec::Partial { start, end } => (start, end - start + 1, StatusCode::PARTIAL_CONTENT),
+        RangeSpec::Unsatisfiable => {
+            // 已经下载/打开的文件要还回去：先关句柄再删中转文件（`Prepared` 的字段序）。
+            guard.finish(OUTCOME_REJECTED);
+            prepared.abandon();
+            return ApiError::RangeNotSatisfiable { total }.into_response_with(&request_id);
+        },
+    };
+
+    let Prepared { mut file, temp, path, .. } = prepared;
+    // 只 seek 到区间起点，再用 `take` 限定长度：ReaderStream 照旧按 64 KiB 块读，
+    // 4 GiB 对象的区间请求不会把区间整块读进内存。
+    if start > 0
+        && let Err(error) = file.seek(SeekFrom::Start(start)).await
+    {
+        guard.finish(OUTCOME_FAILED);
+        drop(file);
+        drop(temp);
+        return local_io(&path, error).into_response_with(&request_id);
+    }
+
+    // 遥测交给响应体读取器：直到流真正结束（或客户端断开）才落 duration_ms，
+    // 这样慢客户端的大对象下载也能看到真实传输耗时；`bytes` 记实际发送的字节数，
+    // Range 时就是区间长度。
+    let reader = BodyReader::new(file.take(length), temp, guard);
+    let stream = ReaderStream::with_capacity(reader, HASH_BUFFER_BYTES);
+    let mut response = Response::new(Body::from_stream(stream));
+    let response_headers = response.headers_mut();
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM));
+    // `Content-Length` 必填（api.md）；u64 的十进制形式是合法头值，转换不会失败。
+    response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    // 声明支持区间，客户端才会在续传时直接带 Range 试一次。
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let RangeSpec::Partial { .. } = spec {
+        match HeaderValue::from_str(&content_range(start, start + length - 1, total)) {
+            Ok(value) => {
+                response_headers.insert(header::CONTENT_RANGE, value);
+            },
+            // 头值只含数字与分隔符，实际不会失败；真失败也只是少一个头，body 仍正确。
+            Err(error) => tracing::error!(error = %error, "构造 Content-Range 响应头失败"),
+        }
+    }
+    *response.status_mut() = status;
+    response
+}
+
+/// 一次 GET 的本地文件：已打开、大小已知，清理责任一并带出来。
+///
+/// 字段顺序是有意的：`file` 在 `temp` 之前，整体 Drop 时先关句柄再删中转文件
+/// （先删后关在 Windows 上会撞共享冲突，B5 已踩过）。
+struct Prepared {
+    /// 待发送的文件句柄。
+    file: fs::File,
+    /// 中转文件守卫；缓存命中为 `None`——缓存对象不能随响应删除。
+    temp: Option<TempPath>,
+    /// 文件真实大小；`Content-Length` 与 Range 的总量都用它。
+    size: u64,
+    /// 本地路径，仅用于错误信息与日志。
+    path: PathBuf,
+}
+
+impl Prepared {
+    /// 放弃这次响应：先关句柄，再让临时文件守卫删文件（顺序与 [`BodyReader`] 一致）。
+    fn abandon(self) {
+        let Self { file, temp, .. } = self;
+        drop(file);
+        drop(temp);
     }
 }
 
-/// 解析 oid、下载到本地中转文件并打开待发送的文件句柄。
+/// 定位到本地文件：缓存命中只打开文件，未命中则单飞下载、入缓存后打开。
 ///
-/// 返回的 [`TempPath`] 由调用方转交给 [`BodyReader`]：响应体没读完之前不能删文件，
-/// 所以清理责任不能留在本函数里。
+/// 404 只来自后端，且**不入缓存**（不缓存负面结果）：先 404、之后上传成功的对象，
+/// 下一次 GET 能正常命中。
 async fn prepare_get(
     state: &AppState,
-    request_id: &RequestId,
     raw_oid: &str,
     span: &tracing::Span,
-) -> Result<(fs::File, TempPath, u64), ApiError> {
+) -> Result<Prepared, ApiError> {
     let oid =
         Oid::parse(raw_oid).map_err(|error| ApiError::BadRequest(format!("oid 非法：{error}")))?;
     span.record("oid", oid.as_str());
+    let cache = state.cache();
 
-    let dir = download_dir(state.config());
-    fs::create_dir_all(&dir).await.map_err(|error| local_io(&dir, error))?;
-    // 与上传缓冲同理：同一 oid 的并发 GET 各用一个文件，互不覆盖。
-    let temp = TempPath::new(dir.join(format!("{oid}-{request_id}.part")));
-    // NotFound 由 From<StoreError> 映射成 404；其它失败按后端错误处理。
-    state.store().fetch(&oid, temp.path()).await.map_err(ApiError::from)?;
-    // Content-Length 用落盘后的真实大小：fetch 已校验过 sha256，这个值即对象大小。
-    let size = fs::metadata(temp.path()).await.map_err(|error| local_io(temp.path(), error))?.len();
-    let file = fs::File::open(temp.path()).await.map_err(|error| local_io(temp.path(), error))?;
-    Ok((file, temp, size))
+    // 命中路径：不触发 `store.fetch`，也不写缓存文件（spec「只读命中不写盘」）。
+    if let Some(path) = cache.get(&oid).await {
+        match open_local(&path).await {
+            Ok((file, size)) => {
+                span.record("cache_hit", true);
+                return Ok(Prepared { file, temp: None, size, path });
+            },
+            Err(error) => {
+                // `get` 刚校验过大小，这里失败只可能是「命中后被并发驱逐或删除」：
+                // 丢掉索引项后按未命中重新下载，不把这次请求当 500。
+                tracing::debug!(
+                    oid = %oid,
+                    error = error.message(),
+                    "缓存命中后打开失败，驱逐索引项后重新下载"
+                );
+                cache.forget(&oid);
+            },
+        }
+    }
+    span.record("cache_hit", false);
+
+    let store = state.store();
+    let fetch_oid = oid.clone();
+    let fetched = cache
+        .fetch_once(&oid, move |part: PathBuf| async move { store.fetch(&fetch_oid, &part).await })
+        .await
+        .map_err(ApiError::from)?;
+    // `Transient` 是超过预算（或缓存已降级）的直通文件：响应结束必须删；
+    // `Cached` 是缓存对象，跟着响应删就等于把缓存清空。
+    let path = fetched.path().to_path_buf();
+    let temp = match fetched {
+        CachedFile::Cached(_) => None,
+        CachedFile::Transient(_) => Some(TempPath::new(path.clone())),
+    };
+    let (file, size) = open_local(&path).await?;
+    Ok(Prepared { file, temp, size, path })
 }
 
-/// 下载中转目录：沿用 `[cache] dir`，与 `specs/storage.md` 的 `cache/<oid>.part` 一致。
+/// 打开本地文件并取真实大小（`Content-Length` 与 Range 的总量都用它）。
+async fn open_local(path: &FsPath) -> Result<(fs::File, u64), ApiError> {
+    let file = fs::File::open(path).await.map_err(|error| local_io(path, error))?;
+    let size = file.metadata().await.map_err(|error| local_io(path, error))?.len();
+    Ok((file, size))
+}
+
+/// `Range` 请求头的解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeSpec {
+    /// 忽略 `Range`，回 200 全量。
+    Full,
+    /// 单区间（闭区间），回 206。
+    Partial {
+        /// 区间起点。
+        start: u64,
+        /// 区间终点（含）。
+        end: u64,
+    },
+    /// 语法正确但起点越界，回 416。
+    Unsatisfiable,
+}
+
+/// 解析 `Range` 头；语义以 `specs/api.md`「GET /lfs/objects/{oid}」为准。
 ///
-/// 缓存分支会在同一个目录里做 LRU 与单飞；本分支每请求用独立文件名、响应结束即删，
-/// 不会与将来的缓存对象混淆（缓存对象不带 `.part` 后缀）。
-fn download_dir(config: &Config) -> PathBuf {
-    config.cache.dir.clone()
+/// 取舍：
+///
+/// - 只支持 `bytes` 单位与**单区间**。多区间（含逗号）与语法非法一律回
+///   [`RangeSpec::Full`]：客户端拿全量还能用，回 400 只会让 `git-lfs` 直接失败；
+/// - 语法合法但 `start >= total`（含空对象上请求区间、`bytes=-0`）→
+///   [`RangeSpec::Unsatisfiable`]，按 RFC 9110 回 416 而不是假装满足；
+/// - `end` 越过对象末尾时截到最后一个字节（RFC 要求），不算越界。
+fn parse_range(raw: Option<&HeaderValue>, total: u64) -> RangeSpec {
+    let Some(raw) = raw else {
+        return RangeSpec::Full;
+    };
+    let Ok(text) = raw.to_str() else {
+        tracing::debug!("Range 头不是可见 ASCII，按全量处理");
+        return RangeSpec::Full;
+    };
+    let Some(spec) = text.strip_prefix("bytes=") else {
+        tracing::debug!(range = text, "不支持的 Range 单位，按全量处理");
+        return RangeSpec::Full;
+    };
+    if spec.contains(',') {
+        tracing::debug!(range = text, "多区间 Range 不支持，按 api.md 回 200 全量");
+        return RangeSpec::Full;
+    }
+    let spec = spec.trim();
+    let Some((first, last)) = spec.split_once('-') else {
+        tracing::debug!(range = text, "Range 缺少 '-'，按全量处理");
+        return RangeSpec::Full;
+    };
+    let (first, last) = (first.trim(), last.trim());
+
+    if first.is_empty() {
+        // 后缀区间 `bytes=-n`：最后 n 个字节。
+        let Ok(suffix) = last.parse::<u64>() else {
+            tracing::debug!(range = text, "后缀区间长度非法，按全量处理");
+            return RangeSpec::Full;
+        };
+        if suffix == 0 || total == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        return RangeSpec::Partial { start: total.saturating_sub(suffix), end: total - 1 };
+    }
+
+    let Ok(start) = first.parse::<u64>() else {
+        tracing::debug!(range = text, "区间起点非法，按全量处理");
+        return RangeSpec::Full;
+    };
+    if start >= total {
+        return RangeSpec::Unsatisfiable;
+    }
+    if last.is_empty() {
+        return RangeSpec::Partial { start, end: total - 1 };
+    }
+    let Ok(end) = last.parse::<u64>() else {
+        tracing::debug!(range = text, "区间终点非法，按全量处理");
+        return RangeSpec::Full;
+    };
+    if end < start {
+        tracing::debug!(range = text, "区间终点小于起点，按全量处理");
+        return RangeSpec::Full;
+    }
+    RangeSpec::Partial { start, end: end.min(total - 1) }
+}
+
+/// `Content-Range` 的头值：`bytes {start}-{end}/{total}`。
+fn content_range(start: u64, end: u64, total: u64) -> String {
+    format!("bytes {start}-{end}/{total}")
+}
+
+/// `lfs.get` span 里记录 Range 的处置结果，便于排查「为什么回 200 而不是 206」。
+fn range_label(spec: RangeSpec, total: u64) -> String {
+    match spec {
+        RangeSpec::Full => "full".to_owned(),
+        RangeSpec::Unsatisfiable => format!("unsatisfiable/{total}"),
+        RangeSpec::Partial { start, end } => content_range(start, end, total),
+    }
 }
 
 /// `POST /lfs/objects/{oid}/verify`：回查对象存在且大小与声明一致。
@@ -395,29 +586,32 @@ async fn check(
     }
 }
 
-/// 响应体读取器：边读文件边累计已发送字节，读尽/断开时落遥测并删临时文件。
+/// 响应体读取器：边读文件边累计已发送字节，读尽/断开时落遥测并清理临时文件。
 ///
 /// 直接实现 [`AsyncRead`] 而不是自己写 `Stream`：`ReaderStream` 负责把
 /// `AsyncRead` 适配成 `Stream`，这里只需关心计数与收尾，避免 `pin-project`/
 /// `unsafe`（本仓库 `unsafe_code = "forbid"`）。
-struct BodyReader {
-    /// 待发送的本地文件；声明在 `_temp` 之前，Drop 时先关闭句柄再删文件。
-    file: fs::File,
-    /// 临时文件守卫，随读取器一起被丢弃。
+///
+/// 读取端是泛型：全量响应是 `fs::File`，Range 响应是 seek 过的 `Take<fs::File>`，
+/// 两种形态都能直接套 `ReaderStream`，不需要为 Range 单独写一条发送路径。
+struct BodyReader<R> {
+    /// 待发送的读取端；声明在 `_temp` 之前，Drop 时先关闭句柄再删文件。
+    reader: R,
+    /// 中转文件守卫；缓存命中时为 `None`（缓存对象要留着给下一个请求）。
     ///
     /// 下划线前缀是刻意的：字段只靠 Drop 生效、从不被读，直接叫 `temp` 会触发
     /// `dead_code`，而这里又不能加 `#[allow]`（本仓库 lint 集中在 Cargo.toml）。
-    _temp: TempPath,
+    _temp: Option<TempPath>,
     /// 遥测守卫：读到 EOF 后取出并 `finish`，否则（客户端断连）由 Drop 记 aborted。
     telemetry: Option<DurationGuard>,
     /// 已读出的字节数。
     bytes: u64,
 }
 
-impl BodyReader {
-    /// 绑定文件、清理守卫与遥测守卫。
-    fn new(file: fs::File, temp: TempPath, guard: DurationGuard) -> Self {
-        Self { file, _temp: temp, telemetry: Some(guard), bytes: 0 }
+impl<R> BodyReader<R> {
+    /// 绑定读取端、清理守卫与遥测守卫。
+    fn new(reader: R, temp: Option<TempPath>, guard: DurationGuard) -> Self {
+        Self { reader, _temp: temp, telemetry: Some(guard), bytes: 0 }
     }
 
     /// 结束遥测；重复调用无副作用（`telemetry` 取出后即为 `None`）。
@@ -429,16 +623,16 @@ impl BodyReader {
     }
 }
 
-impl AsyncRead for BodyReader {
+impl<R: AsyncRead + Unpin> AsyncRead for BodyReader<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // `BodyReader` 的字段都是 `Unpin`，可以从 Pin 里安全取出可变引用。
+        // `R: Unpin` 且其余字段都 `Unpin`，可以从 Pin 里安全取出可变引用。
         let this = self.as_mut().get_mut();
         let filled_before = buf.filled().len();
-        match Pin::new(&mut this.file).poll_read(cx, buf) {
+        match Pin::new(&mut this.reader).poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
                 let read = buf.filled().len() - filled_before;
@@ -458,10 +652,106 @@ impl AsyncRead for BodyReader {
     }
 }
 
-impl Drop for BodyReader {
+impl<R> Drop for BodyReader<R> {
     fn drop(&mut self) {
         // 走到这里还没 settle，说明响应体没读完就被丢弃：客户端断连或响应被取消。
         self.settle(OUTCOME_ABORTED);
-        // `file`、`_temp` 随后按声明顺序 Drop：先关文件，再删临时文件。
+        // `reader`、`_temp` 随后按声明顺序 Drop：先关文件，再删中转文件。
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::{RangeSpec, content_range, parse_range};
+
+    /// 造一个 `Range` 头值。
+    fn range(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).expect("测试用 Range 头值合法")
+    }
+
+    #[test]
+    fn given_no_range_header_when_parse_then_full() {
+        assert_eq!(parse_range(None, 10), RangeSpec::Full);
+    }
+
+    #[test]
+    fn given_closed_range_when_parse_then_partial() {
+        assert_eq!(
+            parse_range(Some(&range("bytes=0-3")), 10),
+            RangeSpec::Partial { start: 0, end: 3 }
+        );
+        assert_eq!(
+            parse_range(Some(&range("bytes=4-4")), 10),
+            RangeSpec::Partial { start: 4, end: 4 }
+        );
+    }
+
+    #[test]
+    fn given_open_ended_range_when_parse_then_partial_to_last_byte() {
+        assert_eq!(
+            parse_range(Some(&range("bytes=5-")), 10),
+            RangeSpec::Partial { start: 5, end: 9 }
+        );
+    }
+
+    #[test]
+    fn given_suffix_range_when_parse_then_last_n_bytes() {
+        assert_eq!(
+            parse_range(Some(&range("bytes=-2")), 10),
+            RangeSpec::Partial { start: 8, end: 9 }
+        );
+        // 后缀长度超过对象大小时从头开始，不是越界。
+        assert_eq!(
+            parse_range(Some(&range("bytes=-99")), 10),
+            RangeSpec::Partial { start: 0, end: 9 }
+        );
+    }
+
+    #[test]
+    fn given_end_beyond_object_when_parse_then_clamped_to_last_byte() {
+        assert_eq!(
+            parse_range(Some(&range("bytes=0-99")), 4),
+            RangeSpec::Partial { start: 0, end: 3 }
+        );
+    }
+
+    #[test]
+    fn given_start_beyond_object_when_parse_then_unsatisfiable() {
+        assert_eq!(parse_range(Some(&range("bytes=999-")), 4), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range(Some(&range("bytes=4-5")), 4), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range(Some(&range("bytes=0-")), 0), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range(Some(&range("bytes=-0")), 4), RangeSpec::Unsatisfiable);
+    }
+
+    #[test]
+    fn given_multiple_ranges_when_parse_then_full() {
+        assert_eq!(parse_range(Some(&range("bytes=0-1,3-4")), 10), RangeSpec::Full);
+    }
+
+    #[test]
+    fn given_malformed_range_when_parse_then_full() {
+        for value in [
+            "bytes=abc-def",
+            "bytes=",
+            "bytes=3",
+            "bytes=5-1",
+            "bytes=-abc",
+            "items=0-3",
+            "bytes=--1",
+        ] {
+            assert_eq!(
+                parse_range(Some(&range(value)), 10),
+                RangeSpec::Full,
+                "{value} 应按全量处理"
+            );
+        }
+    }
+
+    #[test]
+    fn given_partial_range_when_content_range_then_http_format() {
+        assert_eq!(content_range(0, 3, 10), "bytes 0-3/10");
+        assert_eq!(content_range(8, 9, 10), "bytes 8-9/10");
     }
 }

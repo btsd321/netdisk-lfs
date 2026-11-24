@@ -12,8 +12,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use netdisk_lfs::http::upload_dir;
 use netdisk_lfs::{
-    AppState, BdpanStore, Config, ConfigError, EnvSource, ObjectStore, init_logging, router,
+    AppState, BdpanStore, Cache, Config, ConfigError, EnvSource, ObjectStore, init_logging, router,
+    transient_dir,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -93,7 +95,27 @@ async fn run(config: Config) -> Result<(), StartupError> {
     // 所以配置错误（如路径不可执行）不会在这里暴露，而是留给首个请求与
     // 部署分支的 `whoami` 探活。
     let store: Arc<dyn ObjectStore> = Arc::new(BdpanStore::from_storage(&config.storage));
-    let state = AppState::new(store, Arc::new(config));
+
+    // 缓存启动清理：删除超龄 `.part` 残留、扫描目录重建索引、按预算收敛。
+    // 三步都不返回错误（失败只降级为直通并记 warn）：缓存可随时清空、清空不影响
+    // 正确性，所以缓存侧的问题绝不能阻止服务启动。
+    // 降级直通模式的中转文件落在一个专用临时子目录里，同样纳入清理——
+    // 不能把整个系统临时目录传进来（会误删其它进程的文件）。
+    let cache = Cache::open(&config.cache).await;
+    let sweep = cache.sweep(&[upload_dir(&config), transient_dir()]).await;
+    info!(
+        cache_dir = %cache.root().display(),
+        cache_max_bytes = cache.max_bytes(),
+        cache_objects = cache.len(),
+        cache_used_bytes = cache.used_bytes(),
+        cache_enabled = cache.is_enabled(),
+        stale_parts = sweep.stale_parts,
+        stale_bytes = sweep.stale_bytes,
+        evicted_objects = sweep.evicted_objects,
+        "缓存启动扫描完成"
+    );
+
+    let state = AppState::with_cache(store, Arc::new(config), cache);
 
     let listener =
         TcpListener::bind(addr).await.map_err(|source| StartupError::Bind { addr, source })?;

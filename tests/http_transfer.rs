@@ -62,8 +62,8 @@ impl TestApp {
         self.config.data_dir.as_ref().expect("测试配置带本地数据根").join("upload")
     }
 
-    /// 下载中转目录：本分支沿用 `[cache] dir`。
-    fn download_dir(&self) -> PathBuf {
+    /// 缓存目录：GET 命中/落库的对象与下载中转文件都在 `[cache] dir` 下。
+    fn cache_dir(&self) -> PathBuf {
         self.config.cache.dir.clone()
     }
 
@@ -203,6 +203,28 @@ async fn dir_entries(dir: &Path) -> Vec<String> {
     names
 }
 
+/// 递归收集目录下的 `.part` 文件：缓存对象不带该后缀，残留说明中转文件没清理。
+async fn part_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let mut reader = match tokio::fs::read_dir(&current).await {
+            Ok(reader) => reader,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("读取目录 {} 失败：{error}", current.display()),
+        };
+        while let Some(entry) = reader.next_entry().await.expect("遍历目录") {
+            let path = entry.path();
+            if entry.file_type().await.expect("文件类型").is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "part") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
 #[tokio::test]
 async fn given_valid_object_when_put_then_get_roundtrips_with_content_length() {
     let app = TestApp::new();
@@ -236,7 +258,16 @@ async fn given_valid_object_when_put_then_get_roundtrips_with_content_length() {
     assert_eq!(get_body, contents);
 
     assert!(dir_entries(&app.upload_dir()).await.is_empty(), "上传缓冲必须清理");
-    assert!(dir_entries(&app.download_dir()).await.is_empty(), "下载中转必须清理");
+    // B6 起 GET 走本地 LRU 缓存：对象落在 `<cache>/<aa>/<bb>/<oid>`，不带 `.part`。
+    assert!(part_files(&app.cache_dir()).await.is_empty(), "下载中转文件必须清理");
+    assert!(
+        app.cache_dir()
+            .join(&oid.as_str()[..2])
+            .join(&oid.as_str()[2..4])
+            .join(oid.as_str())
+            .is_file(),
+        "对象应已进本地缓存"
+    );
 }
 
 #[tokio::test]
@@ -392,7 +423,7 @@ async fn given_missing_object_when_get_then_404_with_error_contract() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_error_contract(&headers, &body);
-    assert!(dir_entries(&app.download_dir()).await.is_empty(), "404 后中转文件必须清理");
+    assert!(part_files(&app.cache_dir()).await.is_empty(), "404 后中转文件必须清理");
 }
 
 #[tokio::test]
@@ -529,8 +560,9 @@ async fn given_no_authorization_when_transfer_endpoints_then_401_with_challenge(
 }
 
 #[tokio::test]
-async fn given_range_header_when_get_then_ignores_and_returns_full_200() {
-    // B5 不实现 Range：不得报错，也不能只回片段，必须忽略头并回全量 200。
+async fn given_single_range_when_get_then_partial_206_with_content_range() {
+    // B6 起单区间 Range 生效：206 + Content-Range + 区间长度（细化断言在
+    // tests/cache_behavior.rs，这里只保证传输端点自身不再忽略 Range）。
     let app = TestApp::new();
     let contents = b"range is a B6 concern".to_vec();
     let oid = app.seed_object(&contents).await;
@@ -540,15 +572,16 @@ async fn given_range_header_when_get_then_ignores_and_returns_full_200() {
 
     let (status, headers, body) = app.send(request).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(header_str(&headers, "content-length"), contents.len().to_string());
-    assert!(!headers.contains_key(header::CONTENT_RANGE), "B5 不应回 206/Content-Range");
-    assert_eq!(body, contents);
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header_str(&headers, "content-length"), "4");
+    assert_eq!(header_str(&headers, "content-range"), format!("bytes 0-3/{}", contents.len()));
+    assert_eq!(body, contents[..4]);
 }
 
 #[tokio::test]
-async fn given_dropped_get_body_when_response_dropped_then_temp_file_cleaned() {
-    // 客户端拿到响应头就断连：body 一次都没被 poll，临时文件仍必须删除。
+async fn given_dropped_get_body_when_response_dropped_then_cache_kept_and_no_part() {
+    // 客户端拿到响应头就断连：body 一次都没被 poll。B6 起下载文件先 rename 进缓存
+    // 再开始发送，所以这里既不能留下 `.part`，也不能因为断连把缓存对象删掉。
     let app = TestApp::new();
     let contents = b"drop the body immediately".to_vec();
     let oid = app.seed_object(&contents).await;
@@ -565,7 +598,15 @@ async fn given_dropped_get_body_when_response_dropped_then_temp_file_cleaned() {
     // 不读 body，直接丢弃响应。
     drop(response);
 
-    assert!(dir_entries(&app.download_dir()).await.is_empty(), "响应被丢弃后中转文件必须清理");
+    assert!(part_files(&app.cache_dir()).await.is_empty(), "响应被丢弃后不得留下中转文件");
+    assert!(
+        app.cache_dir()
+            .join(&oid.as_str()[..2])
+            .join(&oid.as_str()[2..4])
+            .join(oid.as_str())
+            .is_file(),
+        "缓存对象应保留（下次请求直接命中）"
+    );
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ use axum::routing::{get, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
+use crate::cache::Cache;
 use crate::config::Config;
 use crate::store::{ObjectStore, Oid};
 
@@ -33,6 +34,9 @@ mod error;
 mod transfer;
 
 pub use error::ApiError;
+// 上传缓冲目录由 `transfer` 唯一实现（含 `data_dir` 缺省时的回退）；`main` 的启动
+// 清理要清同一批目录，所以从这里导出，避免两处各推导一遍导致清理漏目录。
+pub use transfer::upload_dir;
 
 /// LFS 协议媒体类型；请求与响应都用它（客户端可能附加 `; charset=utf-8`）。
 pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
@@ -43,26 +47,38 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 /// 进程内请求序号，与毫秒时间戳拼成可排序的 request id。
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 请求处理共享状态：存储后端与已校验的配置。
+/// 请求处理共享状态：存储后端、已校验的配置与本地读缓存。
 ///
-/// 两者都放在 `Arc` 里，handler 只持有轻量句柄；配置在启动后不可变，因此
-/// 认证与 batch 读的是同一份快照。
+/// 三者都是轻量句柄（`Arc` / 内部 `Arc` 的 `Cache`），handler 随便 clone；配置与
+/// 后端在启动后不可变，认证、batch 与传输读的都是同一份快照。
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<dyn ObjectStore>,
     config: Arc<Config>,
+    cache: Cache,
 }
 
 impl AppState {
-    /// 用存储后端与已校验的配置构造；构造期不触发任何 IO（不会调用 `bdpan`）。
+    /// 用存储后端与已校验的配置构造，并按 `[cache]` 建一个索引为空的缓存。
+    ///
+    /// 只给测试与嵌入用法（不扫描目录、不做启动清理）。生产启动走
+    /// [`Self::with_cache`]：`main` 先 [`Cache::open`] 重建索引、[`Cache::sweep`]
+    /// 清理残留，再把同一个缓存交给路由，否则磁盘上已有的缓存对象既不知道大小、
+    /// 也进不了 LRU。
     pub fn new(store: Arc<dyn ObjectStore>, config: Arc<Config>) -> Self {
-        Self { store, config }
+        let cache = Cache::empty(&config.cache);
+        Self::with_cache(store, config, cache)
+    }
+
+    /// 注入已扫描、已清理的缓存；`main` 的启动路径用这个。
+    pub fn with_cache(store: Arc<dyn ObjectStore>, config: Arc<Config>, cache: Cache) -> Self {
+        Self { store, config, cache }
     }
 
     /// 对象存储后端句柄。
     ///
-    /// 返回 `Arc` 克隆而非借用：batch 需要对多个 oid 并发探测，探测任务必须
-    /// 拥有自己的句柄才能 move 进 `JoinSet`。
+    /// 返回 `Arc` 克隆而非借用：batch 需要对多个 oid 并发探测，传输端点要把句柄
+    /// move 进单飞下载的 future，两者都必须拥有自己的句柄。
     pub fn store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.store)
     }
@@ -70,6 +86,11 @@ impl AppState {
     /// 运行期配置。
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 本地读缓存。
+    pub fn cache(&self) -> &Cache {
+        &self.cache
     }
 }
 
