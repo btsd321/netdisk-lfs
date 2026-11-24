@@ -149,21 +149,86 @@ curl -s  http://127.0.0.1:9001/metrics | head      # 期望 6 个 netdisk_lfs_ca
 
 ## 5. Caddy 反向代理（TLS + Basic 透传 + 保留流式）
 
+本节示例一律使用**占位域名 `lfs.example.com`**，请替换成你自己的域名；仓库是公开的，
+不要把真实域名、IP 或证书私钥写进任何入库文件。
+
+前提：DNS 的 `A`/`AAAA` 记录已指向运行 Caddy 的这台机器（服务只监听 `127.0.0.1`，
+Caddy 与网关同机部署）。改完 Caddyfile 用 `sudo systemctl reload caddy` 生效。
+
+### 5.1 标准端口（80/443，推荐）
+
 ```caddyfile
 lfs.example.com {
-	# 刻意不开全局 `encode`：对象响应的 Content-Type 是 application/octet-stream，
-	# 压缩只会烧 CPU 并可能推迟流式刷新；batch/verify 的 JSON 很小，压缩收益可忽略。
+	# 默认走 HTTP-01：需要公网的 80 端口可达。
+	# 80 不可达、或需要泛域名时改用 DNS-01（以 Cloudflare 为例，token 由 systemd
+	# 环境文件注入，不要写进 Caddyfile 或仓库）：
+	# tls {
+	#     dns cloudflare {env.CF_API_TOKEN}
+	# }
 
 	# 可选：不想把 /metrics 暴露到公网就挡掉（服务本身不鉴权）。
 	@metrics path /metrics
 	respond @metrics 404
 
 	reverse_proxy 127.0.0.1:9001 {
-		# 关闭响应刷新缓冲：4 GiB 对象要边读边发，攒包会让客户端首字节和进度卡住。
+		# 关闭响应刷新缓冲：大对象要边读边发，攒包会让客户端首字节和进度卡住。
 		flush_interval -1
 	}
 }
 ```
+
+Caddy 默认会透传 `Host` 与 `X-Forwarded-Proto`，服务端 `[server] public_base` **留空即可**
+——batch 下发的 action href 会按请求自动推导成 `https://lfs.example.com/...`。
+只有反代改写了主机名/端口、或客户端看到的外部地址与 Host 不一致时，才需要显式配置
+`public_base`。
+
+### 5.2 非标准端口（例如 :19333）
+
+不想占用宿主 80/443（已跑别的站点）时，可以整站换端口：
+
+```caddyfile
+{
+	https_port 19333
+}
+
+lfs.example.com:19333 {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		# 本机解析器看不到 ACME TXT 记录的环境（表现为
+		# "timed out waiting for record to fully propagate"）需要这两行：
+		propagation_delay 15s
+		propagation_timeout -1
+	}
+
+	reverse_proxy 127.0.0.1:9001 {
+		flush_interval -1
+	}
+}
+```
+
+此时客户端 `.lfsconfig` **必须带端口**：`https://lfs.example.com:19333/lfs/`。
+DNS 记录仍只需 A/AAAA；IPv4 需要在路由器把该端口转发到本机，IPv6 需要在主机/路由器
+防火墙放行该端口。Cloudflare 橙云（代理模式）不支持非标准端口且会缓冲响应，必须保持
+**灰云（仅 DNS）**。
+
+### 5.3 DNS 与证书注意事项
+
+- **A / AAAA**：指向 Caddy 所在机器即可；只有 AAAA（IPv6）时，IPv4-only 的网络/CI
+  连不上，建议双栈，或给 IPv4 客户端保留 SSH 隧道（见第 6 节）。
+- **IPv6 地址是动态的**（SLAAC/前缀委派）时，前缀变化后 AAAA 会失效，建议用 DDNS
+  脚本定时更新该记录。
+- **证书**：标准端口直接 `caddy reload` 即可自动申请/续期；DNS-01 需要 DNS 服务商的
+  API token（Cloudflare、阿里云、DNSPod 等都有 Caddy 插件，按需安装）。
+- **DNS 还没生效时先本地验证**（不依赖公网解析）：
+
+  ```bash
+  curl --resolve lfs.example.com:443:127.0.0.1 https://lfs.example.com/healthz
+  # 非标端口同理：--resolve lfs.example.com:19333:127.0.0.1
+  ```
+
+- **ACME TXT 残留**：Caddy 在挑战中途被重启时，DNS 服务商可能留下
+  `_acme-challenge.<域名>` 的 TXT 记录，续期会报「同名记录已存在」（Cloudflare 81058）；
+  删除残留 TXT 后重试即可。
 
 三条**不要做**：
 
@@ -179,8 +244,8 @@ lfs.example.com {
    Caddy 默认透传 `Authorization` 头即可；再叠一层会出现两套口令、401 挑战头错乱，
    以及 `git-lfs` 反复重试认证。
 
-防火墙只放 `80/443`；`9001` 只监听回环，不需要对外。若必须跨机抓取 `/metrics`，用
-SSH 隧道或在内网直连，不要把它开到公网。
+防火墙只放反向代理用到的端口（80/443 或你选的非标端口）；`9001` 只监听回环，不需要
+对外。若必须跨机抓取 `/metrics`，用 SSH 隧道或在内网直连，不要把它开到公网。
 
 ## 6. 客户端配置
 
@@ -192,6 +257,9 @@ url = https://lfs.example.com/lfs/
 ```
 
 - 结尾的 `/` 必须保留：客户端会拼 `objects/batch`。
+- 还不想配域名/反代时，可以临时用 SSH 隧道（仅限本机测试）：
+  `ssh -N -L 9001:127.0.0.1:9001 <user>@<server>`，然后 `.lfsconfig` 用
+  `http://127.0.0.1:9001/lfs/`。注意这是明文 HTTP + Basic，只适合本机回环。
 - 凭据交给 git credential（或 `~/.netrc`）：
 
   ```bash
