@@ -17,4 +17,6 @@ mod test_support;
 pub use config::{Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, RuntimeEnv};
 pub use http::router;
 pub use logging::init as init_logging;
-pub use store::{Oid, OidError, Sha256Writer, hash_file};
+pub use store::{
+    ObjectMeta, ObjectStore, Oid, OidError, Quota, Sha256Writer, StoreError, hash_file, object_path,
+};
