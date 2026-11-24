@@ -443,6 +443,20 @@ async fn given_unknown_oid_when_delete_then_idempotent() {
 }
 
 #[tokio::test]
+async fn given_expired_login_when_whoami_then_auth_error() {
+    let fixture = Fixture::new();
+    let client = fixture.client(
+        Duration::from_secs(30),
+        RetryPolicy::none(),
+        &[("FAKE_BDPAN_FAIL_AUTH", "1")],
+    );
+
+    let err = client.whoami().await.expect_err("登录态失效应报错");
+
+    assert!(err.is_auth(), "应归类为登录态失效，实际：{err}");
+}
+
+#[tokio::test]
 async fn given_logged_in_stub_when_whoami_then_ok() {
     let fixture = Fixture::new();
     let client = fixture.client(Duration::from_secs(30), RetryPolicy::none(), &[]);

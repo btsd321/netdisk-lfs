@@ -95,8 +95,8 @@ pub(super) fn strip_ansi(input: &str) -> String {
 /// 先剥 ANSI，再按 `\n`/`\r` 切行，从**后往前**尝试从每个「看起来像 JSON 起点」的行
 /// 解析出完整值：CLI 把结果打印在进度条之后，倒序能优先拿到最终结果；进度条
 /// `[=====>] 50%` 虽然以 `[` 开头，但过不了 `serde_json`，会被自然跳过。再要求解析出的
-/// 值带 `code`/`data`/`error`/`status` 之一（或本身是数组），避免把结果里的嵌套对象
-/// 误当成整段结果。
+/// 值「像命令结果」（见 [`looks_like_result`]：数组、带 `code`/`data`/`error`/`status`
+/// 的信封对象，或 `whoami` 的扁平对象），避免把结果里的嵌套对象误当成整段结果。
 ///
 /// 尾部残留的非 JSON 行不影响解析：`Deserializer::into_iter` 在第一个完整值处停下。
 pub(super) fn first_json(stdout: &str) -> Option<Value> {
@@ -127,12 +127,17 @@ fn candidate_starts(text: &str) -> Vec<usize> {
     starts
 }
 
-/// 只把「像命令结果」的值当结果：数组，或带 `code`/`data`/`error`/`status` 之一的对象。
+/// 只把「像命令结果」的值当结果：数组、带 `code`/`data`/`error`/`status` 的信封对象，
+/// 或 `whoami` 的扁平对象（实测真实 CLI 的 `whoami --json` 没有信封键，
+/// 只有 `authenticated`/`has_valid_token` 等字段——没有这两个键就会把登录态
+/// 探活误判成「输出无法解析」）。
 fn looks_like_result(value: &Value) -> bool {
     match value {
         Value::Array(_) => true,
         Value::Object(map) => {
-            ["code", "data", "error", "status"].iter().any(|key| map.contains_key(*key))
+            ["code", "data", "error", "status", "authenticated", "has_valid_token"]
+                .iter()
+                .any(|key| map.contains_key(*key))
         },
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
@@ -424,6 +429,16 @@ mod tests {
         let value = first_json(stdout).expect("尾部噪音不应影响解析");
 
         assert_eq!(value["data"]["action"], json!("created"));
+    }
+
+    #[test]
+    fn given_flat_whoami_object_when_first_json_then_parsed() {
+        // 真实 `bdpan whoami --json` 没有 code/data 信封，只有扁平字段。
+        let stdout = "{\n  \"authenticated\": true,\n  \"has_valid_token\": true\n}\n";
+
+        let value = first_json(stdout).expect("whoami 扁平对象应被识别");
+
+        assert_eq!(value["authenticated"], json!(true));
     }
 
     #[test]
