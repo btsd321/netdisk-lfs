@@ -26,6 +26,10 @@ const AUTH_CHALLENGE: &str = "Basic realm=\"netdisk-lfs\"";
 const PASSWORD: &str = "s3cret";
 const MAX_OBJECT_BYTES: u64 = 1_048_576;
 
+/// 测试请求统一带 Host；batch 的 action href 由它推导成绝对 URL。
+const TEST_HOST: &str = "lfs.test";
+const TEST_ORIGIN: &str = "http://lfs.test";
+
 /// 默认测试账号：一个读写、一个只读。
 const USERS: &[(&str, Role)] = &[("alice", Role::Readwrite), ("reader", Role::Readonly)];
 
@@ -37,10 +41,14 @@ struct TestApp {
 
 impl TestApp {
     fn new(users: &[(&str, Role)]) -> Self {
+        Self::from_config(config_with_users(users))
+    }
+
+    fn from_config(config: Config) -> Self {
         let store = FakeStore::new();
         // router 里的后端与夹具写入共用同一根目录；外层 store 负责 Drop 清理。
         let backend: Arc<dyn ObjectStore> = Arc::new(FakeStore::with_root(store.root()));
-        let state = AppState::new(backend, Arc::new(config_with_users(users)));
+        let state = AppState::new(backend, Arc::new(config));
         Self { router: router(state), store }
     }
 
@@ -114,7 +122,7 @@ fn request(
     content_type: Option<&str>,
     body: String,
 ) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
+    let mut builder = Request::builder().method(method).uri(uri).header(header::HOST, TEST_HOST);
     if let Some(auth) = auth {
         builder = builder.header(header::AUTHORIZATION, auth);
     }
@@ -289,7 +297,7 @@ async fn given_readonly_user_when_download_batch_then_ok() {
     assert_eq!(header_str(&headers, "content-type"), LFS_MEDIA_TYPE);
     assert_eq!(
         parsed["objects"][0]["actions"]["download"]["href"].as_str(),
-        Some(format!("/lfs/objects/{oid}").as_str())
+        Some(format!("{TEST_ORIGIN}/lfs/objects/{oid}").as_str())
     );
 }
 
@@ -309,7 +317,7 @@ async fn given_stale_declared_size_when_download_batch_then_response_uses_stored
 }
 
 #[tokio::test]
-async fn given_existing_object_when_download_batch_then_relative_href_and_size() {
+async fn given_existing_object_when_download_batch_then_absolute_href_and_size() {
     let app = TestApp::new(USERS);
     let contents = b"download me";
     let oid = app.put_object(contents).await;
@@ -324,7 +332,7 @@ async fn given_existing_object_when_download_batch_then_relative_href_and_size()
     assert_eq!(parsed["objects"][0]["size"].as_u64(), Some(contents.len() as u64));
     assert_eq!(
         parsed["objects"][0]["actions"]["download"]["href"].as_str(),
-        Some(format!("/lfs/objects/{oid}").as_str())
+        Some(format!("{TEST_ORIGIN}/lfs/objects/{oid}").as_str())
     );
     assert_eq!(parsed["objects"][0]["actions"]["download"]["header"], json!({}));
     assert!(!header_str(&headers, "x-request-id").is_empty());
@@ -360,7 +368,7 @@ async fn given_existing_object_when_upload_batch_then_no_upload_action() {
     assert!(parsed["objects"][0]["actions"].get("upload").is_none(), "已存在对象不得再给 upload");
     assert_eq!(
         parsed["objects"][0]["actions"]["verify"]["href"].as_str(),
-        Some(format!("/lfs/objects/{oid}/verify").as_str())
+        Some(format!("{TEST_ORIGIN}/lfs/objects/{oid}/verify").as_str())
     );
 }
 
@@ -375,11 +383,59 @@ async fn given_missing_object_when_upload_batch_then_upload_and_verify_hrefs() {
 
     assert_eq!(status, StatusCode::OK);
     let actions = &parsed["objects"][0]["actions"];
-    assert_eq!(actions["upload"]["href"].as_str(), Some(format!("/lfs/objects/{oid}").as_str()));
+    assert_eq!(
+        actions["upload"]["href"].as_str(),
+        Some(format!("{TEST_ORIGIN}/lfs/objects/{oid}").as_str())
+    );
     assert_eq!(actions["upload"]["header"]["Content-Type"], "application/octet-stream");
     assert_eq!(
         actions["verify"]["href"].as_str(),
-        Some(format!("/lfs/objects/{oid}/verify").as_str())
+        Some(format!("{TEST_ORIGIN}/lfs/objects/{oid}/verify").as_str())
+    );
+}
+
+#[tokio::test]
+async fn given_public_base_when_batch_then_href_uses_configured_base() {
+    // 反代改写主机名/端口时用 server.public_base 固定对外地址。
+    let mut config = config_with_users(USERS);
+    config.server.public_base = "https://lfs.example.com".to_owned();
+    let app = TestApp::from_config(config);
+    let oid = missing_oid('e');
+    let body = batch_body("upload", &[object_json(&oid, 2048)]);
+    let auth = basic_header("alice", PASSWORD);
+
+    let (status, _, parsed) = app.send_json(batch_request(Some(&auth), &body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parsed["objects"][0]["actions"]["upload"]["href"].as_str(),
+        Some(format!("https://lfs.example.com/lfs/objects/{oid}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn given_forwarded_proto_when_batch_then_href_uses_https() {
+    // 没有 public_base 时按 Host + X-Forwarded-Proto 推导（Caddy 反代会传这两个头）。
+    let app = TestApp::new(USERS);
+    let oid = missing_oid('f');
+    let body = batch_body("upload", &[object_json(&oid, 2048)]);
+    let auth = basic_header("alice", PASSWORD);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(BATCH_PATH)
+        .header(header::HOST, TEST_HOST)
+        .header("x-forwarded-proto", "https")
+        .header(header::AUTHORIZATION, auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(body))
+        .expect("构造请求");
+
+    let (status, _, parsed) = app.send_json(request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parsed["objects"][0]["actions"]["upload"]["href"].as_str(),
+        Some(format!("https://{TEST_HOST}/lfs/objects/{oid}").as_str())
     );
 }
 

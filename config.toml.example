@@ -17,9 +17,10 @@
 # 千万别改成 0.0.0.0：Basic Auth 之外的端点（/healthz、/metrics）没有认证，
 # /lfs 也只有应用层口令，裸暴露到公网等于把服务交给扫描器。
 listen = "127.0.0.1:9001"
-# 对外基地址。经反向代理时留空：batch 返回的 href 是相对路径（如 /lfs/objects/<oid>），
-# 客户端按请求 URL 自行拼接，反代改主机名/端口都不会错。
-# 只有「客户端直连本进程且地址与监听地址不同」时才需要填 https://lfs.example.com。
+# 对外基地址（batch 下发的 action href 用它拼绝对 URL——git-lfs 3.4.1 实测拒绝
+# 相对路径）。留空表示按请求的 Host + X-Forwarded-Proto 推导，适合反代透传原始
+# 主机名的场景（Caddy reverse_proxy 默认如此）。
+# 反代改写了主机名/端口、或客户端看到的外部地址与 Host 不同时，显式填对外地址。
 public_base = ""
 
 [storage]

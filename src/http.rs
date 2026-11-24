@@ -271,17 +271,43 @@ pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> 
     }
 }
 
-/// 对象内容端点（PUT 上传 / GET 下载）的相对路径。
+/// action URL 的基地址：优先配置的 `public_base`，否则按请求头推导。
+///
+/// **git-lfs 3.4.1 实测拒绝相对 href**（报 `missing protocol: "/lfs/objects/..."`），
+/// 所以 batch 必须下发绝对 URL。反代场景要求代理透传 `Host` 与
+/// `X-Forwarded-Proto`（Caddy 的 reverse_proxy 默认会传）；`public_base` 非空时
+/// 直接用它，适合反代改写了主机名或端口的情形。
+pub(crate) fn action_base(config: &Config, headers: &axum::http::HeaderMap) -> String {
+    let configured = config.server.public_base.trim_end_matches('/');
+    if !configured.is_empty() {
+        return configured.to_owned();
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').next().unwrap_or(value).trim())
+        .filter(|value| *value == "http" || *value == "https")
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1");
+    format!("{proto}://{host}")
+}
+
+/// 对象内容端点（PUT 上传 / GET 下载）的绝对 URL。
 ///
 /// batch 下发的 `href` 与 transfer 注册的路由必须同源，否则客户端会拿着一个
 /// 本服务没有的地址去传输。两个助手集中在本模块，路由装配与 batch 协商都从这里取。
-pub(crate) fn object_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}")
+pub(crate) fn object_href(base: &str, oid: &Oid) -> String {
+    format!("{base}/lfs/objects/{oid}")
 }
 
-/// 上传后校验端点的相对路径。
-pub(crate) fn verify_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}/verify")
+/// 上传后校验端点的绝对 URL。
+pub(crate) fn verify_href(base: &str, oid: &Oid) -> String {
+    format!("{base}/lfs/objects/{oid}/verify")
 }
 
 /// 为每个请求建 span，记录状态码与耗时，并回写 `x-request-id`。
@@ -349,20 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn given_oid_when_hrefs_then_relative_paths() {
+    fn given_base_when_hrefs_then_absolute_urls() {
         let oid = oid();
+        let base = "http://127.0.0.1:9001";
 
-        assert_eq!(object_href(&oid), format!("/lfs/objects/{oid}"));
-        assert_eq!(verify_href(&oid), format!("/lfs/objects/{oid}/verify"));
-        assert!(object_href(&oid).starts_with('/'), "href 必须是相对路径");
+        assert_eq!(object_href(base, &oid), format!("{base}/lfs/objects/{oid}"));
+        assert_eq!(verify_href(base, &oid), format!("{base}/lfs/objects/{oid}/verify"));
+        // git-lfs 3.4.1 拒绝相对 href（missing protocol），必须带 scheme。
+        assert!(object_href(base, &oid).starts_with("http://"));
     }
 
     #[test]
     fn given_uppercase_oid_when_href_then_normalized_lowercase() {
         let raw = "ABCDEF01".repeat(8);
         let oid = Oid::parse(&raw).expect("合法 oid");
+        let base = "https://lfs.example.com";
 
-        assert_eq!(object_href(&oid), format!("/lfs/objects/{}", raw.to_lowercase()));
-        assert!(verify_href(&oid).ends_with("/verify"));
+        assert_eq!(object_href(base, &oid), format!("{base}/lfs/objects/{}", raw.to_lowercase()));
+        assert!(verify_href(base, &oid).ends_with("/verify"));
     }
 }
