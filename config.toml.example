@@ -60,6 +60,16 @@ dir = "/var/lib/netdisk-lfs/cache"
 # `sudo systemctl stop netdisk-lfs && sudo rm -rf /var/lib/netdisk-lfs/cache/*`。
 max_bytes = 214748364800
 
+[accounts]
+# 账户库（SQLite）路径。留空 = $NETDISK_LFS_DATA_DIR/accounts.db；本示例显式写出，
+# 便于 tests/config_example.rs 在不设环境变量时也能加载校验。必须是绝对路径。
+# 账户库保存注册用户的 Argon2id 口令哈希，属于**不可随意删除**的运行数据，
+# 必须和缓存区分：缓存可随时清空，accounts.db 要纳入 /var/lib/netdisk-lfs 的备份。
+db = "/var/lib/netdisk-lfs/accounts.db"
+# 新账户口令与改密的最小长度（字符数），上限固定 128；口令不能等于用户名，
+# 也不能全为空白。注册策略（open/approval/closed）等字段由后续分支加入。
+min_password_len = 12
+
 # 客户端凭据：用户名 → 口令哈希与角色。用户名即 HTTP Basic 的用户名，
 # 不允许包含 ':'（会让 user:password 拆分有歧义）。
 #
@@ -68,7 +78,9 @@ max_bytes = 214748364800
 #   # 输出形如 `3f1c...9a  -`，取第一个字段（64 个十六进制字符）。
 #   # 注意 printf 不加换行，否则换行符也会被算进哈希。
 #
-# role 只接受两个值：
+# role 接受三个值：
+#   admin     —— 管理员：拥有 readwrite 的全部 LFS 权限，并在后续分支获得
+#                /admin/* 账户管理能力（部署分级账户后建议把 maintainer 改成它）；
 #   readwrite —— 允许 batch 上传、PUT、verify 与下载（日常开发用）；
 #   readonly  —— 只允许下载（CI、只读镜像站、需要临时借看的人）。
 #

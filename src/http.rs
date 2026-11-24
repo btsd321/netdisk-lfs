@@ -384,7 +384,9 @@ mod tests {
         OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, action_base, object_href, outcome_for_status,
         verify_href,
     };
-    use crate::config::{AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig};
+    use crate::config::{
+        AccountsConfig, AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig,
+    };
     use crate::store::Oid;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -404,6 +406,10 @@ mod tests {
                 bdpan_min_throughput_bytes_per_sec: 102_400,
             },
             cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
+            accounts: AccountsConfig {
+                db: std::env::temp_dir().join("netdisk-lfs-http-tests-accounts.db"),
+                min_password_len: 12,
+            },
             auth: AuthConfig::default(),
             runtime_env: RuntimeEnv::Dev,
             data_dir: None,

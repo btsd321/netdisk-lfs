@@ -16,6 +16,8 @@ pub struct Config {
     pub storage: StorageConfig,
     /// `[cache]`：本地读缓存。
     pub cache: CacheConfig,
+    /// `[accounts]`：SQLite 账户库路径与口令策略。
+    pub accounts: AccountsConfig,
     /// `[auth.users]`：LFS 客户端凭据（B4 才消费）。
     pub auth: AuthConfig,
     /// `NETDISK_LFS_ENV`，决定日志格式与默认级别。
@@ -69,6 +71,15 @@ pub struct CacheConfig {
     pub max_bytes: u64,
 }
 
+/// `[accounts]` 段。
+#[derive(Debug, Clone)]
+pub struct AccountsConfig {
+    /// 账户库（SQLite）路径；总是绝对路径，由 `accounts.db` 或数据根推导而来。
+    pub db: PathBuf,
+    /// 口令最小长度（字符数）；上限固定 128，由口令校验负责。
+    pub min_password_len: usize,
+}
+
 /// `[auth]` 段。
 #[derive(Debug, Default, Clone)]
 pub struct AuthConfig {
@@ -94,6 +105,37 @@ pub enum Role {
     Readonly,
     /// 读写：允许上传与下载。
     Readwrite,
+    /// 管理员：除读写权限外，还可在后续分支使用 `/admin/*` 管理账户。
+    Admin,
+}
+
+impl Role {
+    /// 是否允许上传（`readwrite` 与 `admin`）。
+    ///
+    /// 权限判定统一走这里：新增角色时只需改这一处，不会出现 batch 放行、
+    /// PUT 拒绝之类的分叉。
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::Readwrite | Self::Admin)
+    }
+
+    /// 稳定字符串表示，与 serde 的 lowercase 输出、账户库 `role` 列一致。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Readwrite => "readwrite",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// 从字符串解析角色；未知值返回 `None`，由调用方决定报错方式。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "readonly" => Some(Self::Readonly),
+            "readwrite" => Some(Self::Readwrite),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
 }
 
 /// 运行环境标识，来自 `NETDISK_LFS_ENV`，缺省 `dev`。
@@ -121,10 +163,7 @@ impl RuntimeEnv {
 
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Readonly => "readonly",
-            Self::Readwrite => "readwrite",
-        })
+        f.write_str(self.as_str())
     }
 }
 
@@ -134,5 +173,31 @@ impl fmt::Display for RuntimeEnv {
             Self::Dev => "dev",
             Self::Prod => "prod",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Role;
+
+    #[test]
+    fn given_admin_role_when_can_write_then_true_and_readonly_denied() {
+        assert!(Role::Admin.can_write(), "admin 必须拥有 readwrite 的 LFS 写权限");
+        assert!(Role::Readwrite.can_write());
+        assert!(!Role::Readonly.can_write());
+    }
+
+    #[test]
+    fn given_each_role_when_display_and_parse_then_roundtrip() {
+        for role in [Role::Readonly, Role::Readwrite, Role::Admin] {
+            assert_eq!(role.to_string(), role.as_str());
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+            assert_eq!(
+                serde_json::from_str::<Role>(&format!("\"{}\"", role.as_str())).expect("合法角色"),
+                role,
+                "serde 的 lowercase 表示必须与 as_str 一致"
+            );
+        }
+        assert_eq!(Role::parse("owner"), None);
     }
 }

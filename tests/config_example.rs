@@ -34,6 +34,8 @@ fn given_shipped_example_when_loaded_then_valid_and_deploy_shaped() {
     );
     assert_eq!(config.cache.dir, Path::new("/var/lib/netdisk-lfs/cache"));
     assert_eq!(config.cache.max_bytes, 214_748_364_800, "缓存预算 200 GiB");
+    assert_eq!(config.accounts.db, Path::new("/var/lib/netdisk-lfs/accounts.db"));
+    assert_eq!(config.accounts.min_password_len, 12, "口令最少 12 个字符");
     assert_eq!(config.auth.users.len(), 2, "示例给一个读写、一个只读账号");
     assert_eq!(config.auth.users["maintainer"].role, Role::Readwrite);
     assert_eq!(config.auth.users["reader"].role, Role::Readonly);

@@ -25,9 +25,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use http_body_util::BodyExt;
 use netdisk_lfs::store::StoreFuture;
 use netdisk_lfs::{
-    AppState, AuthConfig, Cache, CacheConfig, Config, FakeStore, ObjectMeta, ObjectStore, Oid,
-    Quota, Role, RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, StoreError, UserConfig,
-    router, transient_dir,
+    AccountsConfig, AppState, AuthConfig, Cache, CacheConfig, Config, FakeStore, ObjectMeta,
+    ObjectStore, Oid, Quota, Role, RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig,
+    StoreError, UserConfig, router, transient_dir,
 };
 use tower::ServiceExt;
 
@@ -202,6 +202,7 @@ fn test_config(data_dir: &Path, cache_max_bytes: u64) -> Config {
             bdpan_min_throughput_bytes_per_sec: 102_400,
         },
         cache: CacheConfig { dir: data_dir.join("cache"), max_bytes: cache_max_bytes },
+        accounts: AccountsConfig { db: data_dir.join("accounts.db"), min_password_len: 12 },
         auth: AuthConfig { users: auth_users },
         runtime_env: RuntimeEnv::Dev,
         data_dir: Some(data_dir.to_path_buf()),
