@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use netdisk_lfs::{Config, EnvSource, Role};
+use netdisk_lfs::{Config, EnvSource, RegistrationPolicy, Role};
 
 fn example_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example")
@@ -36,6 +36,15 @@ fn given_shipped_example_when_loaded_then_valid_and_deploy_shaped() {
     assert_eq!(config.cache.max_bytes, 214_748_364_800, "缓存预算 200 GiB");
     assert_eq!(config.accounts.db, Path::new("/var/lib/netdisk-lfs/accounts.db"));
     assert_eq!(config.accounts.min_password_len, 12, "口令最少 12 个字符");
+    assert_eq!(
+        config.accounts.registration,
+        RegistrationPolicy::Approval,
+        "示例默认需要管理员审批"
+    );
+    assert_eq!(config.accounts.default_role, Role::Readwrite, "新账户默认读写");
+    assert_eq!(config.accounts.registration_per_hour, 5, "每 IP 每小时最多 5 个账户");
+    assert_eq!(config.accounts.login_failures_per_5min, 10, "每用户名 5 分钟最多 10 次失败");
+    assert!(!config.accounts.trust_proxy, "示例不假设自己处在可信反代之后");
     assert_eq!(config.auth.users.len(), 2, "示例给一个读写、一个只读账号");
     assert_eq!(config.auth.users["maintainer"].role, Role::Readwrite);
     assert_eq!(config.auth.users["reader"].role, Role::Readonly);

@@ -186,6 +186,30 @@ impl UserStore {
         self.with_conn(move |conn| fetch_user(conn, &username)).await
     }
 
+    /// 读取账户的口令哈希（PHC 字符串）；用户不存在返回 `Ok(None)`。
+    ///
+    /// 只给认证路径用：`User` 故意不带哈希，避免账户视图在 handler 之间流转时把
+    /// 哈希也带出去。哈希取出后由调用方在**独立**的阻塞任务里做 Argon2 校验——
+    /// 校验要几十毫秒，不能占着账户库的连接锁。
+    ///
+    /// # Errors
+    ///
+    /// 用户名不合法或 SQLite 查询失败。
+    pub async fn password_hash(&self, username: &str) -> Result<Option<String>, AccountError> {
+        validate_username(username)?;
+        let username = username.to_owned();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT password_hash FROM users WHERE username = ?1",
+                params![&username],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AccountError::from)
+        })
+        .await
+    }
+
     /// 分页列出账户，返回 `(当页用户, 总数)`。
     ///
     /// `limit = 0` 按 50 处理，上限 100；`offset` 为跳过的行数。`status` 为 `None`

@@ -71,6 +71,13 @@ pub struct CacheConfig {
     pub max_bytes: u64,
 }
 
+/// 口令最小长度缺省值：12 个字符。
+pub(crate) const DEFAULT_MIN_PASSWORD_LEN: usize = 12;
+/// 注册限速缺省值：每来源地址每小时 5 个账户。
+pub(crate) const DEFAULT_REGISTRATION_PER_HOUR: u64 = 5;
+/// 登录失败限速缺省值：每用户名每 5 分钟 10 次。
+pub(crate) const DEFAULT_LOGIN_FAILURES_PER_5MIN: u64 = 10;
+
 /// `[accounts]` 段。
 #[derive(Debug, Clone)]
 pub struct AccountsConfig {
@@ -78,6 +85,65 @@ pub struct AccountsConfig {
     pub db: PathBuf,
     /// 口令最小长度（字符数）；上限固定 128，由口令校验负责。
     pub min_password_len: usize,
+    /// 自助注册策略（`open` / `approval` / `closed`）。
+    pub registration: RegistrationPolicy,
+    /// 新注册账户的默认角色；不允许是 `admin`（管理员只能由配置文件引导）。
+    pub default_role: Role,
+    /// 每个来源地址每小时的注册成功上限；`0` = 不限。
+    pub registration_per_hour: u64,
+    /// 每个用户名每 5 分钟的登录失败上限；`0` = 不限。
+    pub login_failures_per_5min: u64,
+    /// 是否用 `X-Forwarded-For` 的**最后一段**作为注册限速的来源地址。
+    ///
+    /// 取最后一段（代理「追加」语义下由代理写入的真实对端），而不是第一段——
+    /// 第一段是客户端可伪造的。仍只应在可信反向代理之后打开：直连场景下该头
+    /// 完全可控，打开等于让攻击者用伪造 IP 绕过注册限速。
+    pub trust_proxy: bool,
+}
+
+impl Default for AccountsConfig {
+    /// 字段缺省值：与 `[accounts]` 段整体缺失时的解析结果一致。
+    ///
+    /// `db` 留空表示「未指定」，真实配置由 `Config::load_with` 从数据根推导；
+    /// 测试用 `AccountsConfig { db: .., ..AccountsConfig::default() }` 构造，
+    /// 新增字段时不必逐个补字面量。
+    fn default() -> Self {
+        Self {
+            db: PathBuf::new(),
+            min_password_len: DEFAULT_MIN_PASSWORD_LEN,
+            registration: RegistrationPolicy::Approval,
+            default_role: Role::Readwrite,
+            registration_per_hour: DEFAULT_REGISTRATION_PER_HOUR,
+            login_failures_per_5min: DEFAULT_LOGIN_FAILURES_PER_5MIN,
+            trust_proxy: false,
+        }
+    }
+}
+
+/// 自助注册策略。
+///
+/// 与 `Role` 一样用 serde 的 lowercase 表示，`open` 是唯一会让新账户立刻可用的取值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationPolicy {
+    /// 开放：注册即 `Active`，可以马上登录。
+    Open,
+    /// 审批：注册为 `Pending`，需管理员在 C3 的 `/admin/users` 里批准（缺省策略）。
+    #[default]
+    Approval,
+    /// 关闭：注册端点直接拒绝（403），账户只能由管理员创建。
+    Closed,
+}
+
+impl RegistrationPolicy {
+    /// 稳定字符串表示，与 serde 的 lowercase 输出一致。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Approval => "approval",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 /// `[auth]` 段。
@@ -98,12 +164,13 @@ pub struct UserConfig {
 }
 
 /// LFS 客户端的权限档位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// 只读：仅允许下载。
     Readonly,
-    /// 读写：允许上传与下载。
+    /// 读写：允许上传与下载（缺省角色）。
+    #[default]
     Readwrite,
     /// 管理员：除读写权限外，还可在后续分支使用 `/admin/*` 管理账户。
     Admin,
@@ -167,6 +234,12 @@ impl fmt::Display for Role {
     }
 }
 
+impl fmt::Display for RegistrationPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl fmt::Display for RuntimeEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -178,7 +251,22 @@ impl fmt::Display for RuntimeEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::Role;
+    use super::{RegistrationPolicy, Role};
+
+    #[test]
+    fn given_registration_policy_when_display_and_deserialize_then_lowercase_roundtrip() {
+        for policy in
+            [RegistrationPolicy::Open, RegistrationPolicy::Approval, RegistrationPolicy::Closed]
+        {
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert_eq!(
+                serde_json::from_str::<RegistrationPolicy>(&format!("\"{}\"", policy.as_str()))
+                    .expect("合法注册策略"),
+                policy
+            );
+        }
+        assert!(serde_json::from_str::<RegistrationPolicy>("\"invite\"").is_err());
+    }
 
     #[test]
     fn given_admin_role_when_can_write_then_true_and_readonly_denied() {

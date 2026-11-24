@@ -296,3 +296,24 @@ fn given_file_backed_store_when_open_then_path_is_reported() {
 
     assert_eq!(store.path(), db.as_path());
 }
+
+#[tokio::test]
+async fn given_user_when_password_hash_then_phc_string_and_missing_is_none() {
+    // 认证路径需要单独取哈希：`User` 故意不带哈希，避免账户视图外流。
+    let workspace = Workspace::new();
+    let store = open(&workspace);
+    create(&store, "alice", Role::Readwrite, UserStatus::Active).await;
+
+    assert_eq!(
+        store.password_hash("alice").await.expect("查询应成功"),
+        Some(PASSWORD_HASH.to_owned())
+    );
+    assert_eq!(
+        store.password_hash("ghost").await.expect("查询应成功"),
+        None,
+        "不存在返回 Ok(None)"
+    );
+
+    let error = store.password_hash("ab").await.expect_err("非法用户名应报错");
+    assert!(matches!(error, AccountError::InvalidUsername { .. }), "实际错误：{error}");
+}
