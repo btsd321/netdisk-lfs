@@ -54,7 +54,7 @@ use super::{
     config_admin_fallback, config_username, json_with_status, passwords,
 };
 use crate::accounts::{
-    AccountError, User, UserStatus, UserStore, validate_password, validate_username,
+    AccountError, StatusCounts, User, UserStatus, validate_password, validate_username,
 };
 use crate::config::Role;
 
@@ -711,7 +711,9 @@ pub(crate) async fn page(
             return accounts_unavailable_page();
         },
     };
-    let stats = match load_stats(users).await {
+    // 统计与列表来自同一次请求的两个快照：计数用一条 GROUP BY 查回来，
+    // 不再为每种状态各查一次（那样四个数字互相矛盾，总数可能对不上三项之和）。
+    let stats = match users.count_by_status().await {
         Ok(stats) => stats,
         Err(error) => {
             tracing::error!(error = %error, "管理页统计账户失败");
@@ -735,67 +737,48 @@ pub(crate) async fn page(
     )
 }
 
-/// 统计条要四个数字：总数与三种状态各一。
-#[derive(Debug, Clone, Copy, Default)]
-struct Stats {
-    /// 全部账户。
-    total: u64,
-    /// 待审批。
-    pending: u64,
-    /// 已启用。
-    active: u64,
-    /// 已禁用。
-    disabled: u64,
-}
-
-impl Stats {
-    /// 统计条的 HTML：大号数字 + 小号标签，数字用等宽数位对齐。
-    fn render(&self) -> String {
-        let mut html = String::from(r#"<section class="stats" aria-label="账户统计">"#);
-        for (label, count) in [
-            ("总数", self.total),
-            ("待审批", self.pending),
-            ("已启用", self.active),
-            ("已禁用", self.disabled),
-        ] {
-            html.push_str(&format!(
-                r#"<div class="stat"><span class="stat-n">{count}</span><span class="stat-k">{label}</span></div>"#
-            ));
-        }
-        html.push_str("</section>");
-        html
+/// 统计条的 HTML：大号数字 + 小号标签，数字用等宽数位对齐。
+fn render_stats(counts: &StatusCounts) -> String {
+    let mut html = String::from(r#"<section class="stats" aria-label="账户统计">"#);
+    for (label, count) in [
+        ("总数", counts.total),
+        ("待审批", counts.pending),
+        ("已启用", counts.active),
+        ("已禁用", counts.disabled),
+    ] {
+        html.push_str(&format!(
+            r#"<div class="stat"><span class="stat-n">{count}</span><span class="stat-k">{label}</span></div>"#
+        ));
     }
-}
-
-/// 用四次 `COUNT(*)` 取统计，每次只回读一行。
-///
-/// 不把全量账户拉来数一遍：账户数量会随使用增长，而管理页每次打开都要这四个数字；
-/// `limit = 1` 让查询只碰一行，`total` 由账户库那条 `COUNT(*)` 给出。
-async fn load_stats(users: &UserStore) -> Result<Stats, AccountError> {
-    let (_, total) = users.list(None, 1, 0).await?;
-    let (_, pending) = users.list(Some(UserStatus::Pending), 1, 0).await?;
-    let (_, active) = users.list(Some(UserStatus::Active), 1, 0).await?;
-    let (_, disabled) = users.list(Some(UserStatus::Disabled), 1, 0).await?;
-    Ok(Stats { total, pending, active, disabled })
+    html.push_str("</section>");
+    html
 }
 
 /// 没有账户库时的管理页：503 页而不是空表格（空表格会被误读成「一个账户都没有」）。
+///
+/// 「没配账户库」是部署问题，「配了但读写失败」是临时故障，两者的标题与副标题
+/// 必须不同：写成「请稍后重试」会让运维一直等一个不会自己恢复的配置。
 fn accounts_disabled_page() -> Response {
-    accounts_problem_page(ACCOUNTS_NOT_CONFIGURED_MESSAGE)
+    accounts_problem_page(
+        ACCOUNTS_NOT_CONFIGURED_MESSAGE,
+        "管理页未启用",
+        "本实例没有接入账户库，账户管理端点不可用。",
+    )
 }
 
 /// 账户库暂时不可用时的管理页。
 fn accounts_unavailable_page() -> Response {
-    accounts_problem_page(ACCOUNTS_UNAVAILABLE_MESSAGE)
+    accounts_problem_page(
+        ACCOUNTS_UNAVAILABLE_MESSAGE,
+        "管理页暂时不可用",
+        "账户库读写失败，请稍后重试。",
+    )
 }
 
-/// 503 页的公共外壳：原因文本必须转义后进页面。
-fn accounts_problem_page(message: &str) -> Response {
+/// 503 页的公共外壳：标题、副标题与原因文本都由调用方给。
+fn accounts_problem_page(message: &str, title: &str, subtitle: &str) -> Response {
     let body = format!(r#"<p class="alert" role="alert">{}</p>"#, escape_html(message));
-    html_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        layout::public_page("管理页暂时不可用", "账户库读写失败，请稍后重试。", &body),
-    )
+    html_response(StatusCode::SERVICE_UNAVAILABLE, layout::public_page(title, subtitle, &body))
 }
 
 /// 解析管理页的 `?status=` 与 `?offset=`。
@@ -828,14 +811,14 @@ fn parse_filter(raw: Option<&str>) -> Result<Filter, ApiError> {
 fn render_page(
     list: &[User],
     total: u64,
-    stats: &Stats,
+    stats: &StatusCounts,
     filter: &Filter,
     min_password_len: usize,
 ) -> String {
     let mut body = String::from(
         r#"<div class="lede"><h1>账户管理</h1><p>审批、禁用与角色变更立即生效；删除账户不会删除任何 LFS 对象。</p></div>"#,
     );
-    body.push_str(&stats.render());
+    body.push_str(&render_stats(stats));
     if let Some(unknown) = &filter.unknown {
         body.push_str(&format!(
             r#"<p class="alert" role="alert">无法识别的状态过滤 “{}”，已显示全部账户；可选 active、pending、disabled。</p>"#,

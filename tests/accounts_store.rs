@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use netdisk_lfs::{
-    AccountError, Role, UserStatus, UserStore, hash_password, validate_password, verify_password,
+    AccountError, Role, StatusCounts, UserStatus, UserStore, hash_password, validate_password,
+    verify_password,
 };
 
 /// 每个用例一个临时目录；Drop 时连同 SQLite 的 `-wal` / `-shm` 一起删除。
@@ -209,6 +210,41 @@ async fn given_users_when_list_with_pagination_and_status_then_total_and_slices(
     let (pending, total) = store.list(Some(UserStatus::Pending), 0, 0).await.expect("列表应成功");
     assert_eq!(total, 1);
     assert_eq!(pending[0].username, "dave");
+}
+
+#[tokio::test]
+async fn given_mixed_statuses_when_count_by_status_then_matches_list_totals() {
+    let workspace = Workspace::new();
+    let store = open(&workspace);
+
+    let empty = store.count_by_status().await.expect("空库统计应成功");
+    assert_eq!(empty, StatusCounts::default(), "空库四项都应是 0");
+
+    create(&store, "alice", Role::Readwrite, UserStatus::Active).await;
+    create(&store, "bob", Role::Readwrite, UserStatus::Active).await;
+    create(&store, "carol", Role::Readonly, UserStatus::Active).await;
+    create(&store, "dave", Role::Readwrite, UserStatus::Pending).await;
+    create(&store, "eve", Role::Readonly, UserStatus::Disabled).await;
+
+    let counts = store.count_by_status().await.expect("统计应成功");
+    assert_eq!((counts.active, counts.pending, counts.disabled), (3, 1, 1));
+    assert_eq!(counts.total, 5, "总数应是三项之和，而不是另查一个 COUNT(*)");
+
+    // 与分页接口同口径：全库 total 与三次过滤 total 之和都要对上分组计数。
+    let (_, total) = store.list(None, 1, 0).await.expect("列表应成功");
+    assert_eq!(total, counts.total);
+    let mut listed = 0;
+    for status in [UserStatus::Active, UserStatus::Pending, UserStatus::Disabled] {
+        let (_, filtered) = store.list(Some(status), 1, 0).await.expect("列表应成功");
+        listed += filtered;
+    }
+    assert_eq!(listed, counts.total, "分组计数与 list 的过滤总数必须一致");
+
+    // 状态改动后计数立刻跟上（管理页的禁用/启用按钮走的就是这条路径）。
+    store.update_status("dave", UserStatus::Active).await.expect("改状态应成功");
+    let updated = store.count_by_status().await.expect("统计应成功");
+    assert_eq!((updated.active, updated.pending, updated.disabled), (4, 0, 1));
+    assert_eq!(updated.total, 5);
 }
 
 #[tokio::test]

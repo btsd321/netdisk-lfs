@@ -564,7 +564,11 @@ async fn given_no_account_store_when_admin_endpoints_then_503() {
     let (status, headers, body) = app.send(page_get("/admin", "cfgadmin", PASSWORD)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(content_type(&headers).starts_with("text/html"));
-    assert!(body_text(body).contains("账户库未启用"), "应说明原因，而不是空表格");
+    let body = body_text(body);
+    assert!(body.contains("账户库未启用"), "应说明原因，而不是空表格");
+    // 「没配账户库」是部署问题，不能写成「请稍后重试」——那样运维会一直等下去。
+    assert!(body.contains("管理页未启用"), "未接入账户库要给出对应的标题：{body}");
+    assert!(!body.contains("暂时不可用"), "未接入不是临时故障：{body}");
 }
 
 #[tokio::test]
@@ -585,7 +589,8 @@ async fn given_corrupt_row_when_admin_reads_then_503_says_temporarily_unavailabl
     let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body = body_text(body);
-    assert!(body.contains("暂时不可用"), "管理页也应给出可重试的文案：{body}");
+    assert!(body.contains("管理页暂时不可用"), "故障页要说「暂时」，并提示可重试：{body}");
+    assert!(body.contains("请稍后重试"));
     assert!(!body.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
 }
 
