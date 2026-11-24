@@ -473,11 +473,14 @@ fn not_found_if_unchanged(changed: usize, username: String) -> Result<(), Accoun
 }
 
 /// SQLite 唯一约束冲突（用户名重复）。
+///
+/// 只认 `SQLITE_CONSTRAINT_UNIQUE`：外键/NOT NULL 等其它约束失败必须原样上报，
+/// 不能被误判成「用户名已存在」。
 fn is_unique_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(inner, _)
-            if inner.code == rusqlite::ErrorCode::ConstraintViolation
+            if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
     )
 }
 
