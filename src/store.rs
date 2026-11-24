@@ -8,10 +8,12 @@ use std::path::Path;
 use std::pin::Pin;
 
 mod error;
+mod fake;
 mod hash;
 mod oid;
 
 pub use error::StoreError;
+pub use fake::FakeStore;
 pub use hash::{HASH_BUFFER_BYTES, Sha256Writer, hash_file};
 pub use oid::{Oid, OidError};
 
@@ -34,6 +36,9 @@ pub fn object_path(oid: &Oid) -> String {
 /// 协议层就无法把具体后端放进 `Arc<dyn ObjectStore>`——按配置选后端、集成测试换
 /// [`FakeStore`] 都依赖这一点。代价是每次调用一次堆分配，相对网盘子进程与网络 IO
 /// 可以忽略。
+///
+/// 生命周期统一写成 `'a`（`&'a self` 与参数同一生命周期），因为返回的 future 会借用
+/// 参数；若按省略规则只绑 `&self`，实现里的异步块就没法捕获 `oid`。
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
 
 /// 对象元信息；当前只有大小，按后端能力再扩。
@@ -88,16 +93,16 @@ impl Quota {
 ///   而不是伪装成成功。
 pub trait ObjectStore: Send + Sync {
     /// 探测对象是否存在；存在时返回其元信息。
-    fn exists(&self, oid: &Oid) -> StoreFuture<'_, Option<ObjectMeta>>;
+    fn exists<'a>(&'a self, oid: &'a Oid) -> StoreFuture<'a, Option<ObjectMeta>>;
 
     /// 把本地文件写入后端；实现方必须先校验哈希再落最终路径。
-    fn put(&self, oid: &Oid, local_source: &Path) -> StoreFuture<'_, ()>;
+    fn put<'a>(&'a self, oid: &'a Oid, local_source: &'a Path) -> StoreFuture<'a, ()>;
 
     /// 把对象下载到本地 `dest`；完成后 `dest` 的哈希必须等于 oid。
-    fn fetch(&self, oid: &Oid, dest: &Path) -> StoreFuture<'_, ()>;
+    fn fetch<'a>(&'a self, oid: &'a Oid, dest: &'a Path) -> StoreFuture<'a, ()>;
 
     /// 删除对象；不存在时幂等成功。
-    fn delete(&self, oid: &Oid) -> StoreFuture<'_, ()>;
+    fn delete<'a>(&'a self, oid: &'a Oid) -> StoreFuture<'a, ()>;
 
     /// 查询后端配额。
     fn quota(&self) -> StoreFuture<'_, Quota>;
