@@ -24,7 +24,8 @@ use axum::response::Response;
 
 use super::auth::{self, LoginFailure};
 use super::csrf;
-use super::html::{escape_html, html_response, page_shell, parse_form, see_other};
+use super::html::{escape_html, html_response, parse_form, see_other};
+use super::layout;
 use super::session::{self, SessionCookieState};
 use super::{AppState, RequestId};
 use crate::config::{RegistrationPolicy, Role};
@@ -54,6 +55,9 @@ const SESSION_CREATE_MESSAGE: &str = "无法建立会话，请稍后重试";
 /// 表单本身解析不出来时的 400 文案。
 const MALFORMED_FORM_MESSAGE: &str = "表单格式不正确，请从登录页重新提交";
 
+/// 登录页左侧的一句话定位（公开页共用同一套说明）。
+const SUBTITLE: &str = "自建的 Git LFS 服务端：大对象写进百度网盘，仓库里只留指针。";
+
 /// `GET /`：已登录按角色落地（尊重站内 `next`），未登录显示登录页。
 pub(crate) async fn page(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _body) = request.into_parts();
@@ -81,7 +85,7 @@ pub(crate) async fn page(State(state): State<AppState>, request: Request) -> Res
             tracing::debug!(request_id = %request_id, failure = ?failure, "未登录，显示登录页");
             let page = html_response(
                 StatusCode::OK,
-                page_shell("登录", &render_form(&state, next.as_deref(), None)),
+                layout::public_page("登录", SUBTITLE, &render_form(&state, next.as_deref(), None)),
             );
             if clear { auth::with_clear_cookie(page, secure) } else { page }
         },
@@ -225,15 +229,17 @@ fn next_from_query(query: Option<&str>) -> Option<String> {
 }
 
 /// 渲染登录表单；`next` 原样回填（转义后），错误文案只作为提示。
+///
+/// 只返回票根里的正文：`<h1>` 由 [`layout::public_page`] 渲染，避免标题出现两次。
 fn render_form(state: &AppState, next: Option<&str>, error: Option<&str>) -> String {
-    let mut body = String::from("<h1>登录</h1>");
-    body.push_str(
-        r#"<p class="hint">用账户用户名与口令登录；Git 客户端继续用 HTTP Basic，不需要在这里登录。</p>"#,
+    let mut body = String::from(
+        r#"<p class="note">用账户用户名与口令登录；Git 客户端继续用 HTTP Basic，不需要在这里登录。</p>"#,
     );
     if let Some(error) = error {
-        body.push_str(&format!(r#"<p class="error">{}</p>"#, escape_html(error)));
+        // `role="alert"`：读屏器会把登录失败当场播报，不必再去找错误在哪。
+        body.push_str(&format!(r#"<p class="alert" role="alert">{}</p>"#, escape_html(error)));
     }
-    body.push_str(r#"<form method="post" action="/login">"#);
+    body.push_str(r#"<form method="post" action="/login" class="form">"#);
     if let Some(next) = next {
         // 属性值必须转义：`next` 直接来自 `?next=`（用户可控）。
         body.push_str(&format!(
@@ -242,19 +248,19 @@ fn render_form(state: &AppState, next: Option<&str>, error: Option<&str>) -> Str
         ));
     }
     body.push_str(
-        r#"<label>用户名
+        r#"<label class="field"><span>用户名</span>
 <input name="username" autocomplete="username" required autofocus>
 </label>
-<label>口令
+<label class="field"><span>口令</span>
 <input type="password" name="password" autocomplete="current-password" required>
 </label>
-<button type="submit">登录</button>
+<button type="submit" class="btn btn-wide">登录</button>
 </form>"#,
     );
     if matches!(state.config().accounts.registration, RegistrationPolicy::Approval) {
-        body.push_str(r#"<p class="hint">注册后需要管理员审批，审批通过前无法登录。</p>"#);
+        body.push_str(r#"<p class="note">注册后需要管理员审批，审批通过前无法登录。</p>"#);
     }
-    body.push_str(r#"<p class="hint"><a href="/account/register">注册账号</a></p>"#);
+    body.push_str(r#"<p class="note"><a href="/account/register">注册账号</a></p>"#);
     body
 }
 
@@ -265,7 +271,10 @@ fn message_page(
     message: &str,
     next: Option<&str>,
 ) -> Response {
-    html_response(status, page_shell("登录", &render_form(state, next, Some(message))))
+    html_response(
+        status,
+        layout::public_page("登录", SUBTITLE, &render_form(state, next, Some(message))),
+    )
 }
 
 /// 凭据判定失败的响应：401 / 429（带 `Retry-After`）/ 503，页面形态保持一致。
@@ -298,8 +307,10 @@ fn failure_page(
         status = status.as_u16(),
         "登录失败"
     );
-    let mut response =
-        html_response(status, page_shell("登录", &render_form(state, next, Some(&message))));
+    let mut response = html_response(
+        status,
+        layout::public_page("登录", SUBTITLE, &render_form(state, next, Some(&message))),
+    );
     if let Some(seconds) = retry_after
         && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
     {

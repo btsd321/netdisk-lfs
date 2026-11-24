@@ -369,7 +369,8 @@ async fn given_open_policy_when_get_root_then_no_approval_hint() {
     let page = body_text(body);
 
     assert!(page.contains(r#"href="/account/register""#), "注册链接仍要在");
-    assert!(!page.contains("管理员审批"), "open 策略不该提示审批：{page}");
+    // 左侧事实与策略无关；open 策略下整页不该出现「审批」二字（否则与事实自相矛盾）。
+    assert!(!page.contains("审批"), "open 策略不该提示审批：{page}");
 }
 
 #[tokio::test]
@@ -654,7 +655,7 @@ async fn given_session_when_get_account_then_200_with_identity_and_logout_form()
     assert!(content_type(&headers).starts_with("text/html"));
     assert!(page.contains("alice"), "应显示用户名：{page}");
     assert!(page.contains("读写"), "应显示角色：{page}");
-    assert!(page.contains("正常"), "应显示状态：{page}");
+    assert!(page.contains("已启用"), "应显示状态：{page}");
     assert!(page.contains("创建时间") && page.contains("最后登录"), "应显示时间：{page}");
     // git-lfs 会把 `objects/batch` 拼在 lfs.url 后面：示例必须给到 `/lfs/`，
     // 只给站点根地址的话用户照抄会打到 `/objects/batch` 拿 404。

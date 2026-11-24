@@ -5,26 +5,28 @@
 //! 取自认证中间件写进请求扩展的 [`AuthUser`]，没有「按用户名指定目标」的入口，因此
 //! 不存在越权修改他人账户的可能；管理员管理他人账户是 C3 的 `/admin/*`。
 //!
-//! `GET /account` 是浏览器登录后的落地页：只读展示「我是谁 + LFS 端点怎么配 + 退出」，
-//! 不提供改密/注销按钮（那两个是 API，走 `POST /account/password` 与 `DELETE /account`，
-//! 需要重新确认口令）。账户库未接入时它照样能渲染：config-only 用户本来就该有落地页，
-//! 只是创建/最后登录时间显示 `—`；`GET /account/me` 与两个写端点仍保持「没有库就 503」
-//! （没有库就没有可改的账户，config 用户改口令请直接改 `config.toml` 后重启）。
+//! `GET /account` 是浏览器登录后的落地页：左「身份」、右「LFS 接入」，退出在页头。
+//! 不提供改密/注销按钮（那两个是 API，走 `POST /account/password` 与
+//! `DELETE /account`，需要重新确认口令）。账户库未接入时它照样能渲染：config-only
+//! 用户本来就该有落地页，只是创建/最后登录时间显示 `—`；`GET /account/me` 与两个
+//! 写端点仍保持「没有库就 503」（没有库就没有可改的账户，config 用户改口令请直接改
+//! `config.toml` 后重启）。
 //!
 //! 页面会按「这次是怎么认证的」给出不同提示：Basic 是浏览器缓存的凭据，页面上的退出
-//! 按钮只清会话 Cookie，对 Basic 用户无效，所以那种情况下不显示退出表单而提示清除
-//! 浏览器凭据，避免给出一个按了也不生效的按钮。
+//! 按钮只清会话 Cookie，对 Basic 用户无效，所以那种情况下不渲染退出表单（页头只给
+//! 说明）并在身份面板里写清「当前为 HTTP Basic 认证」，避免给出一个按了也不生效的
+//! 按钮。
 
 use axum::Extension;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use super::admin::{role_label, status_label};
 use super::auth::AuthUser;
 use super::error::ApiError;
-use super::html::{escape_html, format_unix_seconds, html_response, page_shell, table};
+use super::html::{escape_html, format_unix_seconds, html_response};
+use super::layout::{self, CredentialChannel, Nav, role_label, status_dot, status_label};
 use super::{
     ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
     action_base, config_admin_fallback, config_username, json_with_status, passwords,
@@ -110,47 +112,36 @@ pub(crate) async fn page(
     let base = action_base(state.config(), &headers);
     // 同一路径两条通道都通：有 `Authorization` 就是 Basic（它的优先级高于 Cookie），
     // 页面必须据此给出「退出按钮能不能真的退出」的准确提示。
-    let channel = if headers.contains_key(header::AUTHORIZATION) {
-        CredentialChannel::Basic
-    } else {
-        CredentialChannel::Session
-    };
+    let channel = CredentialChannel::of(&headers);
     tracing::debug!(
         request_id = %request_id,
         username = %view.username,
         channel = channel.as_str(),
         "渲染账户页"
     );
-    html_response(StatusCode::OK, page_shell("我的账户", &render_page(&view, &base, channel)))
-}
-
-/// 这次请求是怎么认证的：决定页面上的提示与是否显示退出按钮。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialChannel {
-    /// 会话 Cookie（登录页签发）：退出按钮会真的撤销会话。
-    Session,
-    /// HTTP Basic（浏览器缓存的凭据）：退出按钮清不掉它。
-    Basic,
-}
-
-impl CredentialChannel {
-    /// 日志字段值。
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Session => "session",
-            Self::Basic => "basic",
-        }
-    }
+    html_response(
+        StatusCode::OK,
+        layout::authed_page(
+            "我的账户",
+            &auth,
+            view.status,
+            channel,
+            Nav::Account,
+            &render_page(&view, &base, channel),
+        ),
+    )
 }
 
 /// 账户页读库失败时的 503 页。
 fn problem_page(message: &str) -> Response {
-    let body =
-        format!(r#"<h1>我的账户暂时不可用</h1><p class="error">{}</p>"#, escape_html(message));
-    html_response(StatusCode::SERVICE_UNAVAILABLE, page_shell("我的账户", &body))
+    let body = format!(r#"<p class="alert" role="alert">{}</p>"#, escape_html(message));
+    html_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        layout::public_page("我的账户暂时不可用", "账户库读写失败，请稍后重试。", &body),
+    )
 }
 
-/// 账户页正文：身份表格 + LFS 端点与 `.lfsconfig` 片段 + 退出表单。
+/// 账户页正文：左「身份」面板 + 右「LFS 接入」面板。
 ///
 /// 所有动态文本都过 [`escape_html`]：`base` 在没有 `public_base` 时来自 `Host` 头，
 /// 用户名来自账户库，两者都必须按不可信输入处理。
@@ -160,65 +151,79 @@ fn render_page(view: &AccountView, base: &str, channel: CredentialChannel) -> St
         // 只有 config-only 用户会走到这里（库里有行就一定有 created_at）。
         None => "—".to_owned(),
     };
-    let rows = vec![
-        vec!["用户名".to_owned(), escape_html(&view.username)],
-        vec![
-            "角色".to_owned(),
-            format!(
-                r#"<span title="{}">{}</span>"#,
-                view.role.as_str(),
-                escape_html(role_label(view.role))
-            ),
-        ],
-        vec![
-            "状态".to_owned(),
-            format!(
-                r#"<span title="{}">{}</span>"#,
-                view.status.as_str(),
-                escape_html(status_label(view.status))
-            ),
-        ],
-        vec!["创建时间".to_owned(), time(view.created_at)],
-        vec!["最后登录".to_owned(), time(view.last_login_at)],
-    ];
+    // 首字母方块：用户名可能以非拉丁字符开头（甚至为空），取不到就退回中性符号，
+    // 不让布局塌掉。
+    let initial = view
+        .username
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "·".to_owned());
+    // 两条通道的退出方式不同：会话可以由服务端撤销，Basic 只能由浏览器清除。
+    let channel_note = match channel {
+        CredentialChannel::Session => {
+            "当前以会话 Cookie 登录，页头右侧可以退出；Git 客户端请用同一账户的 HTTP Basic 凭据。"
+        },
+        CredentialChannel::Basic => {
+            "当前为 HTTP Basic 认证：凭据由浏览器缓存，本页无法代为清除；退出请关闭浏览器，或清除浏览器为本站点保存的凭据。"
+        },
+    };
+    let admin_link = if view.role == Role::Admin {
+        r#"<p class="panel-note"><a href="/admin">管理账户</a></p>"#
+    } else {
+        ""
+    };
 
-    let mut body = String::from("<h1>我的账户</h1>");
-    match channel {
-        CredentialChannel::Session => body.push_str(
-            r#"<p class="hint">当前以会话 Cookie 登录，无需再输入口令；Git 客户端请用同一账户的 HTTP Basic 凭据。</p>"#,
-        ),
-        // Basic 用户看到的提示必须诚实：页面上的退出按钮清不掉浏览器缓存的凭据。
-        CredentialChannel::Basic => body.push_str(
-            r#"<p class="hint">当前以 HTTP Basic 凭据登录（由浏览器缓存）。本页面无法代为清除 Basic 凭据：要退出请关闭浏览器，或清除浏览器为该站点保存的凭据。</p>"#,
-        ),
-    }
-    body.push_str(&table(&["项目", "值"], &rows));
+    let mut body = String::from(
+        r#"<div class="lede"><h1>我的账户</h1><p>身份与 LFS 接入方式；角色与状态以账户库为准。</p></div>
+<div class="split">"#,
+    );
+    body.push_str(&format!(
+        r#"<section class="panel" aria-labelledby="identity-title">
+<p class="panel-k" id="identity-title">身份</p>
+<div class="id-head">
+<span class="initial" aria-hidden="true">{initial}</span>
+<div>
+<div class="id-name">{name}</div>
+<div class="id-sub"><span class="badge" title="{role_key}">{role}</span><span class="state"><span class="dot {dot}" aria-hidden="true"></span>{status}</span></div>
+</div>
+</div>
+<dl class="meta">
+<dt>创建时间</dt><dd>{created}</dd>
+<dt>最后登录</dt><dd>{last_login}</dd>
+</dl>
+<p class="panel-note">{channel_note}</p>
+{admin_link}
+</section>"#,
+        initial = escape_html(&initial),
+        name = escape_html(&view.username),
+        role_key = view.role.as_str(),
+        role = escape_html(role_label(view.role)),
+        dot = status_dot(view.status),
+        status = escape_html(status_label(view.status)),
+        created = time(view.created_at),
+        last_login = time(view.last_login_at),
+        channel_note = channel_note,
+    ));
     // git-lfs 会把 `objects/batch` 拼在 `lfs.url` 后面，所以这里必须给到 `/lfs/`；
     // 只给站点根地址的话，用户照抄示例会在 `/objects/batch` 上拿到 404。
     body.push_str(&format!(
-        r#"<h2>LFS 端点</h2>
-<p>把仓库的 LFS 地址指向 <code>{}/lfs/</code>：</p>
-<pre>[lfs]
-	url = {}/lfs/</pre>
-<p class="hint">在仓库根目录提交 <code>.lfsconfig</code> 后，<code>git lfs push/pull</code> 会自动使用该地址（凭据仍走 HTTP Basic）。</p>"#,
-        escape_html(base),
-        escape_html(base)
+        r#"<section class="panel" aria-labelledby="lfs-title">
+<p class="panel-k" id="lfs-title">LFS 接入</p>
+<p>Endpoint <code>{base}/lfs/</code></p>
+<p class="note">在仓库根目录提交 <code>.lfsconfig</code>，git-lfs 会把 <code>objects/batch</code> 拼在这个地址后面：</p>
+<pre><code>[lfs]
+	url = {base}/lfs/</code></pre>
+<ol class="steps">
+<li><code>git lfs install</code>：为当前用户启用 LFS 钩子。</li>
+<li><code>git lfs track "*.bin"</code>：把大文件后缀登记进 <code>.gitattributes</code>。</li>
+<li><code>git push origin main</code>：提交后对象经网关写入网盘，指针留在 Git 历史里。</li>
+</ol>
+<p class="note">凭据仍走 HTTP Basic：首次 push 时输入账户用户名与口令。</p>
+</section>"#,
+        base = escape_html(base),
     ));
-    body.push_str("<h2>退出</h2>");
-    match channel {
-        CredentialChannel::Session => body.push_str(
-            r#"<form method="post" action="/logout">
-<button type="submit" class="danger">退出登录</button>
-</form>"#,
-        ),
-        // 不给出一个按了也不生效的按钮：Basic 用户只能靠清除浏览器凭据退出。
-        CredentialChannel::Basic => body.push_str(
-            r#"<p class="hint">退出方式：关闭浏览器，或清除浏览器为本站点保存的凭据（Basic 认证没有服务端可撤销的会话）。</p>"#,
-        ),
-    }
-    if view.role == Role::Admin {
-        body.push_str(r#"<p class="hint"><a href="/admin">管理账户</a></p>"#);
-    }
+    body.push_str("</div>");
     body
 }
 

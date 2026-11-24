@@ -1,4 +1,4 @@
-//! 极简 HTML 渲染与表单解析：注册页与管理员页共用。
+//! HTML 转义、表单解析与响应构造：页面外壳与样式在 [`super::layout`]。
 //!
 //! 不引模板引擎、不加载任何外部资源、页面里没有一行脚本：页面全靠字符串拼接。
 //! 正因如此，**所有**动态文本都必须先经 [`escape_html`]；[`table`] 的单元格是
@@ -17,38 +17,6 @@ use axum::response::Response;
 
 use super::error::ApiError;
 
-/// 页面样式：只做可读性，不引外部资源（离线可用、无追踪）。
-///
-/// 注册页与管理员页共用一份：体量不值得拆，也不值得为此引一个 CSS 依赖。
-pub(crate) const PAGE_STYLE: &str = r#"
-body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2.5rem auto;
-       max-width: 48rem; padding: 0 1rem; line-height: 1.6; color: #1f2328; }
-h1 { font-size: 1.4rem; margin-bottom: .5rem; }
-p { margin: .5rem 0; }
-form { display: grid; gap: .85rem; margin: 1rem 0; max-width: 32rem; }
-label { display: grid; gap: .3rem; font-size: .95rem; }
-input { padding: .5rem; border: 1px solid #d0d7de; border-radius: .375rem; font-size: 1rem; }
-button { padding: .55rem 1rem; border: 0; border-radius: .375rem; background: #1f6feb;
-         color: #fff; font-size: 1rem; cursor: pointer; }
-button.danger { background: #b42318; }
-.hint { color: #59636e; font-size: .9rem; }
-.error { color: #b42318; }
-nav.filters, nav.pager { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1rem 0;
-                           font-size: .9rem; }
-table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .9rem; }
-th, td { border-bottom: 1px solid #d0d7de; padding: .4rem .5rem; text-align: left;
-         vertical-align: top; }
-th { font-weight: 600; white-space: nowrap; }
-pre { background: #f6f8fa; padding: .75rem; border-radius: .375rem; overflow-x: auto;
-      font-size: .9rem; }
-.actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
-.actions form { display: inline-flex; gap: .25rem; align-items: center; margin: 0;
-                max-width: none; }
-.actions select, .actions input[type="password"] { padding: .3rem; font-size: .85rem; }
-.actions button { padding: .3rem .6rem; font-size: .85rem; }
-label.inline { display: inline-flex; align-items: center; gap: .25rem; font-size: .85rem; }
-"#;
-
 /// HTML 转义：`&` 最先替换，避免把后续生成的实体二次转义。
 pub(crate) fn escape_html(raw: &str) -> String {
     let mut escaped = String::with_capacity(raw.len());
@@ -63,29 +31,6 @@ pub(crate) fn escape_html(raw: &str) -> String {
         }
     }
     escaped
-}
-
-/// 页面外壳：内联样式，不引外部资源，不含任何脚本。
-pub(crate) fn page_shell(title: &str, body: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · netdisk-lfs</title>
-<style>{PAGE_STYLE}</style>
-</head>
-<body>
-<main>
-{body}
-</main>
-</body>
-</html>
-"#,
-        title = escape_html(title),
-        body = body,
-    )
 }
 
 /// 构造 HTML 响应（`text/html; charset=utf-8`），并统一加 `Cache-Control: no-store`。
@@ -155,7 +100,8 @@ fn location_header(location: &str) -> HeaderValue {
 pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut html = String::from("<table>\n<thead><tr>");
     for header in headers {
-        html.push_str(&format!("<th>{}</th>", escape_html(header)));
+        // `scope="col"` 让读屏器把表头与整列关联起来（行数多时尤其重要）。
+        html.push_str(&format!(r#"<th scope="col">{}</th>"#, escape_html(header)));
     }
     html.push_str("</tr></thead>\n<tbody>\n");
     for row in rows {
@@ -401,7 +347,7 @@ mod tests {
         );
 
         assert!(html.starts_with("<table>"));
-        assert!(html.contains("<th>用户名</th>"));
+        assert!(html.contains(r#"<th scope="col">用户名</th>"#));
         assert!(html.contains("<td>&lt;script&gt;</td>"), "文本单元格必须已转义：{html}");
         assert!(html.contains("<td><form></form></td>"), "HTML 片段原样输出：{html}");
     }

@@ -89,6 +89,23 @@ pub struct User {
     pub last_login_at: Option<i64>,
 }
 
+/// 按状态分组的账户计数，供管理页统计条一次取全。
+///
+/// `total` 是三项之和（同一快照），因此「总数 = 待审批 + 已启用 + 已禁用」恒成立；
+/// 分开四次 `COUNT(*)` 会拿到四个互不一致的快照。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StatusCounts {
+    /// 全部账户（`pending + active + disabled`）。
+    pub total: u64,
+    /// 待审批。
+    pub pending: u64,
+    /// 已启用。
+    pub active: u64,
+    /// 已禁用。
+    pub disabled: u64,
+}
+
 /// 账户库句柄。
 ///
 /// 轻量：内部是 `Arc`，clone 后共享同一连接与互斥锁；可放进 `AppState` 供各
@@ -258,6 +275,42 @@ impl UserStore {
             };
             let users = raw.into_iter().map(parse_user).collect::<Result<Vec<_>, _>>()?;
             Ok((users, u64::try_from(total).unwrap_or(0)))
+        })
+        .await
+    }
+
+    /// 按状态分组统计账户数：一条 `GROUP BY` 查询返回三项计数与总数。
+    ///
+    /// 与 [`Self::list`] 的 `total` 同一口径（都是 `COUNT(*)`），但只回读三行汇总：
+    /// 管理页每次打开都要这四个数字，分别查四次不但多三次往返，还会得到四个互相
+    /// 矛盾的快照（总数可能对不上三项之和）。
+    ///
+    /// # Errors
+    ///
+    /// SQLite 查询失败，或库里的 `status` 不是已知取值。
+    pub async fn count_by_status(&self) -> Result<StatusCounts, AccountError> {
+        self.with_conn(|conn| {
+            let mut statement =
+                conn.prepare("SELECT status, COUNT(*) FROM users GROUP BY status")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+            let mut counts = StatusCounts::default();
+            for row in rows {
+                let (status, count) = row?;
+                let count = u64::try_from(count).unwrap_or(0);
+                match UserStatus::parse(&status) {
+                    Some(UserStatus::Active) => counts.active = count,
+                    Some(UserStatus::Pending) => counts.pending = count,
+                    Some(UserStatus::Disabled) => counts.disabled = count,
+                    // 与 `list` 一致：脏状态是数据损坏，不静默当成「没有这个状态」。
+                    None => {
+                        return Err(AccountError::CorruptRow { column: "status", value: status });
+                    },
+                }
+            }
+            counts.total =
+                counts.active.saturating_add(counts.pending).saturating_add(counts.disabled);
+            Ok(counts)
         })
         .await
     }
@@ -507,7 +560,9 @@ fn init_schema(conn: &Connection) -> Result<(), AccountError> {
              created_at    INTEGER NOT NULL,
              updated_at    INTEGER NOT NULL,
              last_login_at INTEGER
-         );",
+         );
+         -- 管理页的统计与 ?status= 过滤都按 status 筛选；索引幂等，不需要升 schema 版本。
+         CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);",
     )?;
     let found: Option<i64> = conn
         .query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| row.get(0))

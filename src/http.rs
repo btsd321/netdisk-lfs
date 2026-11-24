@@ -5,9 +5,10 @@
 //! 都长在这条子路由下，新增端点自动继承认证。
 //!
 //! 分工：`auth` 负责认证与角色，`login` 负责浏览器登录页/登录/退出，`account` 与
-//! `admin` 负责自身账户页与管理员账户管理（JSON API + HTML 页），`html` 负责极简
-//! 页面的外壳/转义/表单解析，`error` 负责统一错误体与状态码映射，`batch` 负责批量
-//! 协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
+//! `admin` 负责自身账户页与管理员账户管理（JSON API + HTML 页），`layout` 负责页面
+//! 外壳与唯一一份内联样式，`html` 负责转义/表单解析/响应构造，`error` 负责统一
+//! 错误体与状态码映射，`batch` 负责批量协商，`health` 负责 `bdpan` 探活与降级
+//! 判定，`metrics` 负责 Prometheus 文本。
 //! 本文件只做装配与请求级横切（span、request id）。
 
 use std::fmt;
@@ -40,6 +41,7 @@ mod csrf;
 mod error;
 mod health;
 mod html;
+mod layout;
 mod limits;
 mod login;
 mod metrics;

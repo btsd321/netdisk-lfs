@@ -6,7 +6,7 @@
 //!   记录登录与删除；所有 DB 操作都在阻塞线程池里执行；
 //! - [`hash_password`] / [`verify_password`] / [`validate_password`]：Argon2id
 //!   哈希与口令策略；
-//! - [`User`] / [`UserStatus`]：对外账户视图与状态。
+//! - [`User`] / [`UserStatus`] / [`StatusCounts`]：对外账户视图、状态与分组计数。
 //!
 //! 现有 `[auth.users]` 的 sha256 校验仍由 `http::auth` 处理，本模块不改变它的
 //! 行为；C2 再做「DB 优先、config 回落、登录成功时懒升级哈希」。
@@ -17,4 +17,4 @@ mod store;
 
 pub use error::AccountError;
 pub use password::{MAX_PASSWORD_CHARS, hash_password, validate_password, verify_password};
-pub use store::{User, UserStatus, UserStore, validate_username};
+pub use store::{StatusCounts, User, UserStatus, UserStore, validate_username};

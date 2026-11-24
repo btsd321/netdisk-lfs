@@ -46,15 +46,16 @@ use serde::{Deserialize, Serialize};
 use super::auth::AuthUser;
 use super::csrf;
 use super::error::ApiError;
-use super::html::{
-    escape_html, format_unix_seconds, html_response, page_shell, parse_form, table, wants_html,
-};
+use super::html::{escape_html, format_unix_seconds, html_response, parse_form, table, wants_html};
+use super::layout::{self, CredentialChannel, Nav, role_label, status_dot, status_label};
 use super::register::username_taken;
 use super::{
     ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
     config_admin_fallback, config_username, json_with_status, passwords,
 };
-use crate::accounts::{AccountError, User, UserStatus, validate_password, validate_username};
+use crate::accounts::{
+    AccountError, StatusCounts, User, UserStatus, validate_password, validate_username,
+};
 use crate::config::Role;
 
 /// `GET /admin/users` 未带 `limit` 时的页大小（与账户库的默认值一致）。
@@ -126,11 +127,14 @@ pub(crate) async fn require_admin(request: Request, next: Next) -> Response {
 fn forbidden(request_id: &RequestId, html_page: bool, message: &str) -> Response {
     if html_page {
         let body = format!(
-            r#"<h1>禁止访问</h1><p class="error">{}</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+            r#"<p class="alert" role="alert">{}</p><p class="note">请求 id：{}</p><p class="note"><a href="/admin">返回管理页</a></p>"#,
             escape_html(message),
             escape_html(request_id.as_str())
         );
-        html_response(StatusCode::FORBIDDEN, page_shell("禁止访问", &body))
+        html_response(
+            StatusCode::FORBIDDEN,
+            layout::public_page("禁止访问", "当前身份没有通过这道闸。", &body),
+        )
     } else {
         ApiError::Forbidden(message.to_owned()).into_response_with(request_id)
     }
@@ -688,7 +692,9 @@ struct Filter {
 /// `GET /admin`：只读的用户表格，所有改动都是页面上的表单 POST。
 pub(crate) async fn page(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
     query: RawQuery,
 ) -> Response {
     let Some(users) = state.accounts() else {
@@ -705,25 +711,74 @@ pub(crate) async fn page(
             return accounts_unavailable_page();
         },
     };
+    // 统计与列表来自同一次请求的两个快照：计数用一条 GROUP BY 查回来，
+    // 不再为每种状态各查一次（那样四个数字互相矛盾，总数可能对不上三项之和）。
+    let stats = match users.count_by_status().await {
+        Ok(stats) => stats,
+        Err(error) => {
+            tracing::error!(error = %error, "管理页统计账户失败");
+            return accounts_unavailable_page();
+        },
+    };
     let min_password_len = state.config().accounts.min_password_len;
-    let body = render_page(&list, total, &filter, min_password_len);
-    html_response(StatusCode::OK, page_shell("账户管理", &body))
+    let body = render_page(&list, total, &stats, &filter, min_password_len);
+    // 认证只放行 active 账户（DB 与 config 两条路径都查了状态），所以当前账号在
+    // 页面上的状态恒为「已启用」，不必为 chip 再查一次库。
+    html_response(
+        StatusCode::OK,
+        layout::authed_page(
+            "账户管理",
+            &auth,
+            UserStatus::Active,
+            CredentialChannel::of(&headers),
+            Nav::Admin,
+            &body,
+        ),
+    )
+}
+
+/// 统计条的 HTML：大号数字 + 小号标签，数字用等宽数位对齐。
+fn render_stats(counts: &StatusCounts) -> String {
+    let mut html = String::from(r#"<section class="stats" aria-label="账户统计">"#);
+    for (label, count) in [
+        ("总数", counts.total),
+        (status_label(UserStatus::Pending), counts.pending),
+        (status_label(UserStatus::Active), counts.active),
+        (status_label(UserStatus::Disabled), counts.disabled),
+    ] {
+        html.push_str(&format!(
+            r#"<div class="stat"><span class="stat-n">{count}</span><span class="stat-k">{label}</span></div>"#
+        ));
+    }
+    html.push_str("</section>");
+    html
 }
 
 /// 没有账户库时的管理页：503 页而不是空表格（空表格会被误读成「一个账户都没有」）。
+///
+/// 「没配账户库」是部署问题，「配了但读写失败」是临时故障，两者的标题与副标题
+/// 必须不同：写成「请稍后重试」会让运维一直等一个不会自己恢复的配置。
 fn accounts_disabled_page() -> Response {
-    accounts_problem_page(ACCOUNTS_NOT_CONFIGURED_MESSAGE)
+    accounts_problem_page(
+        ACCOUNTS_NOT_CONFIGURED_MESSAGE,
+        "管理页未启用",
+        "本实例没有接入账户库，账户管理端点不可用。",
+    )
 }
 
 /// 账户库暂时不可用时的管理页。
 fn accounts_unavailable_page() -> Response {
-    accounts_problem_page(ACCOUNTS_UNAVAILABLE_MESSAGE)
+    accounts_problem_page(
+        ACCOUNTS_UNAVAILABLE_MESSAGE,
+        "管理页暂时不可用",
+        "账户库读写失败，请稍后重试。",
+    )
 }
 
-/// 503 页的公共外壳：原因文本必须转义后进页面。
-fn accounts_problem_page(message: &str) -> Response {
-    let body = format!(r#"<h1>管理页不可用</h1><p class="error">{}</p>"#, escape_html(message));
-    html_response(StatusCode::SERVICE_UNAVAILABLE, page_shell("管理页不可用", &body))
+/// 503 页的公共外壳：标题、副标题与原因文本都由调用方给。
+fn accounts_problem_page(message: &str, title: &str, subtitle: &str) -> Response {
+    let body = format!(r#"<p class="alert" role="alert">{}</p>"#, escape_html(message));
+    html_response(StatusCode::SERVICE_UNAVAILABLE, layout::public_page(title, subtitle, &body))
 }
 
 /// 解析管理页的 `?status=` 与 `?offset=`。
@@ -752,26 +807,54 @@ fn parse_filter(raw: Option<&str>) -> Result<Filter, ApiError> {
     Ok(Filter { page: PageQuery { status, offset }, unknown })
 }
 
-/// 渲染整页：过滤链接、提示、表格。
-fn render_page(list: &[User], total: u64, filter: &Filter, min_password_len: usize) -> String {
-    let mut body = String::from("<h1>账户管理</h1>");
-    body.push_str(&format!(
-        r#"<p class="hint">共 {total} 个账户，本页显示 {} 个（每页最多 {MAX_LIMIT} 个）。删除账户不会删除任何 LFS 对象：对象全局共享、内容寻址。</p>"#,
-        list.len()
-    ));
-    body.push_str(&render_filters(filter));
+/// 渲染整页：标题、统计条、筛选页签、表格与翻页。
+fn render_page(
+    list: &[User],
+    total: u64,
+    stats: &StatusCounts,
+    filter: &Filter,
+    min_password_len: usize,
+) -> String {
+    let mut body = String::from(
+        r#"<div class="lede"><h1>账户管理</h1><p>审批、禁用与角色变更立即生效；删除账户不会删除任何 LFS 对象。</p></div>"#,
+    );
+    body.push_str(&render_stats(stats));
     if let Some(unknown) = &filter.unknown {
         body.push_str(&format!(
-            r#"<p class="error">无法识别的状态过滤 “{}”，已显示全部账户；可选 active、pending、disabled。</p>"#,
+            r#"<p class="alert" role="alert">无法识别的状态过滤 “{}”，已显示全部账户；可选 active、pending、disabled。</p>"#,
             escape_html(unknown)
         ));
     }
-    let rows =
-        list.iter().map(|user| render_row(user, filter.page, min_password_len)).collect::<Vec<_>>();
-    body.push_str(&table(&["用户名", "角色", "状态", "创建时间", "最后登录", "操作"], &rows));
+    body.push_str(&render_tabs(filter));
+    body.push_str(&format!(
+        r#"<p class="note">共 {total} 个账户，本页显示 {} 个（每页最多 {MAX_LIMIT} 个）。</p>"#,
+        list.len()
+    ));
+    if list.is_empty() {
+        let offset = u64::from(filter.page.offset);
+        if total > 0 && offset >= total {
+            // 页码越界（手工改地址栏，或翻页后数据变少）不是「没有账户」，而是
+            // 「这个位置没有账户」：给出实际总数并给一条回到第一页的路。
+            body.push_str(&format!(
+                r#"<p class="note">偏移 {offset} 超出范围：当前筛选下共 {total} 个账户。<a href="{}">回到第一页</a></p>"#,
+                page_location(PageQuery { status: filter.page.status, offset: 0 })
+            ));
+        } else {
+            body.push_str(r#"<p class="note">当前筛选下没有账户。</p>"#);
+        }
+    } else {
+        let rows = list
+            .iter()
+            .map(|user| render_row(user, filter.page, min_password_len))
+            .collect::<Vec<_>>();
+        body.push_str(&format!(
+            r#"<div class="table-scroll">{}</div>"#,
+            table(&["用户名", "角色", "状态", "创建时间", "最后登录", "操作"], &rows)
+        ));
+    }
     body.push_str(&render_pager(filter, total));
     body.push_str(
-        r#"<p class="hint">账户来自账户库；<code>[auth.users]</code> 里的配置用户在首次登录后才会出现在这里。</p>"#,
+        r#"<p class="note">账户来自账户库；<code>[auth.users]</code> 里的配置用户在首次登录后才会出现在这里。</p>"#,
     );
     body
 }
@@ -814,18 +897,19 @@ fn render_pager(filter: &Filter, total: u64) -> String {
     format!(r#"<nav class="pager">{links}</nav>"#)
 }
 
-/// 状态过滤链接；每个链接都带 `?status=`，当前生效的那条加「(当前)」。
-fn render_filters(filter: &Filter) -> String {
-    let mut html = String::from(r#"<nav class="filters">"#);
+/// 状态筛选页签：每个链接都带 `?status=`，当前生效的那条标 `aria-current`。
+fn render_tabs(filter: &Filter) -> String {
+    let mut html = String::from(r#"<nav class="tabs" aria-label="按状态筛选">"#);
+    // 页签文案与表格、统计条共用 status_label：同一状态在页面上只能有一种说法。
     for (label, status) in [
         ("全部", None),
-        ("正常", Some(UserStatus::Active)),
-        ("待审批", Some(UserStatus::Pending)),
-        ("已禁用", Some(UserStatus::Disabled)),
+        (status_label(UserStatus::Pending), Some(UserStatus::Pending)),
+        (status_label(UserStatus::Active), Some(UserStatus::Active)),
+        (status_label(UserStatus::Disabled), Some(UserStatus::Disabled)),
     ] {
         let href = page_location(PageQuery { status, offset: 0 });
-        let current = if filter.page.status == status { " <strong>(当前)</strong>" } else { "" };
-        html.push_str(&format!(r#"<a href="{href}">{label}{current}</a>"#));
+        let current = if filter.page.status == status { r#" aria-current="page""# } else { "" };
+        html.push_str(&format!(r#"<a href="{href}"{current}>{label}</a>"#));
     }
     html.push_str("</nav>");
     html
@@ -835,11 +919,23 @@ fn render_filters(filter: &Filter) -> String {
 fn render_row(user: &User, page: PageQuery, min_password_len: usize) -> Vec<String> {
     vec![
         escape_html(&user.username),
-        format!(r#"<span title="{}">{}</span>"#, user.role.as_str(), role_label(user.role)),
-        format!(r#"<span title="{}">{}</span>"#, user.status.as_str(), status_label(user.status)),
-        format_unix_seconds(user.created_at),
+        format!(
+            r#"<span class="badge" title="{}">{}</span>"#,
+            user.role.as_str(),
+            role_label(user.role)
+        ),
+        format!(
+            r#"<span class="state" title="{}"><span class="dot {}" aria-hidden="true"></span>{}</span>"#,
+            user.status.as_str(),
+            status_dot(user.status),
+            status_label(user.status)
+        ),
+        // 时间不换行：拆成两行的 UTC 时间在台账里根本对不齐。
+        format!(r#"<span class="num">{}</span>"#, format_unix_seconds(user.created_at)),
         match user.last_login_at {
-            Some(seconds) => format_unix_seconds(seconds),
+            Some(seconds) => {
+                format!(r#"<span class="num">{}</span>"#, format_unix_seconds(seconds))
+            },
             None => "从未登录".to_owned(),
         },
         render_actions(user, page, min_password_len),
@@ -862,8 +958,14 @@ fn render_actions(user: &User, page: PageQuery, min_password_len: usize) -> Stri
         UserStatus::Active => ("disable", "禁用"),
         UserStatus::Disabled => ("enable", "启用"),
     };
+    // 主操作（批准/启用）用强调色按钮，危险操作（禁用/删除）用 danger，其余是
+    // 次级操作：一屏里按钮的视觉重量要跟「改动后果」一致。
+    let class = match user.status {
+        UserStatus::Pending | UserStatus::Disabled => "btn btn-small",
+        UserStatus::Active => "btn btn-danger btn-small",
+    };
     html.push_str(&format!(
-        r#"<form method="post" action="/admin/users/{name}/{action}">{hidden}<button type="submit">{label}</button></form>"#
+        r#"<form method="post" action="/admin/users/{name}/{action}">{hidden}<button type="submit" class="{class}">{label}</button></form>"#
     ));
 
     let mut options = String::new();
@@ -876,16 +978,16 @@ fn render_actions(user: &User, page: PageQuery, min_password_len: usize) -> Stri
         ));
     }
     html.push_str(&format!(
-        r#"<form method="post" action="/admin/users/{name}/role">{hidden}<select name="role">{options}</select><button type="submit">保存角色</button></form>"#
+        r#"<form method="post" action="/admin/users/{name}/role">{hidden}<select name="role" aria-label="角色">{options}</select><button type="submit" class="btn btn-quiet btn-small">保存角色</button></form>"#
     ));
 
     html.push_str(&format!(
-        r#"<form method="post" action="/admin/users/{name}/password-form">{hidden}<input type="password" name="password" placeholder="新口令" autocomplete="new-password" required minlength="{min_password_len}"><button type="submit">重置口令</button></form>"#
+        r#"<form method="post" action="/admin/users/{name}/password-form">{hidden}<input type="password" name="password" placeholder="新口令" aria-label="新口令" autocomplete="new-password" required minlength="{min_password_len}"><button type="submit" class="btn btn-quiet btn-small">重置口令</button></form>"#
     ));
 
     // 删除是不可逆的：浏览器侧 `required` 勾选框 + 服务端再查一次 `confirm` 字段。
     html.push_str(&format!(
-        r#"<form method="post" action="/admin/users/{name}/delete">{hidden}<label class="inline"><input type="checkbox" name="confirm" value="yes" required>确认删除</label><button type="submit" class="danger">删除</button></form>"#
+        r#"<form method="post" action="/admin/users/{name}/delete">{hidden}<label class="inline"><input type="checkbox" name="confirm" value="yes" required>确认删除</label><button type="submit" class="btn btn-danger btn-small">删除</button></form>"#
     ));
     html.push_str("</div>");
     html
@@ -906,25 +1008,7 @@ fn hidden_page_fields(page: PageQuery) -> String {
     hidden
 }
 
-/// 角色在页面上的中文标签。
-pub(crate) fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::Readonly => "只读",
-        Role::Readwrite => "读写",
-        Role::Admin => "管理员",
-    }
-}
-
-/// 状态在页面上的中文标签。
-pub(crate) fn status_label(status: UserStatus) -> &'static str {
-    match status {
-        UserStatus::Active => "正常",
-        UserStatus::Pending => "待审批",
-        UserStatus::Disabled => "已禁用",
-    }
-}
-
-/// `POST /admin/users/{name}/approve`：待审批 → 正常（303）。
+/// `POST /admin/users/{name}/approve`：待审批 → 已启用（303）。
 pub(crate) async fn approve(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -939,7 +1023,7 @@ pub(crate) async fn approve(
     set_status(state, auth, request_id, name, body, UserStatus::Active).await
 }
 
-/// `POST /admin/users/{name}/disable`：正常 → 已禁用（303）。
+/// `POST /admin/users/{name}/disable`：已启用 → 已禁用（303）。
 pub(crate) async fn disable(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -954,7 +1038,7 @@ pub(crate) async fn disable(
     set_status(state, auth, request_id, name, body, UserStatus::Disabled).await
 }
 
-/// `POST /admin/users/{name}/enable`：已禁用 → 正常（303）。
+/// `POST /admin/users/{name}/enable`：已禁用 → 已启用（303）。
 pub(crate) async fn enable(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -1116,11 +1200,11 @@ fn redirect_to_admin(page: PageQuery) -> Response {
 fn error_page(error: &ApiError, request_id: &RequestId) -> Response {
     let status = error.status();
     let body = format!(
-        r#"<h1>操作失败</h1><p class="error">{}</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+        r#"<p class="alert" role="alert">{}</p><p class="note">请求 id：{}</p><p class="note"><a href="/admin">返回管理页</a></p>"#,
         escape_html(error.message()),
         escape_html(request_id.as_str())
     );
-    html_response(status, page_shell("操作失败", &body))
+    html_response(status, layout::public_page("操作失败", "这次改动没有生效。", &body))
 }
 
 #[cfg(test)]
@@ -1148,7 +1232,7 @@ mod tests {
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "实际：{html}");
         // 状态按钮、角色下拉、口令输入与删除确认都在同一格里。
         assert!(html.contains("/disable"), "active 账户应给「禁用」");
-        assert!(html.contains(r#"<select name="role">"#));
+        assert!(html.contains(r#"name="role""#), "角色下拉要在操作格里：{html}");
         assert!(html.contains(r#"name="confirm" value="yes" required"#));
     }
 
@@ -1196,7 +1280,7 @@ mod tests {
         assert_eq!(role_label(Role::Admin), "管理员");
         assert_eq!(role_label(Role::Readwrite), "读写");
         assert_eq!(role_label(Role::Readonly), "只读");
-        assert_eq!(status_label(UserStatus::Active), "正常");
+        assert_eq!(status_label(UserStatus::Active), "已启用");
         assert_eq!(status_label(UserStatus::Pending), "待审批");
         assert_eq!(status_label(UserStatus::Disabled), "已禁用");
     }

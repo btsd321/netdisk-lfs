@@ -564,7 +564,11 @@ async fn given_no_account_store_when_admin_endpoints_then_503() {
     let (status, headers, body) = app.send(page_get("/admin", "cfgadmin", PASSWORD)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(content_type(&headers).starts_with("text/html"));
-    assert!(body_text(body).contains("账户库未启用"), "应说明原因，而不是空表格");
+    let body = body_text(body);
+    assert!(body.contains("账户库未启用"), "应说明原因，而不是空表格");
+    // 「没配账户库」是部署问题，不能写成「请稍后重试」——那样运维会一直等下去。
+    assert!(body.contains("管理页未启用"), "未接入账户库要给出对应的标题：{body}");
+    assert!(!body.contains("暂时不可用"), "未接入不是临时故障：{body}");
 }
 
 #[tokio::test]
@@ -585,7 +589,8 @@ async fn given_corrupt_row_when_admin_reads_then_503_says_temporarily_unavailabl
     let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body = body_text(body);
-    assert!(body.contains("暂时不可用"), "管理页也应给出可重试的文案：{body}");
+    assert!(body.contains("管理页暂时不可用"), "故障页要说「暂时」，并提示可重试：{body}");
+    assert!(body.contains("请稍后重试"));
     assert!(!body.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
 }
 
@@ -1115,17 +1120,34 @@ async fn given_admin_page_when_get_then_table_with_escaped_username() {
     // 每行都有状态按钮、角色下拉、口令输入与带确认框的删除表单。
     assert!(body.contains(r#"action="/admin/users/pending-pal/approve""#));
     assert!(body.contains(r#"action="/admin/users/root/disable""#));
-    assert!(body.contains(r#"<select name="role">"#));
+    assert!(body.contains(r#"name="role""#), "角色下拉要在操作格里：{body}");
     assert!(body.contains(r#"name="password""#));
     assert!(body.contains(r#"action="/admin/users/root/delete""#));
     assert!(body.contains(r#"name="confirm""#));
+
+    // 统计条：总数与三种状态各一个数字（root=active、pending-pal=pending、
+    // 手工写入的账户=disabled）。
+    assert!(body.contains(r#"aria-label="账户统计""#), "应有统计条：{body}");
+    for (count, label) in [("3", "总数"), ("1", "待审批"), ("1", "已启用"), ("1", "已禁用")]
+    {
+        assert!(
+            body.contains(&format!(r#"<span class="stat-n">{count}</span>"#)),
+            "统计条应给出 {label}={count}：{body}"
+        );
+        assert!(body.contains(&format!(r#"<span class="stat-k">{label}</span>"#)));
+    }
+    // 状态筛选页签：当前项用 aria-current 标出，链接保留 ?status=。
+    assert!(body.contains(r#"aria-label="按状态筛选""#), "应有筛选页签：{body}");
+    assert!(body.contains(r#"<a href="/admin" aria-current="page">全部</a>"#));
 
     // 状态过滤：只显示待审批。
     let (status, _, filtered) = app.send(page_get("/admin?status=pending", "root", PASSWORD)).await;
     assert_eq!(status, StatusCode::OK);
     let filtered = body_text(filtered);
     assert!(filtered.contains("pending-pal"));
-    assert!(!filtered.contains(">root<"), "过滤后不应出现 normal 账户：{filtered}");
+    // 页头的账号 chip 会显示当前管理员自己的用户名，所以「没有 root 这一行」要按行内
+    // 操作表单的地址判断，不能按纯文本 `>root<` 判断。
+    assert!(!filtered.contains("/admin/users/root/"), "过滤后不应出现 active 账户：{filtered}");
 
     // 无法识别的过滤值：忽略并转义回显，不 500。
     let (status, _, unknown) =
