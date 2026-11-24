@@ -1,6 +1,12 @@
-//! HTTP Basic 认证与角色提取。
+//! 认证与角色提取：HTTP Basic 与会话 Cookie 双通道。
 //!
-//! 安全约定见 `specs/api.md`「公共约定」：
+//! **优先级**：请求带 `Authorization` 头时只认 Basic，失败即 401，不回退 Cookie；
+//! 否则才看会话 Cookie。git 客户端只会用 Basic，浏览器登录后用 Cookie。
+//!
+//! **会话通道**每次都重新确认账户：账户库优先（角色也以库为准，改角色/禁用/删除
+//! 立即生效），未接入账户库时回落 `[auth.users]`；确认不过就撤销该会话。
+//!
+//! Basic 的安全约定见 `specs/api.md`「公共约定」：
 //!
 //! - 未带认证头、格式错、用户名不存在、口令不符**一律 401**，响应体完全相同，
 //!   不泄漏「用户名是否存在」；
@@ -21,7 +27,7 @@ use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::HeaderValue;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, SET_COOKIE};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
@@ -30,6 +36,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::{self, ApiError};
 use super::passwords;
+use super::session::{self, SessionCookieState, SessionId};
 use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId};
 use crate::accounts::{AccountError, UserStatus, UserStore};
 use crate::config::{Config, Role, UserConfig};
@@ -105,6 +112,14 @@ impl AuthFailure {
 
 /// 认证中间件：校验通过后把 [`Role`] 与 [`AuthUser`] 写进请求扩展，再交给下游 handler。
 ///
+/// 双通道：
+///
+/// 1. 请求带 `Authorization` 头 → 走 Basic（git 客户端与脚本的既有路径），失败就
+///    401，**不**回退到 Cookie——两套凭据同时出现时以 Basic 为准，避免「Basic 写错
+///    却被 Cookie 放行」这种身份混淆；
+/// 2. 否则看会话 Cookie：有效则以**账户库当前的角色**认人（管理员改角色立即生效），
+///    失效/被撤销/账户不可用时删会话、401 并让浏览器清掉那条 Cookie。
+///
 /// 返回 `Response` 而不是 `Result`，是因为失败时要复用本次请求的 request id
 /// 构造错误体——`ApiError` 的 `IntoResponse` 拿不到请求，只能另外生成一个，
 /// 那样响应体与响应头的 id 会对不上。
@@ -113,16 +128,25 @@ pub(crate) async fn require(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 先取出 Authorization 头再进入异步：`Request<Body>` 不是 `Sync`，把 `&request`
+    // 先取出认证相关的头再进入异步：`Request<Body>` 不是 `Sync`，把 `&request`
     // 带过 `.await` 会让整个中间件 future 不是 `Send`（axum 的 `FromFn` 要求它）。
     let authorization = request.headers().get(AUTHORIZATION).cloned();
-    match authenticate(&state, authorization).await {
+    let cookie = session::parse_session_cookie(request.headers());
+    // 清 Cookie 时要与服务端签发时同样带不带 Secure，否则 HTTPS 站点上清不掉。
+    let secure = session::request_is_https(request.headers(), state.config());
+
+    let outcome = match authorization {
+        Some(header) => authenticate(&state, Some(header)).await.map_err(Rejection::Basic),
+        None => authenticate_session(&state, &cookie).await.map_err(Rejection::Session),
+    };
+
+    match outcome {
         Ok(user) => {
             request.extensions_mut().insert(user.role);
             request.extensions_mut().insert(user);
             next.run(request).await
         },
-        Err(failure) => {
+        Err(rejection) => {
             let request_id = request
                 .extensions()
                 .get::<RequestId>()
@@ -130,10 +154,186 @@ pub(crate) async fn require(
                 .unwrap_or_else(RequestId::generate);
             tracing::warn!(
                 request_id = %request_id,
-                reason = failure.as_str(),
-                "LFS 认证失败"
+                channel = rejection.channel(),
+                reason = rejection.reason(),
+                "认证失败"
             );
-            failure_response(failure, &request_id)
+            rejection.into_response(&request_id, secure)
+        },
+    }
+}
+
+/// 认证失败的通道归属：两条通道的失败语义不同（Basic 有 429、Cookie 要清 Cookie）。
+enum Rejection {
+    /// Basic 通道失败。
+    Basic(AuthFailure),
+    /// 会话 Cookie 通道失败。
+    Session(SessionFailure),
+}
+
+impl Rejection {
+    /// 日志字段值：哪条通道失败（`accounts_unavailable` 这类原因两条通道都会出现，
+    /// 只靠 reason 分不清该去查账户库还是查会话）。
+    fn channel(&self) -> &'static str {
+        match self {
+            Self::Basic(_) => "basic",
+            Self::Session(_) => "session",
+        }
+    }
+
+    /// 日志字段值：为什么失败（Basic 与 Session 的取值集合不同）。
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Basic(failure) => failure.as_str(),
+            Self::Session(failure) => failure.as_str(),
+        }
+    }
+
+    /// 映射成响应；`secure` 决定清除 Cookie 时是否带 `Secure`。
+    fn into_response(self, request_id: &RequestId, secure: bool) -> Response {
+        match self {
+            Self::Basic(failure) => failure_response(failure, request_id),
+            Self::Session(failure) => session_failure_response(failure, request_id, secure),
+        }
+    }
+}
+
+/// 会话认证失败的原因；只写日志，不写响应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFailure {
+    /// 既没有 `Authorization` 头也没有会话 Cookie。
+    Missing,
+    /// 带了会话 Cookie，但值不是合法的会话 id：清掉它，别让浏览器无限重发。
+    Malformed,
+    /// Cookie 里的会话 id 不在表里（伪造、空闲/绝对过期或已被撤销）。
+    Expired,
+    /// 会话对应的账户已不可用：被删除、待审批或已禁用。
+    Revoked,
+    /// 账户库故障：无法确认账户状态，按 503 让客户端稍后重试。
+    AccountsUnavailable,
+}
+
+impl SessionFailure {
+    /// 日志字段值；固定小写英文，避免把用户输入带进日志。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing_session",
+            Self::Malformed => "malformed_session",
+            Self::Expired => "session_expired",
+            Self::Revoked => "session_revoked",
+            Self::AccountsUnavailable => "accounts_unavailable",
+        }
+    }
+}
+
+/// 会话通道的失败响应：401 统一文案、503 带认证挑战头；失效/被撤销时清除 Cookie。
+fn session_failure_response(
+    failure: SessionFailure,
+    request_id: &RequestId,
+    secure: bool,
+) -> Response {
+    let unauthorized =
+        || ApiError::Unauthorized(AUTH_FAILURE_MESSAGE.to_owned()).into_response_with(request_id);
+    match failure {
+        SessionFailure::AccountsUnavailable => error::with_auth_challenge(
+            ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned())
+                .into_response_with(request_id),
+        ),
+        // 没带 Cookie：本来就没有可清的东西，别凭空塞一条 Set-Cookie。
+        SessionFailure::Missing => unauthorized(),
+        // 畸形、失效或被撤销：让浏览器把那条 Cookie 扔掉，否则每个请求都会带着它回来，
+        // 永远 401 且没有出口。
+        SessionFailure::Malformed | SessionFailure::Expired | SessionFailure::Revoked => {
+            with_clear_cookie(unauthorized(), secure)
+        },
+    }
+}
+
+/// 给响应附加一条清除会话 Cookie 的 `Set-Cookie`。
+fn with_clear_cookie(mut response: Response, secure: bool) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&session::secure_clear_cookie(secure)) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+/// 会话 Cookie 通道：查会话、再按「账户库优先、config 回落」确认账户仍可用。
+///
+/// 两件事必须每次都做，不能只信任登录时的快照：
+///
+/// - 账户状态：被删除/禁用/待审批的账户，其已有会话立即失效；
+/// - 角色：以账户库里的**当前**角色为准，管理员降级某个账号后，那个账号手里的会话
+///   不能还按旧角色操作。
+async fn authenticate_session(
+    state: &AppState,
+    cookie: &SessionCookieState,
+) -> Result<AuthUser, SessionFailure> {
+    let id = match cookie {
+        SessionCookieState::Missing => return Err(SessionFailure::Missing),
+        // 值本身不合法：连查表都不用查，直接让浏览器清掉。
+        SessionCookieState::Malformed => return Err(SessionFailure::Malformed),
+        SessionCookieState::Present(id) => id,
+    };
+    // `get` 顺带滑动空闲计时：浏览器每访问一次，12 小时的空闲窗口就重新开始。
+    let Some(session) = state.sessions().get(id) else {
+        return Err(SessionFailure::Expired);
+    };
+
+    match state.accounts() {
+        Some(users) => match users.get(&session.username).await {
+            Ok(Some(user)) if user.status == UserStatus::Active => {
+                Ok(AuthUser { username: user.username, role: user.role })
+            },
+            Ok(Some(user)) => {
+                tracing::warn!(
+                    username = %user.username,
+                    status = user.status.as_str(),
+                    "会话对应的账户已不可用，撤销会话"
+                );
+                state.sessions().revoke(id);
+                Err(SessionFailure::Revoked)
+            },
+            // 库里没有这个账户：与 Basic 通道一致回落 `[auth.users]`。config-only 用户
+            // （还没懒升级、或升级时写库失败）本来就是合法存在的身份。
+            //
+            // 被管理员删除的账户不会因此复活：管理端删除会先 revoke_user，而且删除时
+            // `[auth.users]` 里有同名条目会直接 409，所以「库里没有 + config 也没有」
+            // 就是这条会话的终点。用户名不合法（例如 2 个字符的旧 config 用户名）同理。
+            Ok(None) | Err(AccountError::InvalidUsername { .. }) => {
+                session_config_user(state, id, &session.username)
+            },
+            Err(error) => {
+                tracing::error!(
+                    username = %session.username,
+                    error = %error,
+                    "确认会话账户状态失败"
+                );
+                Err(SessionFailure::AccountsUnavailable)
+            },
+        },
+        None => session_config_user(state, id, &session.username),
+    }
+}
+
+/// 账户只能来自 `[auth.users]` 时（未接入账户库，或库里查不到这一行）用配置判角色。
+///
+/// 库里查不到这一行**不等于**账户没了：config-only 用户、懒升级写库失败的用户都还
+/// 属于这里。配置里也找不到这个用户名时才是真的没了——会话不能凭空延续，这里不做
+/// 「建立时有效就一直有效」的豁免，撤销后 401。
+fn session_config_user(
+    state: &AppState,
+    id: &SessionId,
+    username: &str,
+) -> Result<AuthUser, SessionFailure> {
+    match state.config().auth.users.get(username) {
+        Some(user) => Ok(AuthUser { username: username.to_owned(), role: user.role }),
+        None => {
+            tracing::warn!(
+                username = %username,
+                "会话对应的用户不在 [auth.users] 里，撤销会话"
+            );
+            state.sessions().revoke(id);
+            Err(SessionFailure::Revoked)
         },
     }
 }

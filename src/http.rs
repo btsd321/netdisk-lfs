@@ -35,6 +35,7 @@ mod account;
 mod admin;
 mod auth;
 mod batch;
+mod csrf;
 mod error;
 mod health;
 mod html;
@@ -42,12 +43,20 @@ mod limits;
 mod metrics;
 mod passwords;
 mod register;
+mod session;
 mod transfer;
 
 use limits::{LOGIN_WINDOW, REGISTRATION_WINDOW, SlidingWindowLimiter};
 
 pub use error::ApiError;
 pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
+// 会话基础设施：登录端点（L2）与会话认证共用同一套 id/Cookie/HTTPS 判定，避免各写
+// 一份导致「登录时带 Secure、清除时不带」这类不一致。
+pub use session::{
+    SESSION_COOKIE_NAME, Session, SessionCookieState, SessionId, SessionStore,
+    clear_session_cookie, has_session_cookie, parse_session_cookie, request_is_https,
+    secure_clear_cookie, secure_cookie, session_cookie,
+};
 // 上传缓冲目录由 `transfer` 唯一实现（含 `data_dir` 缺省时的回退）；`main` 的启动
 // 清理要清同一批目录，所以从这里导出，避免两处各推导一遍导致清理漏目录。
 pub use transfer::upload_dir;
@@ -116,6 +125,8 @@ pub struct AppState {
     /// SQLite 账户库；`None` 表示未接入（嵌入用法/既有测试），此时认证只查
     /// `[auth.users]`，`/account/*` 一律 503。
     accounts: Option<Arc<UserStore>>,
+    /// 浏览器会话表（进程内）；无状态构造，不需要配置，重启即清空。
+    sessions: Arc<SessionStore>,
     /// 登录失败限速（按小写用户名）与注册限速（按来源地址）；进程内状态，重启清零。
     login_limits: Arc<SlidingWindowLimiter>,
     register_limits: Arc<SlidingWindowLimiter>,
@@ -141,6 +152,7 @@ impl AppState {
             cache,
             probe: None,
             accounts: None,
+            sessions: Arc::new(SessionStore::new()),
             login_limits: Arc::new(SlidingWindowLimiter::new(LOGIN_WINDOW)),
             register_limits: Arc::new(SlidingWindowLimiter::new(REGISTRATION_WINDOW)),
         }
@@ -201,6 +213,14 @@ impl AppState {
         self.accounts.as_deref()
     }
 
+    /// 浏览器会话表；登录端点建会话、认证中间件查会话、管理端撤销会话都走它。
+    ///
+    /// 返回借用而非 `Arc` 克隆：会话表本身不跨任务 move，`AppState` 已经用 `Arc`
+    /// 让各 handler 共享同一份。
+    pub fn sessions(&self) -> &SessionStore {
+        &self.sessions
+    }
+
     /// 登录失败限速器；认证中间件用它按用户名计数。
     pub(crate) fn login_limits(&self) -> &SlidingWindowLimiter {
         &self.login_limits
@@ -225,6 +245,10 @@ pub fn router(state: AppState) -> Router {
         .merge(account_router(state.clone()))
         .merge(admin_router(state.clone()))
         .merge(lfs_router(state.clone()))
+        // 全局会话 CSRF 守卫：必须套在 `request_span` 之内（错误页要用它注入的
+        // request id），同时位于路由处理之外——跨站写请求在认证之前就被挡掉，
+        // 不依赖具体端点自己再判一次。
+        .layer(middleware::from_fn(csrf::guard))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
 }
