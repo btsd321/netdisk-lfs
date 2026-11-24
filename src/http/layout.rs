@@ -253,13 +253,16 @@ pub(crate) const STYLE: &str = r#"
   --bg: #dfdedb;
   --surface: #d3d2ce;
   --ink: #26251e;
-  --muted: #6b6a62;
+  --muted: #55544d;
   --rule: #c2c1ba;
   --accent: #2456d6;
   --accent-ink: #ffffff;
   --ok: #2f6b4f;
   --warn: #b45309;
+  /* 危险色拆成两个用途：--danger 只做背景（白字），--danger-ink 做文字与状态点。
+     深色底上同一个红既当背景又当文字会有一头过不了对比度。 */
   --danger: #b42318;
+  --danger-ink: #b42318;
   --radius: 2px;
   --sans: "Chivo", "Noto Sans SC", "Source Han Sans SC", "PingFang SC", system-ui, sans-serif;
   --mono: "DM Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -272,6 +275,13 @@ pub(crate) const STYLE: &str = r#"
     --muted: #a3a297;
     --rule: #33362f;
     --accent: #6c8cff;
+    /* 浅蓝底上白字只有约 2.9:1，深色模式必须换成深色字。 */
+    --accent-ink: #141613;
+    /* 亮色块里的状态绿/橙在深底上不足 3:1，这里给提亮后的同色系取值。 */
+    --ok: #5fbf8f;
+    --warn: #e3a54a;
+    --danger: #b42318;
+    --danger-ink: #f97066;
   }
 }
 *, *::before, *::after { box-sizing: border-box; }
@@ -355,7 +365,7 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .dot-ok { background: var(--ok); }
 .dot-warn { background: var(--warn); }
-.dot-danger { background: var(--danger); }
+.dot-danger { background: var(--danger-ink); }
 .chip-note { margin: 0; max-width: 26ch; font-size: 11.5px; line-height: 1.35; color: var(--muted); }
 .logout { display: inline-flex; margin: 0; }
 .page { flex: 1; padding-top: 32px; padding-bottom: 32px; }
@@ -525,8 +535,8 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
   margin: 16px 0 0;
   padding: 10px 0 10px 12px;
   font-size: 14px;
-  color: var(--danger);
-  border-left: 2px solid var(--danger);
+  color: var(--danger-ink);
+  border-left: 2px solid var(--danger-ink);
 }
 .gate {
   display: grid;
@@ -581,7 +591,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialChannel, Nav, authed_page, public_page, status_dot};
+    use super::{CredentialChannel, Nav, STYLE, authed_page, public_page, status_dot};
     use crate::accounts::UserStatus;
     use crate::config::Role;
     use crate::http::auth::AuthUser;
@@ -689,6 +699,98 @@ mod tests {
 
         assert!(page.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(!page.contains("<b>x</b>"));
+    }
+
+    /// 从样式块里取一个自定义属性的原始值（`--name: #rrggbb;`）。
+    fn token(block: &str, name: &str) -> String {
+        let needle = format!("{name}:");
+        let value = block.split(&needle).nth(1).expect("样式里应有该 token");
+        value.split(';').next().unwrap_or_default().trim().to_owned()
+    }
+
+    /// WCAG 相对亮度；只接受 `#rrggbb`。
+    fn luminance(hex: &str) -> f64 {
+        let raw = hex.trim_start_matches('#');
+        assert_eq!(raw.len(), 6, "token 应是 #rrggbb：{hex}");
+        let channel = |offset: usize| {
+            let value = u8::from_str_radix(&raw[offset..offset + 2], 16).expect("合法十六进制");
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    /// 两个颜色的对比度（1–21）。
+    fn contrast(foreground: &str, background: &str) -> f64 {
+        let (a, b) = (luminance(foreground), luminance(background));
+        let (high, low) = if a > b { (a, b) } else { (b, a) };
+        (high + 0.05) / (low + 0.05)
+    }
+
+    #[test]
+    fn given_style_when_read_tokens_then_dark_mode_overrides_semantic_colours() {
+        let mut blocks = STYLE.split("@media (prefers-color-scheme: dark)");
+        let light = blocks.next().expect("样式应含浅色块");
+        let dark = blocks.next().expect("样式应含深色块");
+        // 深色块的变量都在第一个 `:root { ... }` 里。
+        let dark = dark.split('}').next().unwrap_or_default();
+
+        assert!(light.contains("--danger-ink: #b42318"), "浅色块也要有文字用危险色");
+        assert!(dark.contains("--accent-ink: #141613"), "深色块要覆盖 --accent-ink");
+        assert!(dark.contains("--ok:"), "深色块要覆盖状态绿");
+        assert!(dark.contains("--warn:"), "深色块要覆盖状态橙");
+        assert!(
+            dark.contains("--danger:") && dark.contains("--danger-ink:"),
+            "危险色两个用途都要给"
+        );
+    }
+
+    #[test]
+    fn given_tokens_when_contrast_then_text_meets_wcag_aa() {
+        let mut blocks = STYLE.split("@media (prefers-color-scheme: dark)");
+        let light = blocks.next().expect("样式应含浅色块");
+        let dark = blocks.next().expect("样式应含深色块");
+        let dark = dark.split('}').next().unwrap_or_default();
+
+        // 次要文字：浅色底（bg）与表格行 hover 底（surface）都要 ≥ 4.5。
+        let muted = token(light, "--muted");
+        assert!(contrast(&muted, &token(light, "--bg")) >= 4.5, "--muted 在 --bg 上不足 AA");
+        assert!(
+            contrast(&muted, &token(light, "--surface")) >= 4.5,
+            "--muted 在 --surface 上不足 AA"
+        );
+
+        // 主按钮：浅色与深色都要 ≥ 4.5。
+        assert!(
+            contrast(&token(light, "--accent-ink"), &token(light, "--accent")) >= 4.5,
+            "浅色主按钮文字不足 AA"
+        );
+        assert!(
+            contrast(&token(dark, "--accent-ink"), &token(dark, "--accent")) >= 4.5,
+            "深色主按钮文字不足 AA"
+        );
+
+        // 错误文本与状态点：文本 ≥ 4.5，图形（点/线）≥ 3。
+        assert!(
+            contrast(&token(light, "--danger-ink"), &token(light, "--bg")) >= 4.5,
+            "浅色错误文本不足 AA"
+        );
+        assert!(
+            contrast(&token(dark, "--danger-ink"), &token(dark, "--bg")) >= 4.5,
+            "深色错误文本不足 AA"
+        );
+        assert!(
+            contrast(&token(dark, "--ok"), &token(dark, "--bg")) >= 3.0,
+            "深色状态绿的点不足 3:1"
+        );
+        assert!(
+            contrast(&token(dark, "--warn"), &token(dark, "--bg")) >= 3.0,
+            "深色状态橙的点不足 3:1"
+        );
+
+        // 危险按钮是白字落在 --danger 背景上，深浅两边都要 ≥ 4.5。
+        assert!(contrast("#ffffff", &token(light, "--danger")) >= 4.5, "浅色危险按钮文字不足 AA");
+        assert!(contrast("#ffffff", &token(dark, "--danger")) >= 4.5, "深色危险按钮文字不足 AA");
     }
 
     #[test]
