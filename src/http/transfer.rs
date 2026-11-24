@@ -195,10 +195,46 @@ impl TempPath {
 impl Drop for TempPath {
     fn drop(&mut self) {
         // 客户端断连时文件可能已由别的路径删掉，NotFound 属预期。
-        if let Err(error) = std::fs::remove_file(&self.0)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %self.0.display(), error = %error, "清理传输临时文件失败");
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => {
+                // abort 路径上 `tokio::fs::File` 的关闭可能被推迟到 blocking pool
+                // （Drop 里不能同步关句柄），立删在 Windows 会撞共享冲突而不是
+                // NotFound。这里不在 Drop 里阻塞等待，交给后台 blocking 任务重试；
+                // 仍失败则留着给启动扫描（>1h 残留清理）兜底。
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let path = self.0.clone();
+                    handle.spawn_blocking(move || remove_with_retry(&path));
+                } else {
+                    tracing::warn!(
+                        path = %self.0.display(),
+                        error = %error,
+                        "清理传输临时文件失败"
+                    );
+                }
+            },
+        }
+    }
+}
+
+/// 后台重试删除：只用于「句柄刚被延迟关闭」的竞态，最多等约 300 ms。
+fn remove_with_retry(path: &FsPath) {
+    for attempt in 1..=5_u64 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(_) if attempt < 5 => {
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+            },
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "重试清理传输临时文件仍失败，留给启动扫描兜底"
+                );
+                return;
+            },
         }
     }
 }
@@ -223,7 +259,10 @@ pub(crate) async fn get(
         outcome = tracing::field::Empty,
     );
     let guard = DurationGuard::new(span.clone());
-    match prepare_get(&state, &request_id, &raw_oid, &span).await {
+    // fetch 阶段也要在 `lfs.get` 里：否则 BdpanStore 的 store(op=fetch) 子 span
+    // 会挂到外层 http.request 上，GET 与 PUT/verify 的 trace 结构不一致。
+    let prepared = prepare_get(&state, &request_id, &raw_oid, &span).instrument(span.clone()).await;
+    match prepared {
         Ok((file, temp, size)) => {
             // 遥测交给响应体读取器：直到流真正结束（或客户端断开）才落 duration_ms，
             // 这样慢客户端的大对象下载也能看到真实传输耗时。
@@ -292,6 +331,7 @@ pub(crate) async fn verify(
         "lfs.verify",
         oid = tracing::field::Empty,
         bytes = tracing::field::Empty,
+        declared_bytes = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
@@ -332,9 +372,12 @@ async fn check(
     let bytes = axum::body::to_bytes(body, MAX_VERIFY_BODY_BYTES)
         .await
         .map_err(|error| ApiError::BadRequest(format!("读取 verify 请求体失败：{error}")))?;
+    // `bytes` 字段语义是「本请求实际处理的字节数」，与 put/get 一致；
+    // 客户端声明的大小只作为观测值放 `declared_bytes`，不能拿去冒充流量。
+    guard.record_bytes(bytes.len() as u64);
     let request: VerifyRequest = serde_json::from_slice(&bytes)
         .map_err(|error| ApiError::BadRequest(format!("verify 请求体不是合法 JSON：{error}")))?;
-    guard.record_bytes(request.size);
+    guard.span().record("declared_bytes", request.size);
 
     let body_oid = Oid::parse(&request.oid)
         .map_err(|error| ApiError::BadRequest(format!("请求体 oid 非法：{error}")))?;
