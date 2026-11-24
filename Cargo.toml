@@ -1,0 +1,38 @@
+[package]
+name = "netdisk-lfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+description = "自建 Git LFS 服务端，对象存储后端为百度网盘（bdpan CLI）"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+dotenvy = { version = "0.15.7", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "signal", "macros"] }
+toml = { version = "1.2.2", default-features = false, features = ["parse", "serde"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "ansi", "std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+explicit_iter_loop = "warn"
+needless_pass_by_value = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_closure_for_method_calls = "warn"
+uninlined_format_args = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+doc_markdown = "allow"
