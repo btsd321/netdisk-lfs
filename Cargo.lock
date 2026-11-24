@@ -474,6 +474,7 @@ dependencies = [
  "base64",
  "clap",
  "dotenvy",
+ "getrandom",
  "hex",
  "http-body-util",
  "rusqlite",

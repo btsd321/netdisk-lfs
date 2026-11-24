@@ -12,6 +12,9 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 dotenvy = { version = "0.15.7", default-features = false }
+# 会话 id 与 SaltString 同源（已在 lockfile 里，经 password-hash 引入）；直接依赖是
+# 因为 argon2 的 password-hash 在本项目 feature 组合下不 re-export rand_core。
+getrandom = { version = "0.4.3", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

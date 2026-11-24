@@ -42,12 +42,20 @@ mod limits;
 mod metrics;
 mod passwords;
 mod register;
+mod session;
 mod transfer;
 
 use limits::{LOGIN_WINDOW, REGISTRATION_WINDOW, SlidingWindowLimiter};
 
 pub use error::ApiError;
 pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
+// 会话基础设施：登录端点（L2）与会话认证共用同一套 id/Cookie/HTTPS 判定，避免各写
+// 一份导致「登录时带 Secure、清除时不带」这类不一致。
+pub use session::{
+    SESSION_COOKIE_NAME, Session, SessionId, SessionStore, clear_session_cookie,
+    has_session_cookie, parse_session_cookie, request_is_https, secure_clear_cookie, secure_cookie,
+    session_cookie,
+};
 // 上传缓冲目录由 `transfer` 唯一实现（含 `data_dir` 缺省时的回退）；`main` 的启动
 // 清理要清同一批目录，所以从这里导出，避免两处各推导一遍导致清理漏目录。
 pub use transfer::upload_dir;
