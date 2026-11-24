@@ -13,17 +13,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::Request;
 use axum::http::HeaderValue;
+use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
+use serde::Serialize;
 use tracing::{Instrument, field, info_span};
 
 use crate::config::Config;
 use crate::store::ObjectStore;
 
 mod auth;
+mod batch;
 mod error;
 
 pub use error::ApiError;
@@ -71,13 +75,16 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .merge(lfs_router(state))
+        .merge(lfs_router(state.clone()))
         .layer(middleware::from_fn(request_span))
+        .with_state(state)
 }
 
 /// `/lfs` 子路由：认证统一挂这里，后续分支新增的 PUT/GET/verify 自动继承。
-fn lfs_router(state: AppState) -> Router {
-    Router::new().route_layer(middleware::from_fn_with_state(state, auth::require))
+fn lfs_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/lfs/objects/batch", post(batch::handle))
+        .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 
 /// `/healthz` 响应体：`{"status":"ok"}`。
@@ -113,6 +120,27 @@ impl RequestId {
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// 序列化成 LFS JSON 响应。
+///
+/// 不用 `axum::Json` 直接返回：后者的 `Content-Type` 是 `application/json`，
+/// 而 api.md 要求 `application/vnd.git-lfs+json`。序列化失败说明响应模型不可
+/// 序列化，属服务端缺陷，按 500 处理并保留同一个 request id。
+pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(body));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(LFS_MEDIA_TYPE));
+            response
+        },
+        Err(error) => {
+            tracing::error!(request_id = %request_id, error = %error, "序列化 LFS 响应失败");
+            ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
+        },
     }
 }
 

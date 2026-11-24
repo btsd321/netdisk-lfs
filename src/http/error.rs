@@ -14,6 +14,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{LFS_MEDIA_TYPE, REQUEST_ID_HEADER, RequestId};
+use crate::store::StoreError;
 
 /// 401 的认证挑战头；头名与取值由 `specs/api.md` 固定。
 const AUTHENTICATE_HEADER: &str = "lfs-authenticate";
@@ -126,5 +127,22 @@ impl IntoResponse for ApiError {
     /// 兜底路径：没有请求上下文时自造一个 id，保证错误体结构永远完整。
     fn into_response(self) -> Response {
         self.into_response_with(&RequestId::generate())
+    }
+}
+
+/// 存储层错误到 HTTP 状态码的映射（api.md「状态码约定」）。
+///
+/// 同 crate 内 `StoreError` 变体已知，match 不收 `_` 分支：将来新增变体会在此处
+/// 编译失败，逼着补映射，避免新错误被悄悄归到 500。
+impl From<StoreError> for ApiError {
+    fn from(source: StoreError) -> Self {
+        let message = source.to_string();
+        match source {
+            StoreError::NotFound { .. } => Self::NotFound(message),
+            StoreError::HashMismatch { .. } => Self::Unprocessable(message),
+            StoreError::Backend { .. } => Self::BadGateway(message),
+            StoreError::Io { .. } => Self::Internal(message),
+            StoreError::Unimplemented { .. } => Self::Unavailable(message),
+        }
     }
 }
