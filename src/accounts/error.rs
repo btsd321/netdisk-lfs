@@ -46,6 +46,12 @@ pub enum AccountError {
         /// 查询的用户名。
         username: String,
     },
+    /// 操作会移除最后一个 active 管理员：最后一个管理员必须留在账户库里。
+    #[error("用户 {username} 是最后一个 active 管理员，不能降级、禁用或删除")]
+    LastAdmin {
+        /// 目标用户名。
+        username: String,
+    },
     /// 用户名不符合规则。
     #[error("用户名 {username} 不合法：{reason}")]
     InvalidUsername {

@@ -19,10 +19,13 @@
 //! 保护规则（顺序即优先级，见各函数）：
 //!
 //! 1. 目标不存在 → 404；账户库未接入 → 503；
-//! 2. 会让系统失去最后一个 active 管理员 → 409（[`would_remove_last_admin`]）；
-//! 3. 改/删自己 → 409（自助改口令与注销走 `/account/*`）；
-//! 4. 删除时 `[auth.users]` 里还有同名条目 → 409：删掉库里的行会让那份旧 sha256
-//!    口令重新可用，必须先由运维从配置里移除。
+//! 2. 改/删自己 → 409（自助改口令与注销走 `/account/*`）；
+//! 3. 删除时 `[auth.users]` 里还有同名条目 → 409：删掉库里的行会让那份旧 sha256
+//!    口令重新可用，必须先由运维从配置里移除；
+//! 4. 「失去最后一个 active 管理员」→ 409，但这一条由账户库在**事务内**判定
+//!    （`update_profile_guarded` / `delete_guarded`）：先 count 再 update 会留下
+//!    并发窗口，两个管理员互降可以同时成功。`[auth.users]` 里不同名的管理员作为
+//!    数据库之外的兜底一并计入，同名条目不算。
 //!
 //! 审计：**每个写操作**都打一条 `tracing::info!`，字段 `actor`、`action`、`target`、
 //! `request_id`；口令只在请求体里存活，绝不进日志、不进响应。
@@ -39,14 +42,16 @@ use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::account::would_remove_last_admin;
 use super::auth::AuthUser;
 use super::error::ApiError;
 use super::html::{
     escape_html, format_unix_seconds, html_response, page_shell, parse_form, table, wants_html,
 };
 use super::register::duplicate_username;
-use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use super::{
+    ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, config_admin_fallback, config_username,
+    json_with_status, passwords,
+};
 use crate::accounts::{AccountError, User, UserStatus, validate_password, validate_username};
 use crate::config::Role;
 
@@ -484,44 +489,43 @@ async fn patch_account(
         return Err(ApiError::BadRequest("至少要提供 role 或 status 之一".to_owned()));
     }
     let target = load_user(state, name).await?;
-    let new_role = changes.role.unwrap_or(target.role);
-    let new_status = changes.status.unwrap_or(target.status);
-    let changed = new_role != target.role || new_status != target.status;
-
-    // 先判「最后一个管理员」再判「自己」：只有一个管理员时，前者的解释更贴近真实
-    // 原因（不是「你不许改自己」，而是「改了就没人能再进管理页」）。
-    if changed && would_remove_last_admin(state, &target).await? {
-        tracing::warn!(
-            actor = %actor.username,
-            target = %target.username,
-            "拒绝降级或禁用最后一个管理员"
-        );
-        return Err(ApiError::Conflict(
-            "不能降级或禁用最后一个 active 管理员：请先指定另一个管理员".to_owned(),
-        ));
-    }
+    // 改自己：不允许（自助改口令/注销有专门端点，那里会校验旧口令）。
     if target.username.eq_ignore_ascii_case(&actor.username) {
         return Err(ApiError::Conflict("不能修改自己的角色或状态：请由其他管理员操作".to_owned()));
     }
+    let new_role = changes.role.unwrap_or(target.role);
+    let new_status = changes.status.unwrap_or(target.status);
     // 无变化的 PATCH 不写库、不打审计：`updated_at` 是「资料变更时间」，不该被空操作刷新。
-    if !changed {
+    if new_role == target.role && new_status == target.status {
         return Ok(target);
     }
 
-    if new_role != target.role {
-        users.update_role(&target.username, new_role).await.map_err(|error| {
-            tracing::error!(target = %target.username, error = %error, "修改账户角色失败");
-            ApiError::Internal("修改角色失败".to_owned())
-        })?;
-    }
-    if new_status != target.status {
-        users.update_status(&target.username, new_status).await.map_err(|error| {
-            tracing::error!(target = %target.username, error = %error, "修改账户状态失败");
-            ApiError::Internal("修改状态失败".to_owned())
-        })?;
-    }
-    // 回读一次：响应里给的是账户库的真实状态，而不是我们以为写进去的值。
-    let updated = load_user(state, &target.username).await?;
+    // 判定与写入在账户库的同一个事务里完成：拆成 count + update 两步会让两个管理员
+    // 并发互降同时通过「还有 2 个管理员」的检查，事后一个管理员都不剩。
+    let config_admins = config_admin_fallback(state.config(), &target.username);
+    let updated = match users
+        .update_profile_guarded(&target.username, Some(new_role), Some(new_status), config_admins)
+        .await
+    {
+        Ok(updated) => updated,
+        Err(AccountError::LastAdmin { .. }) => {
+            tracing::warn!(
+                actor = %actor.username,
+                target = %target.username,
+                "拒绝降级或禁用最后一个管理员"
+            );
+            return Err(ApiError::Conflict(
+                "不能降级或禁用最后一个 active 管理员：请先指定另一个管理员".to_owned(),
+            ));
+        },
+        Err(AccountError::NotFound { .. }) => {
+            return Err(ApiError::NotFound(missing_user_message(state, &target.username)));
+        },
+        Err(error) => {
+            tracing::error!(target = %target.username, error = %error, "修改账户失败");
+            return Err(accounts_unavailable());
+        },
+    };
     tracing::info!(
         actor = %actor.username,
         action = "user.update",
@@ -548,16 +552,6 @@ async fn delete_account(
     };
     let target = load_user(state, name).await?;
 
-    if would_remove_last_admin(state, &target).await? {
-        tracing::warn!(
-            actor = %actor.username,
-            target = %target.username,
-            "拒绝删除最后一个管理员"
-        );
-        return Err(ApiError::Conflict(
-            "不能删除最后一个 active 管理员：请先指定另一个管理员".to_owned(),
-        ));
-    }
     if target.username.eq_ignore_ascii_case(&actor.username) {
         return Err(ApiError::Conflict(
             "不能删除自己的账户：如需注销请用 DELETE /account 自助完成".to_owned(),
@@ -565,7 +559,7 @@ async fn delete_account(
     }
     // 删掉库里的行之后，`[auth.users]` 里的同名条目会让那份旧 sha256 口令重新生效。
     // 这不是「可能重名」而是「同一个人换个入口原地复活」，必须硬拒。
-    if let Some(config_name) = config_same_name(state, &target.username) {
+    if let Some(config_name) = config_username(state.config(), &target.username) {
         tracing::warn!(
             actor = %actor.username,
             target = %target.username,
@@ -577,10 +571,28 @@ async fn delete_account(
         )));
     }
 
-    users.delete(&target.username).await.map_err(|error| {
-        tracing::error!(target = %target.username, error = %error, "删除账户失败");
-        ApiError::Internal("删除账户失败".to_owned())
-    })?;
+    // 「最后一个管理员」由账户库在同一个事务里判定并删除，避免并发删掉最后两个管理员。
+    let config_admins = config_admin_fallback(state.config(), &target.username);
+    match users.delete_guarded(&target.username, config_admins).await {
+        Ok(()) => {},
+        Err(AccountError::LastAdmin { .. }) => {
+            tracing::warn!(
+                actor = %actor.username,
+                target = %target.username,
+                "拒绝删除最后一个管理员"
+            );
+            return Err(ApiError::Conflict(
+                "不能删除最后一个 active 管理员：请先指定另一个管理员".to_owned(),
+            ));
+        },
+        Err(AccountError::NotFound { .. }) => {
+            return Err(ApiError::NotFound(missing_user_message(state, &target.username)));
+        },
+        Err(error) => {
+            tracing::error!(target = %target.username, error = %error, "删除账户失败");
+            return Err(accounts_unavailable());
+        },
+    }
     tracing::info!(
         actor = %actor.username,
         action = "user.delete",
@@ -649,17 +661,12 @@ async fn load_user(state: &AppState, name: &str) -> Result<User, ApiError> {
 
 /// 404 的文案：配置用户单独解释，避免运维以为「账户凭空消失」。
 fn missing_user_message(state: &AppState, name: &str) -> String {
-    match config_same_name(state, name) {
+    match config_username(state.config(), name) {
         Some(config_name) => format!(
             "账户库里没有 {config_name}：它只存在于 [auth.users]，首次登录升级为账户库账户后才可由管理端点管理"
         ),
         None => format!("用户 {name} 不存在"),
     }
-}
-
-/// `[auth.users]` 里与 `name` 同名的条目（大小写不敏感）；用于删除前的硬拒与 404 提示。
-fn config_same_name(state: &AppState, name: &str) -> Option<String> {
-    state.config().auth.users.keys().find(|candidate| candidate.eq_ignore_ascii_case(name)).cloned()
 }
 
 /// 解析 JSON 请求体；失败统一 400。

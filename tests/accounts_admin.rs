@@ -21,9 +21,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http_body_util::BodyExt;
 use netdisk_lfs::{
-    AccountsConfig, AppState, AuthConfig, CacheConfig, Config, FakeStore, ObjectStore, Role,
-    RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, UserConfig, UserStatus, UserStore,
-    hash_password, router,
+    AccountError, AccountsConfig, AppState, AuthConfig, CacheConfig, Config, FakeStore,
+    ObjectStore, Role, RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, UserConfig,
+    UserStatus, UserStore, hash_password, router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -695,10 +695,11 @@ async fn given_pending_account_when_patched_active_then_login_works() {
 }
 
 #[tokio::test]
-async fn given_only_admin_when_patch_self_then_409_last_admin() {
+async fn given_only_admin_when_patch_self_then_409() {
     let app = TestApp::new();
     app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
 
+    // 改自己先被拒（最后一个管理员的事务保护在 store 层单独覆盖）。
     for payload in [json!({ "role": "readwrite" }), json!({ "status": "disabled" })] {
         let (status, headers, body) = app
             .send_json(api(Method::PATCH, "/admin/users/root", "root", PASSWORD, Some(&payload)))
@@ -706,8 +707,8 @@ async fn given_only_admin_when_patch_self_then_409_last_admin() {
         assert_eq!(status, StatusCode::CONFLICT, "载荷 {payload} 必须被拒");
         assert_error_contract(&headers, &body);
         assert!(
-            body["message"].as_str().is_some_and(|message| message.contains("管理员")),
-            "应说明最后一个管理员的限制：{body}"
+            body["message"].as_str().is_some_and(|message| message.contains("自己")),
+            "应说明不能改自己：{body}"
         );
     }
     // 状态与角色都没变：拒绝不产生副作用。
@@ -733,27 +734,91 @@ async fn given_only_admin_when_patch_self_then_409_last_admin() {
 }
 
 #[tokio::test]
-async fn given_config_same_name_admin_when_patch_last_admin_then_still_409() {
-    // 配置里同名条目是 admin，但它就是同一个人：不算「另一个管理员」，因此库里
-    // 唯一的 active 管理员仍然受保护（文案是「最后一个管理员」，不是「不能改自己」）。
-    let app = TestApp::with(|config| add_config_user(config, "root", PASSWORD, Role::Admin));
+async fn given_role_and_status_together_when_patch_then_both_applied_in_one_update() {
+    let app = TestApp::new();
     app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("dual", "readwrite", "active");
 
-    let (status, headers, body) = app
+    let (status, _, body) = app
         .send_json(api(
             Method::PATCH,
-            "/admin/users/root",
+            "/admin/users/dual",
             "root",
             PASSWORD,
-            Some(&json!({ "status": "disabled" })),
+            Some(&json!({ "role": "readonly", "status": "disabled" })),
         ))
         .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_error_contract(&headers, &body);
-    assert!(
-        body["message"].as_str().is_some_and(|message| message.contains("最后一个")),
-        "配置同名条目不得被当成另一个管理员：{body}"
-    );
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "readonly");
+    assert_eq!(body["status"], "disabled", "role 与 status 应在同一次写入里生效");
+    let stored = app.store().get("dual").await.expect("查询").expect("账户存在");
+    assert_eq!(stored.role, Role::Readonly);
+    assert_eq!(stored.status, UserStatus::Disabled);
+}
+
+#[tokio::test]
+async fn given_guarded_profile_update_when_last_admin_then_last_admin_error() {
+    let app = TestApp::new();
+    app.create_user("solo", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 数据库里只剩一个 active 管理员、配置也没有兜底：必须拒绝。
+    let error = app
+        .store()
+        .update_profile_guarded("solo", Some(Role::Readwrite), None, 0)
+        .await
+        .expect_err("最后一个管理员不能降级");
+    assert!(matches!(error, AccountError::LastAdmin { .. }), "实际错误：{error}");
+
+    // 配置里有**不同名**的管理员时，数据库之外还有兜底，允许降级。
+    let updated = app
+        .store()
+        .update_profile_guarded("solo", Some(Role::Readwrite), None, 1)
+        .await
+        .expect("有配置兜底管理员时应允许");
+    assert_eq!(updated.role, Role::Readwrite);
+    assert_eq!(updated.status, UserStatus::Active, "同一次 UPDATE 不应改动状态");
+}
+
+#[tokio::test]
+async fn given_guarded_delete_when_last_admin_then_last_admin_error() {
+    let app = TestApp::new();
+    app.create_user("solo", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    let error = app.store().delete_guarded("solo", 0).await.expect_err("最后一个管理员不能删除");
+    assert!(matches!(error, AccountError::LastAdmin { .. }), "实际错误：{error}");
+    assert!(app.store().get("solo").await.expect("查询").is_some(), "被拒时不得删行");
+
+    app.store().delete_guarded("solo", 1).await.expect("有配置兜底管理员时应允许");
+    assert_eq!(app.store().get("solo").await.expect("查询"), None);
+}
+
+#[tokio::test]
+async fn given_two_admins_when_concurrent_guarded_updates_then_only_one_succeeds() {
+    let app = TestApp::new();
+    app.create_user("alice", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("bob", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 并发互降：都从「还有两个管理员」出发，但事务要求第二次看到的是已提交的状态。
+    let first = tokio::spawn({
+        let store = Arc::clone(app.store());
+        async move { store.update_profile_guarded("bob", Some(Role::Readwrite), None, 0).await }
+    });
+    let second = tokio::spawn({
+        let store = Arc::clone(app.store());
+        async move { store.update_profile_guarded("alice", Some(Role::Readwrite), None, 0).await }
+    });
+    let (first, second) = tokio::join!(first, second);
+    let results = [first.expect("任务不应 panic"), second.expect("任务不应 panic")];
+
+    let succeeded = results.iter().filter(|result| result.is_ok()).count();
+    let rejected = results
+        .iter()
+        .filter(|result| matches!(result, Err(AccountError::LastAdmin { .. })))
+        .count();
+    assert_eq!(succeeded, 1, "只能有一个降级成功：{results:?}");
+    assert_eq!(rejected, 1, "另一个必须被「最后一个管理员」拒绝：{results:?}");
+    assert_eq!(app.store().count_active_admins().await.expect("统计"), 1, "至少留一个管理员");
 }
 
 #[tokio::test]
@@ -794,6 +859,42 @@ async fn given_two_admins_when_patch_self_then_409_but_other_admin_demotable() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn given_two_admins_when_concurrent_patch_demotions_then_one_admin_kept() {
+    let app = TestApp::new();
+    app.create_user("alice", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("bob", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 两人同时把对方降级：认证可能都发生在任何一次写入之前，所以第二个请求既可能
+    // 撞上「最后一个管理员」409，也可能因为已被降级而在认证/授权处 403。
+    let demote = |actor: &'static str, target: &'static str| {
+        let router = app.router.clone();
+        async move {
+            let request = api(
+                Method::PATCH,
+                &format!("/admin/users/{target}"),
+                actor,
+                PASSWORD,
+                Some(&json!({ "role": "readwrite" })),
+            );
+            router.oneshot(request).await.expect("router 应处理请求").status()
+        }
+    };
+    let (first, second) = tokio::join!(demote("alice", "bob"), demote("bob", "alice"));
+
+    let succeeded = [first, second].iter().filter(|status| **status == StatusCode::OK).count();
+    assert_eq!(succeeded, 1, "并发互降只能成功一个：{first} / {second}");
+    assert!(
+        matches!([first, second], [a, b] if a == StatusCode::CONFLICT || b == StatusCode::CONFLICT
+            || a == StatusCode::FORBIDDEN || b == StatusCode::FORBIDDEN),
+        "失败的一方应是 409 或 403：{first} / {second}"
+    );
+    assert!(
+        app.store().count_active_admins().await.expect("统计") >= 1,
+        "任何时刻都必须至少剩一个 active 管理员"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 删除
 // ---------------------------------------------------------------------------
@@ -808,8 +909,8 @@ async fn given_only_admin_when_delete_self_then_409() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_error_contract(&headers, &body);
     assert!(
-        body["message"].as_str().is_some_and(|message| message.contains("管理员")),
-        "最后一个管理员必须被保护：{body}"
+        body["message"].as_str().is_some_and(|message| message.contains("自己")),
+        "删除自己要先被拒（最后一个管理员的保护在下面单独覆盖）：{body}"
     );
     assert!(app.store().get("root").await.expect("查询").is_some(), "账户仍应在库中");
 }

@@ -28,7 +28,7 @@ use tracing::{Instrument, Span, field, info_span};
 
 use crate::accounts::UserStore;
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{Config, Role};
 use crate::store::{ObjectStore, Oid};
 
 mod account;
@@ -58,6 +58,36 @@ pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 /// 账户库未接入（`accounts: None`）时 `/account/*` 的 503 文案。
 pub(crate) const ACCOUNTS_NOT_CONFIGURED_MESSAGE: &str =
     "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
+
+/// `[auth.users]` 里与 `name` 同名的条目（大小写不敏感），返回配置里的写法。
+///
+/// 账户库优先之后，config 里的同名条目就是「同一个人的另一个入口」：自助注册要拒
+/// 它（否则能把引导管理员顶掉），管理端删除要先移走它（否则删库行会让旧口令复活）。
+pub(crate) fn config_username<'a>(config: &'a Config, name: &str) -> Option<&'a str> {
+    config
+        .auth
+        .users
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .map(String::as_str)
+}
+
+/// 配置文件里**除 `name` 本人之外**的 active 管理员数量。
+///
+/// `[auth.users]` 在启动后不可变，这个数字可以在事务外算好再传给账户库：账户库的
+/// 「最后一个管理员」判定把它当作数据库之外的兜底管理员，避免把「config 里还有别的
+/// 管理员」的合法降级/删除也拒掉。同名条目不算（那是同一个人）。
+pub(crate) fn config_admin_fallback(config: &Config, name: &str) -> u64 {
+    let count = config
+        .auth
+        .users
+        .iter()
+        .filter(|(candidate, user)| {
+            user.role == Role::Admin && !candidate.eq_ignore_ascii_case(name)
+        })
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
 
 /// 回写给客户端与反向代理的请求 id 头。
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
