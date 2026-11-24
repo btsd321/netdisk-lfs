@@ -61,35 +61,46 @@ dir = "/var/lib/netdisk-lfs/cache"
 max_bytes = 214748364800
 
 [accounts]
-# 账户库（SQLite）路径。留空 = $NETDISK_LFS_DATA_DIR/accounts.db；本示例显式写出，
-# 便于 tests/config_example.rs 在不设环境变量时也能加载校验。必须是绝对路径。
-# 账户库保存注册用户的 Argon2id 口令哈希，属于**不可随意删除**的运行数据，
-# 必须和缓存区分：缓存可随时清空，accounts.db 要纳入 /var/lib/netdisk-lfs 的备份。
+# 账户库（SQLite，WAL）路径。留空 = $NETDISK_LFS_DATA_DIR/accounts.db；本示例显式写出，
+# 便于 tests/config_example.rs 在不设环境变量时也能加载校验。必须是绝对路径（相对路径
+# 会让库的落点随 CWD 漂移）；留空且没设 NETDISK_LFS_DATA_DIR 时启动报错。
+# 首次启动（或首次有 config 用户登录）时自动创建，父目录不存在也会建。
+# 账户库保存 Argon2id 口令哈希，属于**不可随意删除**的运行数据：必须和缓存区分——
+# 缓存可随时清空，accounts.db 要纳入 /var/lib/netdisk-lfs 的备份。
 db = "/var/lib/netdisk-lfs/accounts.db"
 # 新账户口令与改密的最小长度（字符数），上限固定 128；口令不能等于用户名，
 # 也不能全为空白。
 min_password_len = 12
 # 自助注册策略：
-#   approval —— 默认：注册后为 pending，需管理员审批（C3 的 /admin/users）后
-#               才能登录。公网暴露时建议保持这个值；
+#   approval —— 默认：注册后为 pending，需管理员在 /admin（或 GET /admin/users）
+#               审批后才能登录。公网暴露时建议保持这个值；
 #   open     —— 注册即生效（active），仅适合内网/小圈子；
 #   closed   —— 关闭注册端点（403），账户只能由管理员创建。
 registration = "approval"
 # 新注册账户的默认角色：readonly / readwrite。不允许写 admin —— 管理员只能由
 # 下面的 [auth.users] 引导，否则开放注册等于把管理员权限发给所有人。
 default_role = "readwrite"
-# 每个来源地址每小时的注册成功上限（0 = 不限）。默认 5，防批量刷号。
+# 每个来源地址每小时的注册成功上限（0 = 不限）。默认 5，防批量刷号；只有创建
+# 成功才计数，被 429 拒掉的请求不会延长窗口。
 registration_per_hour = 5
 # 每个用户名每 5 分钟的登录失败上限（0 = 不限）。超限后即使口令正确也返回 429，
 # 直到最早一次失败滑出 5 分钟窗口；成功登录会清零该用户名的计数。
 login_failures_per_5min = 10
-# 是否信任 X-Forwarded-For 的第一段作为注册限速的来源地址。
-# 只有服务确实在可信反向代理之后时才打开：该头由客户端完全可控，直连场景下
-# 打开它等于让攻击者伪造 IP 绕过注册限速。默认 false（用 TCP 远端地址）。
+# 是否用 X-Forwarded-For 的**最后一段**作为注册限速的来源地址。
+# 取最后一段而不是第一段：代理是追加语义，最后一段才是代理观测到的对端，第一段
+# 由客户端控制、可伪造。仍只应在服务确实位于可信反向代理之后时才打开——直连
+# 场景下该头完全由客户端决定，打开它等于让攻击者伪造来源绕过注册限速。
+# 默认 false（用 TCP 远端地址）。
 trust_proxy = false
 
 # 客户端凭据：用户名 → 口令哈希与角色。用户名即 HTTP Basic 的用户名，
 # 不允许包含 ':'（会让 user:password 拆分有歧义）。
+#
+# 这一段的定位已从「全部账户」变成**引导管理员与应急入口**：账户默认落在
+# [accounts] db 指向的 SQLite 库里，注册/改密/注销都走 HTTP；这里的条目继续可用，
+# 首次成功登录后会被**懒升级**为库里的 Argon2id 账户（明文口令换成哈希）。
+# 升级之后以库为准——改这里的哈希不再影响该账户，改口令请用 /account/password
+# 或管理员重置。库里有同名记录时，本段条目完全不参与认证。
 #
 # 口令哈希用 sha256 的十六进制小写摘要，生成方式：
 #   printf '%s' '<口令>' | sha256sum
@@ -97,13 +108,18 @@ trust_proxy = false
 #   # 注意 printf 不加换行，否则换行符也会被算进哈希。
 #
 # role 接受三个值：
-#   admin     —— 管理员：拥有 readwrite 的全部 LFS 权限，并在后续分支获得
-#                /admin/* 账户管理能力（部署分级账户后建议把 maintainer 改成它）；
+#   admin     —— 管理员：拥有 readwrite 的全部 LFS 权限，并可访问 /admin 与
+#                /admin/* 管理账户（没有 admin 时这些路径一律 403，服务照常跑）。
+#                管理员只能在这里引导，[accounts] default_role 不允许写 admin；
+#                部署分级账户后建议把日常运维账户改成它；
 #   readwrite —— 允许 batch 上传、PUT、verify 与下载（日常开发用）；
 #   readonly  —— 只允许下载（CI、只读镜像站、需要临时借看的人）。
 #
 # 下面两个是**占位值**，原样部署会导致谁也登录不了（口令未知），务必替换或删除。
 # 口令本身不要写进本文件、不要让 `bash -x` 之类的调试开着跑哈希命令。
+# 至少保留一个 admin（可以只留它），账户库误删/损坏时靠它重新建库登录。
+# 它的用户名要不容易被猜到：自助注册只与账户库查重，不比对这一段，同名注册会让
+# 库记录优先、原 config 账户登不上（详见 docs/accounts.md 第 10 节）。
 [auth.users]
 maintainer = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readwrite" }
 reader     = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readonly" }
