@@ -131,6 +131,14 @@ pub enum BdpanError {
 }
 
 impl BdpanError {
+    /// 是否登录态失效；HTTP 层据此映射 503（见 `specs/architecture.md` 失败模式表）。
+    ///
+    /// 单独提供判定而不是让调用方匹配变体：枚举是 `#[non_exhaustive]`，按字符串或按变体
+    /// 猜都会在 CLI 换文案时悄悄失效，把「50x 该有的重试语义」变成「所有对象都 404」。
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Self::Auth { .. })
+    }
+
     /// 这次失败是否值得退避重试。
     ///
     /// 只放超时与网络类：登录失效、路径越界、目标已存在都不是「再试一次会变好」的
@@ -627,6 +635,15 @@ mod tests {
         assert!(!auth.is_retryable());
         assert!(!conflict.is_retryable());
         assert!(!spawn.is_retryable());
+    }
+
+    #[test]
+    fn given_auth_error_when_is_auth_then_true_and_others_false() {
+        let auth = BdpanError::Auth { command: "ls", message: "token 已过期".to_owned() };
+        let timeout = BdpanError::Timeout { command: "ls", timeout: Duration::from_secs(600) };
+
+        assert!(auth.is_auth());
+        assert!(!timeout.is_auth());
     }
 
     #[test]
