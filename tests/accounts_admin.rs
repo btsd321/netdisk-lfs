@@ -1120,6 +1120,21 @@ async fn given_admin_page_when_get_then_table_with_escaped_username() {
     assert!(body.contains(r#"action="/admin/users/root/delete""#));
     assert!(body.contains(r#"name="confirm""#));
 
+    // 统计条：总数与三种状态各一个数字（root=active、pending-pal=pending、
+    // 手工写入的账户=disabled）。
+    assert!(body.contains(r#"aria-label="账户统计""#), "应有统计条：{body}");
+    for (count, label) in [("3", "总数"), ("1", "待审批"), ("1", "已启用"), ("1", "已禁用")]
+    {
+        assert!(
+            body.contains(&format!(r#"<span class="stat-n">{count}</span>"#)),
+            "统计条应给出 {label}={count}：{body}"
+        );
+        assert!(body.contains(&format!(r#"<span class="stat-k">{label}</span>"#)));
+    }
+    // 状态筛选页签：当前项用 aria-current 标出，链接保留 ?status=。
+    assert!(body.contains(r#"aria-label="按状态筛选""#), "应有筛选页签：{body}");
+    assert!(body.contains(r#"<a href="/admin" aria-current="page">全部</a>"#));
+
     // 状态过滤：只显示待审批。
     let (status, _, filtered) = app.send(page_get("/admin?status=pending", "root", PASSWORD)).await;
     assert_eq!(status, StatusCode::OK);
