@@ -15,13 +15,21 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::AuthUser;
 use super::error::ApiError;
-use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use super::{
+    ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
+    config_admin_fallback, config_username, json_with_status, passwords,
+};
 use crate::accounts::{AccountError, User, UserStatus, validate_password};
 use crate::config::Role;
 
-/// 账户库未接入时的 503。
-fn accounts_unavailable() -> ApiError {
+/// 账户库未接入（`accounts: None`）时的 503。
+fn accounts_disabled() -> ApiError {
     ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned())
+}
+
+/// 账户库已接入但读写失败时的 503：与「没配账户库」区分开，排障方向不同。
+fn accounts_unavailable() -> ApiError {
+    ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned())
 }
 
 /// `GET /account/me` 的响应体。
@@ -70,7 +78,7 @@ pub(crate) async fn me(
     Extension(request_id): Extension<RequestId>,
 ) -> Response {
     let Some(users) = state.accounts() else {
-        return accounts_unavailable().into_response_with(&request_id);
+        return accounts_disabled().into_response_with(&request_id);
     };
     match users.get(&auth.username).await {
         Ok(Some(user)) => {
@@ -120,7 +128,7 @@ async fn change_password_inner(
     body: &[u8],
 ) -> Result<(), ApiError> {
     let Some(users) = state.accounts() else {
-        return Err(accounts_unavailable());
+        return Err(accounts_disabled());
     };
     let change: PasswordChange = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("请求体不是合法 JSON：{error}")))?;
@@ -159,7 +167,7 @@ async fn change_password_inner(
     })?;
     users.update_password_hash(&user.username, &new_hash).await.map_err(|error| {
         tracing::error!(username = %user.username, error = %error, "写入口令哈希失败");
-        ApiError::Internal("更新口令失败".to_owned())
+        accounts_unavailable()
     })?;
     tracing::info!(username = %user.username, "账户自助修改口令成功");
     Ok(())
@@ -190,7 +198,7 @@ pub(crate) async fn delete_self(
 
 async fn delete_self_inner(state: &AppState, auth: &AuthUser, body: &[u8]) -> Result<(), ApiError> {
     let Some(users) = state.accounts() else {
-        return Err(accounts_unavailable());
+        return Err(accounts_disabled());
     };
     let request: DeleteAccount = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("请求体不是合法 JSON：{error}")))?;
@@ -222,26 +230,34 @@ async fn delete_self_inner(state: &AppState, auth: &AuthUser, body: &[u8]) -> Re
         return Err(ApiError::Unauthorized("口令不正确".to_owned()));
     }
 
-    if would_remove_last_admin(state, &user).await? {
-        tracing::warn!(username = %user.username, reason = "last_admin", "注销被拒：最后一个管理员");
-        return Err(ApiError::Conflict(
-            "不能注销最后一个管理员账户：请先由其他管理员或配置文件接管".to_owned(),
-        ));
-    }
-
     // 配置里还有同名用户时，删掉库里的行会让那份旧 sha256 口令重新生效——这里
     // 只告警不阻止（管理员可能正准备迁移），但必须让运维在日志里看得见。
-    if state.config().auth.users.keys().any(|name| name.eq_ignore_ascii_case(&user.username)) {
+    if config_username(state.config(), &user.username).is_some() {
         tracing::warn!(
             username = %user.username,
             "[auth.users] 中存在同名条目：删除账户后该配置口令会重新可用，请同步移除"
         );
     }
 
-    users.delete(&user.username).await.map_err(|error| {
-        tracing::error!(username = %user.username, error = %error, "删除账户失败");
-        ApiError::Internal("删除账户失败".to_owned())
-    })?;
+    // 「最后一个管理员」的判定与删除在账户库的同一个事务里完成：分成 count + delete
+    // 两步时，两个管理员并发注销都能通过检查，事后一个管理员都不剩。
+    let config_admins = config_admin_fallback(state.config(), &user.username);
+    match users.delete_guarded(&user.username, config_admins).await {
+        Ok(()) => {},
+        Err(AccountError::LastAdmin { .. }) => {
+            tracing::warn!(username = %user.username, reason = "last_admin", "注销被拒：最后一个管理员");
+            return Err(ApiError::Conflict(
+                "不能注销最后一个管理员账户：请先由其他管理员或配置文件接管".to_owned(),
+            ));
+        },
+        Err(AccountError::NotFound { .. }) => {
+            return Err(ApiError::NotFound("账户不存在".to_owned()));
+        },
+        Err(error) => {
+            tracing::error!(username = %user.username, error = %error, "删除账户失败");
+            return Err(ApiError::Internal("删除账户失败".to_owned()));
+        },
+    }
     // 审计：这里不删 LFS 对象（内容寻址、全局共享），只失效凭据。
     tracing::info!(
         username = %user.username,
@@ -249,41 +265,6 @@ async fn delete_self_inner(state: &AppState, auth: &AuthUser, body: &[u8]) -> Re
         "账户自助注销成功（LFS 对象不随账户删除）"
     );
     Ok(())
-}
-
-/// 删除 `user` 之后，系统是否会失去**最后一个** active 管理员。
-///
-/// 只有 `user` 本身是 active admin 时才需要保护；管理员来源有两处：账户库与
-/// `[auth.users]`。配置文件里的同名条目不算「另一个管理员」——删掉库里的行之后
-/// 它是**同一个人**重新获得 config 权限，不是冗余的第二个管理员。
-///
-/// C3 的 `DELETE /admin/users/{name}` 与「降级/禁用最后一个管理员」复用本函数。
-pub(crate) async fn would_remove_last_admin(
-    state: &AppState,
-    user: &User,
-) -> Result<bool, ApiError> {
-    if user.role != Role::Admin || user.status != UserStatus::Active {
-        return Ok(false);
-    }
-    let Some(users) = state.accounts() else {
-        return Ok(false);
-    };
-    let db_admins = users.count_active_admins().await.map_err(|error| {
-        tracing::error!(error = %error, "统计管理员数量失败");
-        accounts_unavailable()
-    })?;
-    let config_admins = state
-        .config()
-        .auth
-        .users
-        .iter()
-        .filter(|(name, config_user)| {
-            config_user.role == Role::Admin && !name.eq_ignore_ascii_case(&user.username)
-        })
-        .count();
-    // db_admins 包含 user 自己：只剩 1 个且配置里没有其他管理员时，删掉就没人能
-    // 再进 /admin/*，只能改配置文件重启。
-    Ok(db_admins <= 1 && config_admins == 0)
 }
 
 #[cfg(test)]

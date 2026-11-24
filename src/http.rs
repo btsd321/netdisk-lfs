@@ -4,9 +4,10 @@
 //! 探针，后者只在本机被抓取）；`/lfs` 子路由统一挂 Basic 认证，batch 与 PUT/GET/verify
 //! 都长在这条子路由下，新增端点自动继承认证。
 //!
-//! 分工：`auth` 负责认证与角色，`error` 负责统一错误体与状态码映射，`batch` 负责
-//! 批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
-//! 本文件只做装配与请求级横切（span、request id）。
+//! 分工：`auth` 负责认证与角色，`admin` 负责管理员账户管理（JSON API + HTML 页），
+//! `html` 负责极简页面的外壳/转义/表单解析，`error` 负责统一错误体与状态码映射，
+//! `batch` 负责批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责
+//! Prometheus 文本。本文件只做装配与请求级横切（span、request id）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,20 +22,22 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
 use crate::accounts::UserStore;
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{Config, Role};
 use crate::store::{ObjectStore, Oid};
 
 mod account;
+mod admin;
 mod auth;
 mod batch;
 mod error;
 mod health;
+mod html;
 mod limits;
 mod metrics;
 mod passwords;
@@ -55,6 +58,42 @@ pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 /// 账户库未接入（`accounts: None`）时 `/account/*` 的 503 文案。
 pub(crate) const ACCOUNTS_NOT_CONFIGURED_MESSAGE: &str =
     "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
+
+/// `[auth.users]` 里与 `name` 同名的条目（大小写不敏感），返回配置里的写法。
+///
+/// 账户库优先之后，config 里的同名条目就是「同一个人的另一个入口」：自助注册要拒
+/// 它（否则能把引导管理员顶掉），管理端删除要先移走它（否则删库行会让旧口令复活）。
+pub(crate) fn config_username<'a>(config: &'a Config, name: &str) -> Option<&'a str> {
+    config
+        .auth
+        .users
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .map(String::as_str)
+}
+
+/// 配置文件里**除 `name` 本人之外**的 active 管理员数量。
+///
+/// `[auth.users]` 在启动后不可变，这个数字可以在事务外算好再传给账户库：账户库的
+/// 「最后一个管理员」判定把它当作数据库之外的兜底管理员，避免把「config 里还有别的
+/// 管理员」的合法降级/删除也拒掉。同名条目不算（那是同一个人）。
+pub(crate) fn config_admin_fallback(config: &Config, name: &str) -> u64 {
+    let count = config
+        .auth
+        .users
+        .iter()
+        .filter(|(candidate, user)| {
+            user.role == Role::Admin && !candidate.eq_ignore_ascii_case(name)
+        })
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// 账户库已接入但读写失败（磁盘、锁、库损坏）时的 503 文案。
+///
+/// 与 [`ACCOUNTS_NOT_CONFIGURED_MESSAGE`] 分开：一个说「这个实例没配账户库」，
+/// 一个说「配了但暂时用不了」，运维看到后该查的方向完全不同。
+pub(crate) const ACCOUNTS_UNAVAILABLE_MESSAGE: &str = "账户库暂时不可用，请稍后重试";
 
 /// 回写给客户端与反向代理的请求 id 头。
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -184,6 +223,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics::metrics))
         .merge(register_router())
         .merge(account_router(state.clone()))
+        .merge(admin_router(state.clone()))
         .merge(lfs_router(state.clone()))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
@@ -201,6 +241,27 @@ fn account_router(state: AppState) -> Router<AppState> {
         .route("/account/me", get(account::me))
         .route("/account/password", post(account::change_password))
         .route("/account", delete(account::delete_self))
+        .route_layer(middleware::from_fn_with_state(state, auth::require))
+}
+
+/// 管理员路由：JSON API 与 HTML 管理页共用一条受保护子路由。
+///
+/// 两层层按「后注册的在外层」包裹：先 `auth::require` 认人，再
+/// `admin::require_admin` 判角色——判角色只读扩展，不重复解析凭据。
+fn admin_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/admin", get(admin::page))
+        .route("/admin/users", get(admin::list).post(admin::create))
+        .route("/admin/users/{name}", patch(admin::patch).delete(admin::delete))
+        .route("/admin/users/{name}/password", post(admin::reset_password))
+        // 以下为 HTML 管理页的便捷端点：只解析表单、复用上面同一套逻辑，成功后 303。
+        .route("/admin/users/{name}/approve", post(admin::approve))
+        .route("/admin/users/{name}/disable", post(admin::disable))
+        .route("/admin/users/{name}/enable", post(admin::enable))
+        .route("/admin/users/{name}/role", post(admin::role_form))
+        .route("/admin/users/{name}/password-form", post(admin::password_form))
+        .route("/admin/users/{name}/delete", post(admin::delete_form))
+        .route_layer(middleware::from_fn(admin::require_admin))
         .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 

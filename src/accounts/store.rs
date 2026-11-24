@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::AccountError;
@@ -349,21 +349,98 @@ impl UserStore {
         .await
     }
 
+    /// 原子地改「角色 + 状态」，并在同一个事务里守住「最后一个 active 管理员」。
+    ///
+    /// 与 [`Self::update_role`] / [`Self::update_status`] 的区别：读目标、判定、写回
+    /// 三步在**一个 `BEGIN IMMEDIATE` 事务**里完成。拆成两步（先统计再更新）时，两个
+    /// 管理员并发互降都能看到「还有 2 个管理员」而同时成功，事后一个管理员都不剩。
+    ///
+    /// `config_admins` 是 `[auth.users]` 里与目标**不同名**的 active 管理员数：配置文件
+    /// 启动后不可变，调用方在事务外数好传进来，当作数据库之外的兜底管理员。同名条目
+    /// 不算——删掉库里的行之后，那是同一个人换个入口复活，不是第二个管理员。
+    ///
+    /// # Errors
+    ///
+    /// 用户名不合法、用户不存在、会移除最后一个 active 管理员
+    /// （[`AccountError::LastAdmin`]）或 SQLite 操作失败。
+    pub async fn update_profile_guarded(
+        &self,
+        username: &str,
+        role: Option<Role>,
+        status: Option<UserStatus>,
+        config_admins: u64,
+    ) -> Result<User, AccountError> {
+        validate_username(username)?;
+        let username = username.to_owned();
+        self.with_conn_mut(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(target) = fetch_user(&tx, &username)? else {
+                return Err(AccountError::NotFound { username });
+            };
+            let new_role = role.unwrap_or(target.role);
+            let new_status = status.unwrap_or(target.status);
+            if new_role == target.role && new_status == target.status {
+                return Ok(target);
+            }
+            if loses_last_admin(&tx, &target, new_role, new_status, config_admins)? {
+                return Err(AccountError::LastAdmin { username });
+            }
+            tx.execute(
+                "UPDATE users SET role = ?2, status = ?3, updated_at = ?4 WHERE username = ?1",
+                params![&username, new_role.as_str(), new_status.as_str(), unix_now()],
+            )?;
+            let Some(updated) = fetch_user(&tx, &username)? else {
+                return Err(AccountError::NotFound { username });
+            };
+            tx.commit()?;
+            Ok(updated)
+        })
+        .await
+    }
+
+    /// 原子地删除账户，并在同一个事务里守住「最后一个 active 管理员」。
+    ///
+    /// 参数与判定规则同 [`Self::update_profile_guarded`]。只删 `users` 行，
+    /// **不删除任何 LFS 对象**：对象全局共享、内容寻址。
+    ///
+    /// # Errors
+    ///
+    /// 用户名不合法、用户不存在、目标是最后一个 active 管理员
+    /// （[`AccountError::LastAdmin`]）或 SQLite 操作失败。
+    pub async fn delete_guarded(
+        &self,
+        username: &str,
+        config_admins: u64,
+    ) -> Result<(), AccountError> {
+        validate_username(username)?;
+        let username = username.to_owned();
+        self.with_conn_mut(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(target) = fetch_user(&tx, &username)? else {
+                return Err(AccountError::NotFound { username });
+            };
+            let last_admin = target.role == Role::Admin
+                && target.status == UserStatus::Active
+                && active_admin_count(&tx)?.saturating_add(config_admins) <= 1;
+            if last_admin {
+                return Err(AccountError::LastAdmin { username });
+            }
+            let changed =
+                tx.execute("DELETE FROM users WHERE username = ?1", params![&username])?;
+            not_found_if_unchanged(changed, username)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     /// 统计 `role = admin AND status = active` 的账户数，供「最后一个管理员」保护。
     ///
     /// # Errors
     ///
     /// SQLite 查询失败。
     pub async fn count_active_admins(&self) -> Result<u64, AccountError> {
-        self.with_conn(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM users WHERE role = ?1 AND status = ?2",
-                params![Role::Admin.as_str(), UserStatus::Active.as_str()],
-                |row| row.get(0),
-            )?;
-            Ok(u64::try_from(count).unwrap_or(0))
-        })
-        .await
+        self.with_conn(active_admin_count).await
     }
 
     /// 在阻塞线程里持锁执行一条 DB 操作。
@@ -379,6 +456,21 @@ impl UserStore {
         tokio::task::spawn_blocking(move || {
             let guard = conn.lock().map_err(|_| AccountError::LockPoisoned)?;
             operation(&guard)
+        })
+        .await?
+    }
+
+    /// 与 [`Self::with_conn`] 相同，但把 `&mut Connection` 交给闭包：事务需要独占连接
+    /// （`transaction_with_behavior`）。
+    async fn with_conn_mut<T, F>(&self, operation: F) -> Result<T, AccountError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, AccountError> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock().map_err(|_| AccountError::LockPoisoned)?;
+            operation(&mut guard)
         })
         .await?
     }
@@ -492,6 +584,35 @@ fn fetch_user(conn: &Connection, username: &str) -> Result<Option<User>, Account
         )
         .optional()?;
     raw.map(parse_user).transpose()
+}
+
+/// 把 `target` 改成 (`new_role`, `new_status`) 之后，系统是否不再有 active 管理员。
+///
+/// 只有「原本是 active 管理员」且「改完不再是」才需要数人头；`config_admins` 是数据库
+/// 之外的兜底管理员数（见 [`UserStore::update_profile_guarded`]）。
+fn loses_last_admin(
+    conn: &Connection,
+    target: &User,
+    new_role: Role,
+    new_status: UserStatus,
+    config_admins: u64,
+) -> Result<bool, AccountError> {
+    let was_active_admin = target.role == Role::Admin && target.status == UserStatus::Active;
+    let stays_active_admin = new_role == Role::Admin && new_status == UserStatus::Active;
+    if !was_active_admin || stays_active_admin {
+        return Ok(false);
+    }
+    Ok(active_admin_count(conn)?.saturating_add(config_admins) <= 1)
+}
+
+/// `role = admin AND status = active` 的行数；事务内外都可用。
+fn active_admin_count(conn: &Connection) -> Result<u64, AccountError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE role = ?1 AND status = ?2",
+        params![Role::Admin.as_str(), UserStatus::Active.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// 单行更新/删除的影响行数为 0 时转成 [`AccountError::NotFound`]。

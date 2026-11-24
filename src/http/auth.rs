@@ -30,15 +30,12 @@ use sha2::{Digest, Sha256};
 
 use super::error::{self, ApiError};
 use super::passwords;
-use super::{AppState, RequestId};
+use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId};
 use crate::accounts::{AccountError, UserStatus, UserStore};
 use crate::config::{Config, Role, UserConfig};
 
 /// 所有 401 共用的文案：不区分「没带凭据」「用户不存在」「口令错误」。
 const AUTH_FAILURE_MESSAGE: &str = "需要 HTTP Basic 认证";
-
-/// 账户库故障时的 503 文案：不暴露 SQL 细节，只说明可以重试。
-const ACCOUNTS_UNAVAILABLE_MESSAGE: &str = "账户库暂时不可用，请稍后重试";
 
 /// 通过认证的身份：用户名（账户库里的规范大小写）与角色。
 ///
