@@ -493,6 +493,30 @@ async fn given_admin_disables_user_when_session_then_401() {
 }
 
 #[tokio::test]
+async fn given_admin_de_approves_user_when_session_then_401() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("dave", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+    let id = app.session("dave", Role::Readwrite);
+
+    // active → pending（退回待审批）同样不是「可用状态」，会话必须立刻失效。
+    let (status, _, value) = app
+        .send_json(
+            Req::new(Method::PATCH, "/admin/users/dave")
+                .basic("root", PASSWORD)
+                .json(&json!({ "status": "pending" }))
+                .build(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["status"], "pending");
+    assert!(app.state.sessions().is_empty(), "退回待审批应立即清掉该用户的会话");
+
+    let (after, _, _) = app.send(Req::new(Method::GET, "/account/me").cookie(&id).build()).await;
+    assert_eq!(after, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn given_admin_changes_role_when_session_then_401() {
     let app = TestApp::new();
     app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;

@@ -170,7 +170,8 @@ async fn change_password_inner(
         accounts_unavailable()
     })?;
     tracing::info!(username = %user.username, "账户自助修改口令成功");
-    // 改口令 = 换凭据：所有设备上的旧会话立即失效，只保留（即将重新登录的）当前浏览器。
+    // 改口令 = 换凭据：包括当前浏览器在内的全部会话都失效，所有设备都要用新口令
+    // 重新登录（这里不做「保留当前会话」的例外，少一份特例少一处漏判）。
     state.sessions().revoke_user(&user.username);
     Ok(())
 }

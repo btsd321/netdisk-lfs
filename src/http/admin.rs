@@ -516,9 +516,10 @@ async fn patch_account(
         request_id = %request_id,
         "管理员修改账户"
     );
-    // 角色或状态一变，手里的会话就不能再代表这个人：降到只读、被禁用都要立刻踢下线。
-    // 认证中间件每次请求也会复核库里的角色，这里只是让失效**立即**发生并顺手释放内存。
-    if updated.role != target.role || updated.status == UserStatus::Disabled {
+    // 角色变了、或状态不再是 active（禁用、退回待审批），手里的会话都不能再代表这个人。
+    // 认证中间件每次请求也会复核库里的角色与状态，这里只是让失效**立即**发生并顺手
+    // 释放内存；漏掉 pending 的话，被退回待审批的会话能靠不断请求续到绝对过期。
+    if updated.role != target.role || updated.status != UserStatus::Active {
         state.sessions().revoke_user(&updated.username);
     }
     Ok(updated)
