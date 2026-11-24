@@ -29,8 +29,9 @@ use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 
 use super::error::{self, ApiError};
+use super::passwords;
 use super::{AppState, RequestId};
-use crate::accounts::{AccountError, UserStatus, UserStore, hash_password, verify_password};
+use crate::accounts::{AccountError, UserStatus, UserStore};
 use crate::config::{Config, Role, UserConfig};
 
 /// 所有 401 共用的文案：不区分「没带凭据」「用户不存在」「口令错误」。
@@ -252,7 +253,7 @@ async fn authenticate_existing(
 
     // Argon2 是同步的 CPU/内存密集操作（19 MiB），必须在阻塞线程池里跑：
     // 直接在 handler 线程上算会卡住整个 tokio worker。
-    if !verify_password_blocking(hash, password.to_vec()).await {
+    if !passwords::verify(hash, password.to_vec()).await {
         return Err(AuthFailure::WrongPassword);
     }
     // 口令正确但状态不是 active（待审批 / 已禁用）同样拒绝；具体状态只进日志。
@@ -281,7 +282,7 @@ async fn authenticate_legacy(
     let Some(config_user) = config.auth.users.get(username) else {
         // 两边都没有这个用户：付一次与真实校验等价的 Argon2 开销再拒绝，
         // 否则响应时间会泄漏「这个用户名在不在账户库里」。
-        dummy_verify(password.to_vec()).await;
+        passwords::dummy_verify(password.to_vec()).await;
         return Err(AuthFailure::UnknownUser);
     };
     if !password_matches(password, &config_user.password_sha256) {
@@ -313,7 +314,7 @@ async fn upgrade_legacy_user(
         tracing::warn!(username = %username, "config 口令不是 UTF-8，跳过哈希升级");
         return;
     };
-    let Ok(hash) = hash_password_blocking(plaintext.to_owned()).await else {
+    let Ok(hash) = passwords::hash(plaintext.to_owned()).await else {
         tracing::error!(username = %username, "生成 Argon2id 哈希失败，暂不升级");
         return;
     };
@@ -343,46 +344,9 @@ async fn upgrade_legacy_user(
     }
 }
 
-/// 在阻塞线程池里做 Argon2 校验；任务 panic 或运行时关闭时按「不匹配」处理。
-async fn verify_password_blocking(hash: String, password: Vec<u8>) -> bool {
-    let Ok(password) = String::from_utf8(password) else {
-        return false;
-    };
-    match tokio::task::spawn_blocking(move || verify_password(&hash, &password)).await {
-        Ok(matched) => matched,
-        Err(error) => {
-            tracing::error!(error = %error, "口令校验任务失败");
-            false
-        },
-    }
-}
-
-/// 在阻塞线程池里生成 Argon2id 哈希。
-async fn hash_password_blocking(password: String) -> Result<String, AccountError> {
-    tokio::task::spawn_blocking(move || hash_password(&password)).await?
-}
-
-/// 不存在用户名的占位校验：耗时与真实 Argon2 校验一致，结果必然为 false。
-async fn dummy_verify(password: Vec<u8>) {
-    let Ok(password) = String::from_utf8(password) else {
-        return;
-    };
-    // 占位哈希来自一个随机口令，代码里没有它的明文，因此永远不会校验通过。
-    match tokio::task::spawn_blocking(move || verify_password(DUMMY_ARGON2_HASH, &password)).await {
-        Ok(_) => {},
-        Err(error) => tracing::debug!(error = %error, "占位口令校验任务失败"),
-    }
-}
-
 /// 纯 config 认证的占位摘要（64 个 0）：未知用户名也付一次常量时间比较的开销，
 /// 避免计时差泄漏用户名是否存在（CWE-208）。真实配置里不会出现全 0 摘要的可用口令。
 const DUMMY_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// 接入账户库后未知用户名的占位哈希。
-///
-/// 用一个随机口令的 Argon2id PHC 串：明文不在代码里，永远校验不通过，但校验过程
-/// 会消耗与真实账户相同的 CPU/内存，让「用户名在不在库里」无法从响应时间分辨。
-const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$KgEc2p7IRGjkwslYirgWXA$yZi4JDtWmw4Dl0E0q5t+OngJasOO5zhJLgcBLLmATks";
 
 /// 解析 `Basic <base64>`：只切第一个 `:`，口令本身允许含冒号。
 fn parse_basic(header: Option<&HeaderValue>) -> Result<(String, Vec<u8>), AuthFailure> {

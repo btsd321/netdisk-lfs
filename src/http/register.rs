@@ -27,8 +27,8 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::{AppState, RequestId, json_with_status};
-use crate::accounts::{UserStatus, hash_password, validate_password, validate_username};
+use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use crate::accounts::{UserStatus, validate_password, validate_username};
 use crate::config::RegistrationPolicy;
 
 /// 注册请求体上限：表单只有三个短字段，16 KiB 足够，超出直接 400。
@@ -63,7 +63,8 @@ pub(crate) async fn page(State(state): State<AppState>) -> Response {
             ),
         );
     }
-    html_response(StatusCode::OK, page_shell("注册账户", &render_form(policy)))
+    let min_len = state.config().accounts.min_password_len;
+    html_response(StatusCode::OK, page_shell("注册账户", &render_form(policy, min_len)))
 }
 
 /// `POST /account/register`：按 `Content-Type` 分流 JSON 与表单。
@@ -279,17 +280,10 @@ async fn register(
         },
     }
 
-    let password = payload.password;
-    let hash = tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "注册口令哈希任务失败");
-            ApiError::Internal("生成口令哈希失败".to_owned())
-        })?
-        .map_err(|error| {
-            tracing::error!(error = %error, "注册口令哈希失败");
-            ApiError::Internal("生成口令哈希失败".to_owned())
-        })?;
+    let hash = passwords::hash(payload.password).await.map_err(|error| {
+        tracing::error!(error = %error, "注册口令哈希失败");
+        ApiError::Internal("生成口令哈希失败".to_owned())
+    })?;
 
     match users.create(&payload.username, &hash, accounts.default_role, status).await {
         Ok(user) => {
@@ -401,8 +395,8 @@ fn page_shell(title: &str, body: &str) -> String {
     )
 }
 
-/// 按策略渲染表单与提示。
-fn render_form(policy: RegistrationPolicy) -> String {
+/// 按策略渲染表单与提示；`min_password_len` 来自配置，写进输入框的 `minlength`。
+fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
     let hint = match policy {
         RegistrationPolicy::Open => "注册后账户立即可用。",
         RegistrationPolicy::Approval => "注册后需要管理员审批，审批通过前无法登录。",
@@ -419,14 +413,14 @@ fn render_form(policy: RegistrationPolicy) -> String {
 <input name="username" autocomplete="username" required minlength="3" maxlength="32">
 </label>
 <label>口令
-<input type="password" name="password" autocomplete="new-password" required>
+<input type="password" name="password" autocomplete="new-password" required minlength="{min_password_len}">
 </label>
 <label>确认口令
-<input type="password" name="confirm_password" autocomplete="new-password" required>
+<input type="password" name="confirm_password" autocomplete="new-password" required minlength="{min_password_len}">
 </label>
 <button type="submit">注册</button>
 </form>
-<p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少满足服务端配置的最小长度。</p>"#,
+<p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>"#,
         hint = escape_html(hint),
     )
 }
@@ -456,10 +450,6 @@ fn html_response(status: StatusCode, body: String) -> Response {
     *response.status_mut() = status;
     response
 }
-
-/// 账户库未接入时的 503 文案。
-const ACCOUNTS_UNAVAILABLE_MESSAGE: &str =
-    "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
 
 /// 注册限速的来源键：信任反代时取 `X-Forwarded-For` 第一段，否则用远端 IP。
 ///

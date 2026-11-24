@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
@@ -30,12 +30,14 @@ use crate::cache::Cache;
 use crate::config::Config;
 use crate::store::{ObjectStore, Oid};
 
+mod account;
 mod auth;
 mod batch;
 mod error;
 mod health;
 mod limits;
 mod metrics;
+mod passwords;
 mod register;
 mod transfer;
 
@@ -49,6 +51,10 @@ pub use transfer::upload_dir;
 
 /// LFS 协议媒体类型；请求与响应都用它（客户端可能附加 `; charset=utf-8`）。
 pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
+
+/// 账户库未接入（`accounts: None`）时 `/account/*` 的 503 文案。
+pub(crate) const ACCOUNTS_UNAVAILABLE_MESSAGE: &str =
+    "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
 
 /// 回写给客户端与反向代理的请求 id 头。
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -177,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(metrics::metrics))
         .merge(register_router())
+        .merge(account_router(state.clone()))
         .merge(lfs_router(state.clone()))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
@@ -185,6 +192,16 @@ pub fn router(state: AppState) -> Router {
 /// 公开的注册路由：注册页与注册提交都不需要认证（否则没人能注册）。
 fn register_router() -> Router<AppState> {
     Router::new().route("/account/register", get(register::page).post(register::submit))
+}
+
+/// 登录后的自身账户路由：单独一条受保护子路由，不并进 `/lfs`，避免 LFS 端点
+/// 将来加路径级例外时误伤账户端点。
+fn account_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/account/me", get(account::me))
+        .route("/account/password", post(account::change_password))
+        .route("/account", delete(account::delete_self))
+        .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 
 /// `/lfs` 子路由：认证统一挂这里，后续分支新增的 PUT/GET/verify 自动继承。
