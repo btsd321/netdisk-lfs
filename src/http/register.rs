@@ -17,37 +17,21 @@
 //! 限速按来源地址统计（小时窗口），只有**创建成功**才计数；被 429 拒掉的请求不再
 //! 计数，否则攻击者持续打就能把窗口无限延长，把正常用户挡在外面。
 
-use std::collections::HashMap;
-
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
+use super::html::{escape_html, html_response, page_shell, parse_form};
 use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
 use crate::accounts::{UserStatus, validate_password, validate_username};
 use crate::config::RegistrationPolicy;
 
 /// 注册请求体上限：表单只有三个短字段，16 KiB 足够，超出直接 400。
 const MAX_BODY_BYTES: usize = 16 * 1024;
-
-/// 注册页的样式：只做可读性，不引外部资源（离线可用、无追踪）。
-const PAGE_STYLE: &str = r#"
-body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2.5rem auto;
-       max-width: 32rem; padding: 0 1rem; line-height: 1.6; color: #1f2328; }
-h1 { font-size: 1.4rem; margin-bottom: .5rem; }
-p { margin: .5rem 0; }
-form { display: grid; gap: .85rem; margin-top: 1.5rem; }
-label { display: grid; gap: .3rem; font-size: .95rem; }
-input { padding: .5rem; border: 1px solid #d0d7de; border-radius: .375rem; font-size: 1rem; }
-button { padding: .55rem 1rem; border: 0; border-radius: .375rem; background: #1f6feb;
-         color: #fff; font-size: 1rem; cursor: pointer; }
-.hint { color: #59636e; font-size: .9rem; }
-.error { color: #b42318; }
-"#;
 
 /// `GET /account/register`：极简注册页（无 JavaScript）。
 pub(crate) async fn page(State(state): State<AppState>) -> Response {
@@ -177,52 +161,6 @@ fn check_confirmation(payload: &RegisterPayload) -> Result<(), ApiError> {
     }
 }
 
-/// 解析 `application/x-www-form-urlencoded`：`&` 分隔、`=` 切分、`+` 与 `%XX` 解码。
-///
-/// 同名键取第一次出现的值（浏览器不会重复提交同一个控件），避免后出现的值覆盖
-/// 前面的校验结果。
-fn parse_form(body: &str) -> Result<HashMap<String, String>, ApiError> {
-    let mut fields = HashMap::new();
-    for pair in body.split('&').filter(|pair| !pair.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode(raw_key)?;
-        let value = percent_decode(raw_value)?;
-        fields.entry(key).or_insert(value);
-    }
-    Ok(fields)
-}
-
-/// 百分号与 `+` 解码；非法转义或非 UTF-8 都报 400。
-fn percent_decode(raw: &str) -> Result<String, ApiError> {
-    let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            },
-            b'%' => {
-                let pair = bytes
-                    .get(index + 1..index + 3)
-                    .ok_or_else(|| ApiError::BadRequest("表单转义不完整".to_owned()))?;
-                let pair = std::str::from_utf8(pair)
-                    .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?;
-                let byte = u8::from_str_radix(pair, 16)
-                    .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?;
-                decoded.push(byte);
-                index += 3;
-            },
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            },
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| ApiError::BadRequest("表单不是合法的 UTF-8".to_owned()))
-}
-
 /// 校验、限速并按策略创建账户。
 async fn register(
     state: &AppState,
@@ -310,7 +248,10 @@ async fn register(
 }
 
 /// 409：用户名已被占用。
-fn duplicate_username(username: &str) -> ApiError {
+///
+/// 管理员创建账户（`/admin/users`）也走这条映射：两处的「重名」语义与文案一致，
+/// 只有审计日志不同。
+pub(crate) fn duplicate_username(username: &str) -> ApiError {
     tracing::warn!(username = %username, reason = "duplicate_username", "注册被拒：用户名已存在");
     ApiError::Conflict("用户名已被占用".to_owned())
 }
@@ -372,29 +313,6 @@ fn error_response(mode: BodyMode, error: ApiError, request_id: &RequestId) -> Re
     }
 }
 
-/// 注册页/结果页的公共外壳：内联样式，不引外部资源，不含任何脚本。
-fn page_shell(title: &str, body: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · netdisk-lfs</title>
-<style>{PAGE_STYLE}</style>
-</head>
-<body>
-<main>
-{body}
-</main>
-</body>
-</html>
-"#,
-        title = escape_html(title),
-        body = body,
-    )
-}
-
 /// 按策略渲染表单与提示；`min_password_len` 来自配置，写进输入框的 `minlength`。
 fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
     let hint = match policy {
@@ -423,32 +341,6 @@ fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
 <p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>"#,
         hint = escape_html(hint),
     )
-}
-
-/// HTML 转义：`&` 最先替换，避免把后续生成的实体二次转义。
-fn escape_html(raw: &str) -> String {
-    let mut escaped = String::with_capacity(raw.len());
-    for character in raw.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
-}
-
-/// 构造 HTML 响应（`text/html; charset=utf-8`）。
-fn html_response(status: StatusCode, body: String) -> Response {
-    let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    *response.status_mut() = status;
-    response
 }
 
 /// 注册限速的来源键：信任反代时取 `X-Forwarded-For` 第一段，否则用远端 IP。
@@ -482,44 +374,8 @@ pub(crate) fn client_key(state: &AppState, parts: &axum::http::request::Parts) -
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyMode, escape_html, parse_form, percent_decode};
+    use super::BodyMode;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
-
-    #[test]
-    fn given_html_special_chars_when_escape_then_entities() {
-        assert_eq!(
-            escape_html("<script>alert(1)</script>"),
-            "&lt;script&gt;alert(1)&lt;/script&gt;"
-        );
-        assert_eq!(escape_html("a & b \"c\" 'd'"), "a &amp; b &quot;c&quot; &#39;d&#39;");
-        // & 必须先替换，否则会二次转义成 &amp;lt;
-        assert_eq!(escape_html("&lt;"), "&amp;lt;");
-    }
-
-    #[test]
-    fn given_urlencoded_body_when_parse_then_fields_decoded() {
-        let fields = parse_form("username=Alice_01&password=a%2Bb+c&confirm_password=a%2Bb+c")
-            .expect("合法表单");
-
-        assert_eq!(fields["username"], "Alice_01");
-        assert_eq!(fields["password"], "a+b c");
-        assert_eq!(fields["confirm_password"], "a+b c");
-    }
-
-    #[test]
-    fn given_duplicate_key_when_parse_then_first_wins() {
-        let fields = parse_form("username=alice&username=bob").expect("合法表单");
-
-        assert_eq!(fields["username"], "alice");
-    }
-
-    #[test]
-    fn given_broken_percent_escape_when_decode_then_bad_request() {
-        assert!(percent_decode("%2").is_err(), "不完整的转义应被拒");
-        assert!(percent_decode("%zz").is_err(), "非十六进制应被拒");
-        assert!(percent_decode("%ff").is_err(), "非 UTF-8 字节应被拒");
-        assert_eq!(percent_decode("a%20b").expect("合法转义"), "a b");
-    }
 
     #[test]
     fn given_content_type_when_body_mode_then_json_or_form() {

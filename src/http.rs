@@ -4,9 +4,10 @@
 //! 探针，后者只在本机被抓取）；`/lfs` 子路由统一挂 Basic 认证，batch 与 PUT/GET/verify
 //! 都长在这条子路由下，新增端点自动继承认证。
 //!
-//! 分工：`auth` 负责认证与角色，`error` 负责统一错误体与状态码映射，`batch` 负责
-//! 批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
-//! 本文件只做装配与请求级横切（span、request id）。
+//! 分工：`auth` 负责认证与角色，`html` 负责极简页面的外壳/转义/表单解析，`error`
+//! 负责统一错误体与状态码映射，`batch` 负责批量协商，`health` 负责 `bdpan` 探活与
+//! 降级判定，`metrics` 负责 Prometheus 文本。本文件只做装配与请求级横切（span、
+//! request id）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ mod auth;
 mod batch;
 mod error;
 mod health;
+mod html;
 mod limits;
 mod metrics;
 mod passwords;
