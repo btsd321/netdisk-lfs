@@ -16,18 +16,19 @@ pub const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 /// 流式计算本地文件的 sha256，返回小写十六进制字符串。
 ///
-/// 按 [`HASH_BUFFER_BYTES`] 分块读、逐块喂给哈希器，内存占用与文件大小无关。
+/// 直接把 [`HASH_BUFFER_BYTES`] 大小的缓冲交给 `read`：tokio 的 `BufReader`
+/// 对「不小于自身容量的读」会旁路内部缓冲，套一层只会白付一次分配与拷贝。
+/// 内存占用与文件大小无关。
 ///
 /// # Errors
 /// 文件打不开或读失败时返回 [`io::Error`]；路径上下文由调用方补
 /// （存储层用 `StoreError::io` 包装，日志里才看得到是哪个文件）。
 pub async fn hash_file(path: &Path) -> io::Result<String> {
-    let file = tokio::fs::File::open(path).await?;
-    let mut reader = tokio::io::BufReader::with_capacity(HASH_BUFFER_BYTES, file);
+    let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = file.read(&mut buffer).await?;
         if read == 0 {
             break;
         }

@@ -60,20 +60,42 @@ impl fmt::Display for Oid {
     }
 }
 
+impl std::str::FromStr for Oid {
+    type Err = OidError;
+
+    /// 让 `"…"parse::<Oid>()` 与惯用法打通；等价于 [`Oid::parse`]。
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
+    }
+}
+
+impl AsRef<str> for Oid {
+    /// 派生的 `Hash`/`Eq` 与 `str` 语义一致，`&Oid` 可以安全地当 `&str` 借用，
+    /// 喂给接收 `&str` 的泛型 API 不必显式 `as_str()`。
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// `Oid` 构造失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum OidError {
     /// 长度不是 64 个字符。
-    #[error("oid 必须是 64 位十六进制字符串，实际 {actual} 位")]
+    ///
+    /// `actual` 是 UTF-8 字节数（`str::len` 的语义），非 ASCII 输入时大于字符数。
+    #[error("oid 必须是 64 位十六进制字符串，实际 {actual} 字节")]
     Length {
-        /// 实际收到的字符数。
+        /// 实际收到的字节数。
         actual: usize,
     },
     /// 含非十六进制字符。
-    #[error("oid 含非十六进制字符：{value}")]
+    ///
+    /// `value` 用 `{:?}` 渲染：原始输入来自客户端，可能带控制字符，
+    /// 转义输出避免日志注入（CWE-117），同时保留可匹配的原文。
+    #[error("oid 含非十六进制字符：{value:?}")]
     NotHex {
-        /// 原始输入，便于日志定位是哪个客户端传错了。
+        /// 原始输入（调试渲染时转义），便于日志定位是哪个客户端传错了。
         value: String,
     },
 }
@@ -135,5 +157,36 @@ mod tests {
         let high = Oid::parse(&VALID.replacen('0', "f", 1)).expect("合法 oid");
 
         assert!(low < high);
+    }
+
+    #[test]
+    fn given_raw_string_when_from_str_then_same_as_parse() {
+        let oid: Oid = VALID.parse().expect("FromStr 应与 parse 等价");
+
+        assert_eq!(oid.as_str(), VALID);
+        assert!(("zz".parse::<Oid>()).is_err());
+    }
+
+    #[test]
+    fn given_oid_when_as_ref_str_then_borrows_inner() {
+        let oid = Oid::parse(VALID).expect("合法 oid");
+
+        let borrowed: &str = oid.as_ref();
+        assert_eq!(borrowed, VALID);
+    }
+
+    #[test]
+    fn given_control_chars_in_not_hex_when_display_then_escaped() {
+        // 64 个字符（长度检查通过）但含控制字符，走 NotHex 分支。
+        let raw = format!("{}\n{}\t\u{1b}", "a".repeat(30), "g".repeat(31));
+        assert_eq!(raw.len(), 64);
+        let err = Oid::parse(&raw).expect_err("含控制字符应被拒绝");
+        assert!(matches!(err, OidError::NotHex { .. }), "实际错误：{err}");
+
+        // 转义渲染：换行/制表/ESC 不得原样进日志（防日志注入）。
+        let message = err.to_string();
+        assert!(!message.contains('\n'), "实际错误：{message:?}");
+        assert!(!message.contains('\t'), "实际错误：{message:?}");
+        assert!(!message.contains('\u{1b}'), "实际错误：{message:?}");
     }
 }

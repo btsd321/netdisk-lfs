@@ -20,12 +20,14 @@ pub enum StoreError {
         oid: Oid,
     },
     /// 内容与 oid 不符：要么待上传的本地文件是脏的，要么后端给了坏对象。
-    #[error("对象 {oid} 哈希不符：期望 {expected}，实际 {actual}")]
+    ///
+    /// 期望值恒等于 oid 本身，因此不设 `expected` 字段——变体字段是公开的，
+    /// 若单独携带 `expected` 就可能被构造成与 oid 不一致的误导信息；直接渲染
+    /// `{oid}` 让张冠李戴在结构上不可能。
+    #[error("对象 {oid} 哈希不符：实际 {actual}")]
     HashMismatch {
         /// 目标对象。
         oid: Oid,
-        /// 期望的摘要，恒等于 oid 的十六进制形式。
-        expected: String,
         /// 实际算出的摘要，供日志留证。
         actual: String,
     },
@@ -67,11 +69,7 @@ impl StoreError {
     ///
     /// 期望值恒为 oid 本身，集中在这里构造，后端实现不会传错。
     pub fn hash_mismatch(oid: &Oid, actual: &str) -> Self {
-        Self::HashMismatch {
-            oid: oid.clone(),
-            expected: oid.to_string(),
-            actual: actual.to_owned(),
-        }
+        Self::HashMismatch { oid: oid.clone(), actual: actual.to_owned() }
     }
 }
 
@@ -85,12 +83,15 @@ mod tests {
     }
 
     #[test]
-    fn given_mismatch_when_display_then_shows_expected_and_actual() {
+    fn given_mismatch_when_display_then_shows_oid_and_actual() {
         let err = StoreError::hash_mismatch(&oid(), "ff");
 
         let message = err.to_string();
+        // 断言带标签的具体值：oid（64 个 0）与 actual（ff）都在，且顺序正确。
+        let oid_pos = message.find(&"0".repeat(64)).expect("oid 应出现在错误信息中");
+        let actual_pos = message.find("ff").expect("actual 应出现在错误信息中");
+        assert!(oid_pos < actual_pos, "实际错误：{message}");
         assert!(message.contains("哈希不符"), "实际错误：{message}");
-        assert!(message.contains("ff"), "实际错误：{message}");
     }
 
     #[test]
@@ -101,13 +102,16 @@ mod tests {
     }
 
     #[test]
-    fn given_backend_error_when_source_then_keeps_original() {
+    fn given_backend_error_when_source_then_keeps_original_kind() {
         let err = StoreError::Backend {
             message: "bdpan 超时".to_owned(),
             source: Some(Box::new(std::io::Error::from(std::io::ErrorKind::TimedOut))),
         };
 
-        assert!(std::error::Error::source(&err).is_some());
+        // downcast 验证 source 链确实保留了原始错误（而非只是「有 source」）。
+        let source = std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<std::io::Error>().map(std::io::Error::kind));
+        assert_eq!(source, Some(std::io::ErrorKind::TimedOut));
         assert!(!err.to_string().ends_with('。'));
     }
 }

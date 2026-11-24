@@ -38,11 +38,31 @@ pub struct FakeStore {
 
 impl FakeStore {
     /// 在系统临时目录下取一个唯一根目录；Drop 时递归删除。
+    ///
+    /// 独占创建（`create_dir`）：上次运行被 SIGKILL、`Drop` 没跑、OS 又复用了
+    /// 同一 PID 时，陈旧目录会让脏对象混进本次测试——碰撞时换下一个序号
+    /// 重试，而不是静默复用。
     pub fn new() -> Self {
-        let seq = ROOT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("netdisk-lfs-fake-{}-{seq}", std::process::id()));
-        Self::build(root, true)
+        let pid = std::process::id();
+        let mut seq = ROOT_SEQ.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let root = std::env::temp_dir().join(format!("netdisk-lfs-fake-{pid}-{seq}"));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Self::build(root, true),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => seq += 1,
+                // 其它失败（如临时目录本身异常）退回尽力而为的创建。
+                Err(_) => {
+                    if let Err(fallback) = std::fs::create_dir_all(&root) {
+                        tracing::warn!(
+                            root = %root.display(),
+                            error = %fallback,
+                            "创建 FakeStore 根目录失败"
+                        );
+                    }
+                    return Self::build(root, true);
+                },
+            }
+        }
     }
 
     /// 用调用方给的根目录；不负责创建与清理，测试可自行往目录里摆文件。
@@ -140,15 +160,17 @@ impl ObjectStore for FakeStore {
             fs::create_dir_all(parent).await.map_err(|err| StoreError::io(parent, err))?;
 
             // 先写同目录的 .part 再 rename：中途失败不会在最终路径留下半个对象。
+            // Drop 守卫兜底「future 被取消」（超时/断连）时的清理——与
+            // FakeStore::drop 一样用同步删除，这里是一次 unlink，测试替身可接受。
             let staging = target.with_extension("part");
+            let guard = StagingGuard(staging.clone());
             if let Err(err) = fs::copy(local_source, &staging).await {
-                discard(&staging).await;
                 return Err(StoreError::io(&staging, err));
             }
             if let Err(err) = fs::rename(&staging, &target).await {
-                discard(&staging).await;
                 return Err(StoreError::io(&target, err));
             }
+            guard.disarm();
             Ok(())
         })
     }
@@ -167,18 +189,28 @@ impl ObjectStore for FakeStore {
                 fs::create_dir_all(parent).await.map_err(|err| StoreError::io(parent, err))?;
             }
 
-            fs::copy(&source, dest).await.map_err(|err| StoreError::io(dest, err))?;
-            if self.corrupt_next_fetch.swap(false, Ordering::SeqCst) {
-                append_garbage(dest).await?;
+            // 从 copy 开始，dest 可能已被写入：此后任何失败都必须清掉，
+            // 保证调用方看到的 dest「要么没动过、要么是完整且校验通过的对象」。
+            // copy 之前的失败（NotFound 等）不删 dest——那时还没写任何东西。
+            let outcome = async {
+                fs::copy(&source, dest).await.map_err(|err| StoreError::io(dest, err))?;
+                if self.corrupt_next_fetch.swap(false, Ordering::SeqCst) {
+                    append_garbage(dest).await?;
+                }
+                let digest = hash_file(dest).await.map_err(|err| StoreError::io(dest, err))?;
+                if digest != oid.as_str() {
+                    return Err(StoreError::hash_mismatch(oid, &digest));
+                }
+                Ok(())
             }
-
-            // 契约第二条：下载完成后必须自己校验，坏对象绝不留在 dest。
-            let digest = hash_file(dest).await.map_err(|err| StoreError::io(dest, err))?;
-            if digest != oid.as_str() {
-                discard(dest).await;
-                return Err(StoreError::hash_mismatch(oid, &digest));
+            .await;
+            match outcome {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    discard(dest).await;
+                    Err(err)
+                },
             }
-            Ok(())
         })
     }
 
@@ -211,6 +243,28 @@ async fn discard(path: &Path) {
     }
 }
 
+/// 上传 `.part` 中转文件的兜底守卫：正常路径完成后 [`Self::disarm`]，异常返回
+/// 或 future 被取消（Drop）时删除中转文件，避免半截对象泄漏进 objects 树。
+struct StagingGuard(PathBuf);
+
+impl StagingGuard {
+    /// 成功路径：中转文件已 rename 走，解除守卫。
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        // rename 成功后 staging 已不存在，remove 报 NotFound 属预期，静默即可。
+        if let Err(err) = std::fs::remove_file(&self.0)
+            && err.kind() != ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.0.display(), error = %err, "清理 .part 中转文件失败");
+        }
+    }
+}
+
 /// 往文件尾部追加一个字节，模拟传输被静默截断。
 async fn append_garbage(path: &Path) -> Result<(), StoreError> {
     let mut file = fs::OpenOptions::new()
@@ -236,6 +290,10 @@ async fn dir_size(dir: &Path) -> std::io::Result<u64> {
             if file_type.is_dir() {
                 pending.push(entry.path());
             } else if file_type.is_file() {
+                // .part 是上传中转（含取消泄漏的兜底场景），不算已提交对象。
+                if entry.path().extension().is_some_and(|ext| ext == "part") {
+                    continue;
+                }
                 total += entry.metadata().await?.len();
             }
         }
@@ -368,6 +426,24 @@ mod tests {
         assert_eq!(quota.total, 1_000);
         assert_eq!(quota.used, 8);
         assert_eq!(quota.free(), 992);
+    }
+
+    #[tokio::test]
+    async fn given_leaked_part_file_when_quota_then_not_counted() {
+        let store = FakeStore::new();
+        let (oid, source) = fixture(&store, "g3.bin", b"committed").await;
+        store.put(&oid, &source).await.expect("写入对象");
+
+        // 模拟取消泄漏：在 objects 树里塞一个 .part 中转文件。
+        let leaked = store.root().join("objects").join("leak.part");
+        if let Some(parent) = leaked.parent() {
+            tokio::fs::create_dir_all(parent).await.expect("建目录");
+        }
+        tokio::fs::write(&leaked, b"staging junk").await.expect("写中转文件");
+
+        let quota = store.quota().await.expect("查询配额");
+
+        assert_eq!(quota.used, 9, "只统计已提交对象，.part 不计入");
     }
 
     #[tokio::test]
