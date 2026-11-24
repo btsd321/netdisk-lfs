@@ -62,6 +62,14 @@ pub enum ApiError {
     /// 502：`bdpan` 调用失败。
     #[error("{0}")]
     BadGateway(String),
+    /// 429：登录失败或注册请求过于频繁（进程内限速）。
+    #[error("{message}")]
+    TooManyRequests {
+        /// 面向客户端的说明。
+        message: String,
+        /// 建议的重试间隔（秒），写进 `Retry-After` 响应头。
+        retry_after_secs: u64,
+    },
     /// 503：网盘不可用或 token 失效。
     #[error("{0}")]
     Unavailable(String),
@@ -80,6 +88,7 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,6 +106,7 @@ impl ApiError {
             | Self::BadGateway(message)
             | Self::Unavailable(message)
             | Self::Internal(message) => message,
+            Self::TooManyRequests { message, .. } => message,
             // 具体字节数只在日志/Display 里给出，回给客户端的 message 保持简短。
             Self::RangeNotSatisfiable { .. } => "Range 越界：请求起点超出对象大小",
         }
@@ -133,6 +143,12 @@ impl ApiError {
                 headers
                     .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
             },
+            Self::TooManyRequests { retry_after_secs, .. } => {
+                // RFC 9110 §10.2.3：429 应告诉客户端多久后可以重试。
+                if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    headers.insert(header::RETRY_AFTER, value);
+                }
+            },
             Self::RangeNotSatisfiable { total } => {
                 // RFC 9110：416 必须告诉客户端「当前表示有多大」，客户端据此重算区间。
                 if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
@@ -151,6 +167,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         self.into_response_with(&RequestId::generate())
     }
+}
+
+/// 给响应补上 401 的认证挑战头。
+///
+/// 账户库故障（503）也要带它：客户端需要知道该用哪套凭据重试，而不是误以为
+/// 这个端点不需要认证。
+pub(crate) fn with_auth_challenge(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+    response
 }
 
 /// 存储层错误到 HTTP 状态码的映射（api.md「状态码约定」）。

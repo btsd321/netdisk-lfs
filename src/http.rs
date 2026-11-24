@@ -25,6 +25,7 @@ use axum::routing::{get, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
+use crate::accounts::UserStore;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::store::{ObjectStore, Oid};
@@ -33,8 +34,11 @@ mod auth;
 mod batch;
 mod error;
 mod health;
+mod limits;
 mod metrics;
 mod transfer;
+
+use limits::{LOGIN_WINDOW, SlidingWindowLimiter};
 
 pub use error::ApiError;
 pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
@@ -63,6 +67,11 @@ pub struct AppState {
     /// `/healthz` 的 `bdpan` 探活器；`None` 表示未注入（嵌入用法/测试），此时
     /// `/healthz` 按不可用报降级，不谎报健康。
     probe: Option<Arc<BdpanProbe>>,
+    /// SQLite 账户库；`None` 表示未接入（嵌入用法/既有测试），此时认证只查
+    /// `[auth.users]`，`/account/*` 一律 503。
+    accounts: Option<Arc<UserStore>>,
+    /// 登录失败限速（按小写用户名）；进程内状态，重启清零。
+    login_limits: Arc<SlidingWindowLimiter>,
 }
 
 impl AppState {
@@ -79,7 +88,32 @@ impl AppState {
 
     /// 注入已扫描、已清理的缓存；`main` 的启动路径用这个。
     pub fn with_cache(store: Arc<dyn ObjectStore>, config: Arc<Config>, cache: Cache) -> Self {
-        Self { store, config, cache, probe: None }
+        Self {
+            store,
+            config,
+            cache,
+            probe: None,
+            accounts: None,
+            login_limits: Arc::new(SlidingWindowLimiter::new(LOGIN_WINDOW)),
+        }
+    }
+
+    /// 在已装配的 state 上注入账户库；`main` 的启动路径用这个。
+    ///
+    /// 与 [`Self::with_bdpan_probe`] 一样是可选注入：不注入时认证退回「只认
+    /// `[auth.users]`」的旧行为，既有测试与嵌入用法不需要改。
+    pub fn with_account_store(mut self, users: Arc<UserStore>) -> Self {
+        self.accounts = Some(users);
+        self
+    }
+
+    /// 构造一个接入了账户库的 state（空缓存、无探活）；测试与嵌入用法用这个。
+    pub fn with_accounts(
+        store: Arc<dyn ObjectStore>,
+        config: Arc<Config>,
+        users: Arc<UserStore>,
+    ) -> Self {
+        Self::new(store, config).with_account_store(users)
     }
 
     /// 注入 `bdpan` 探活器；`main` 在启动时接上它，`/healthz` 才会真的探测登录态。
@@ -112,6 +146,16 @@ impl AppState {
     /// `bdpan` 探活器；未注入时为 `None`。
     pub fn bdpan_probe(&self) -> Option<&BdpanProbe> {
         self.probe.as_deref()
+    }
+
+    /// 账户库；未接入时为 `None`（此时 `/account/*` 返回 503，认证只查配置）。
+    pub fn accounts(&self) -> Option<&UserStore> {
+        self.accounts.as_deref()
+    }
+
+    /// 登录失败限速器；认证中间件用它按用户名计数。
+    pub(crate) fn login_limits(&self) -> &SlidingWindowLimiter {
+        &self.login_limits
     }
 }
 
