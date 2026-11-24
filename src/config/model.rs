@@ -48,11 +48,16 @@ pub struct StorageConfig {
     pub max_object_bytes: u64,
     /// 同时存在的 `bdpan` 子进程上限。
     pub max_bdpan_procs: usize,
-    /// 单次 `bdpan` 命令超时（秒）；`0` 表示不设超时。
+    /// 非传输命令的固定超时，同时也是传输命令的启动宽限（秒）；`0` = 不设超时。
     ///
-    /// 大对象上传耗时随上行带宽线性增长（实测约 5 MiB/s：50 GiB ≈ 3 小时），
-    /// 超时是「卡死保护」而不是业务上限，默认给到 6 小时。
+    /// 传输类命令（upload/download）的最终超时 = 本值 + `文件大小 / 最低吞吐`，
+    /// 见 [`bdpan_min_throughput_bytes_per_sec`](Self::bdpan_min_throughput_bytes_per_sec)。
     pub bdpan_timeout_secs: u64,
+    /// 传输类命令的最低吞吐（字节/秒），用于按文件大小推导超时；`0` = 不按吞吐计算。
+    ///
+    /// 默认 102400（100 KiB/s）：4.5 GiB 对象的超时约 13 小时，只有平均速度低于
+    /// 100 KiB/s 才会被判卡死——正常上传/下载远快于此，不会误杀。
+    pub bdpan_min_throughput_bytes_per_sec: u64,
 }
 
 /// `[cache]` 段。

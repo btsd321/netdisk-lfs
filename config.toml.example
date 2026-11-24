@@ -40,9 +40,15 @@ max_object_bytes = 0
 # 同时存在的 bdpan 子进程上限（并发许可数）。bdpan 的并发安全性未压测，
 # 保守取 4；调大前先确认网盘侧不触发风控。
 max_bdpan_procs = 4
-# 单次 bdpan 命令超时（秒）：0 = 不设超时。按实测上行约 5 MiB/s 估算，
-# 50 GiB 约需 3 小时，所以默认给 6 小时；只影响「卡死保护」，不是业务上限。
-bdpan_timeout_secs = 21600
+# 非传输命令（ls/mkdir/mv/rm/quota/whoami）的固定超时，也是传输的启动宽限（秒）：
+# 0 = 不设超时。
+bdpan_timeout_secs = 300
+# 传输类命令（upload/download）的最低吞吐（字节/秒），按文件大小推导超时：
+#   超时 = bdpan_timeout_secs + 文件大小 / 本值
+# 默认 102400（100 KiB/s）：只有平均速度低于 100 KiB/s 才判卡死——4.5 GiB 对象
+# 约给 13 小时，50 GiB 约给 6 天，正常传输（实测 ~5 MiB/s 上行）远不会触发。
+# 0 = 关闭按大小计算，退回固定超时。
+bdpan_min_throughput_bytes_per_sec = 102400
 
 [cache]
 # 本地读缓存目录。必须在 systemd unit 的 ReadWritePaths 之内（/var/lib/netdisk-lfs），

@@ -27,7 +27,11 @@ fn given_shipped_example_when_loaded_then_valid_and_deploy_shaped() {
     assert_eq!(config.storage.bdpan_bin, Path::new("/home/lixinlong/.local/bin/bdpan"));
     assert_eq!(config.storage.max_object_bytes, 0, "0 = 不限制单对象大小");
     assert_eq!(config.storage.max_bdpan_procs, 4);
-    assert_eq!(config.storage.bdpan_timeout_secs, 21_600, "bdpan 超时默认 6 小时");
+    assert_eq!(config.storage.bdpan_timeout_secs, 300, "非传输/启动宽限 5 分钟");
+    assert_eq!(
+        config.storage.bdpan_min_throughput_bytes_per_sec, 102_400,
+        "传输按 100 KiB/s 下限推导超时"
+    );
     assert_eq!(config.cache.dir, Path::new("/var/lib/netdisk-lfs/cache"));
     assert_eq!(config.cache.max_bytes, 214_748_364_800, "缓存预算 200 GiB");
     assert_eq!(config.auth.users.len(), 2, "示例给一个读写、一个只读账号");

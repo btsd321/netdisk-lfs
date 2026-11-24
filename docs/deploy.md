@@ -295,7 +295,7 @@ curl -s  http://127.0.0.1:9001/metrics | grep -c '^netdisk_lfs_'
 | token 30 天 | access_token 官方有效期 30 天、刷新后仍 30 天；长期凭据是 refresh_token（官方文档标称 **10 年**）。`bdpan` 内置刷新流程（`grant_type=refresh_token`），前提是 `~/.config/bdpan` 可写；只有 refresh_token 失效/被撤销或用户解除授权才需人工 `login` |
 | 单对象大小 | `storage.max_object_bytes` 默认 **0 = 不限制**（实测 4.5 GiB 往返 sha256 一致）；实际大小受网盘单文件限制、本地磁盘余量与 `bdpan_timeout_secs` 约束。非 0 时超限回 422，不做分片 |
 | 无 LFS 锁 | `git lfs lock` 系列端点未实现 |
-| 大对象超时 | `bdpan_timeout_secs` 默认 21600（6 小时）、0 = 不设超时：按实测上行 ~5 MiB/s，50 GiB 约需 3 小时。上传期间进程被杀会由 `kill_on_drop` 结束 CLI，残留由启动扫描清理 |
+| 大对象超时 | 传输超时 = `bdpan_timeout_secs`（启动宽限，默认 300s）+ 文件大小 / `bdpan_min_throughput_bytes_per_sec`（默认 100 KiB/s）。即平均速度低于 100 KiB/s 未传完才判卡死：4.5 GiB 约给 13 小时、50 GiB 约给 6 天，正常传输（实测上行 ~5 MiB/s）不会误杀。两项均可配，0 表示关闭该因子。上传期间进程被杀由 `kill_on_drop` 结束 CLI，残留由启动扫描清理 |
 | 无配额/限速 | 不按用户限额，也没有请求速率限制 |
 | 指标有限 | `/metrics` 只有缓存维度；HTTP 延迟/状态码计数尚未导出 |
 | 无配置自检 | 没有 `--check-config`，配置错误靠启动失败暴露 |

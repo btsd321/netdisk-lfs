@@ -63,6 +63,7 @@ impl Config {
             max_object_bytes: storage.max_object_bytes,
             max_bdpan_procs: storage.max_bdpan_procs,
             bdpan_timeout_secs: storage.bdpan_timeout_secs,
+            bdpan_min_throughput_bytes_per_sec: storage.bdpan_min_throughput_bytes_per_sec,
         };
 
         let cache_dir = match (cache.dir, &data_dir) {
@@ -195,11 +196,18 @@ struct RawStorage {
     max_bdpan_procs: usize,
     #[serde(default = "default_bdpan_timeout_secs")]
     bdpan_timeout_secs: u64,
+    #[serde(default = "default_bdpan_min_throughput")]
+    bdpan_min_throughput_bytes_per_sec: u64,
 }
 
-/// `bdpan` 命令超时缺省值：6 小时（50 GiB @ 5 MiB/s 约 3 小时，留一倍余量）。
+/// 非传输命令超时 / 传输启动宽限的缺省值：300s。
 fn default_bdpan_timeout_secs() -> u64 {
-    21_600
+    300
+}
+
+/// 传输最低吞吐缺省值：100 KiB/s（低于它视为卡死，按文件大小放大超时）。
+fn default_bdpan_min_throughput() -> u64 {
+    102_400
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,7 +291,8 @@ bob = { password_sha256 = "00000000000000000000000000000000000000000000000000000
         assert_eq!(config.storage.bdpan_bin, PathBuf::from("/usr/local/bin/bdpan"));
         assert_eq!(config.storage.max_object_bytes, 4_294_967_296);
         assert_eq!(config.storage.max_bdpan_procs, 4);
-        assert_eq!(config.storage.bdpan_timeout_secs, 21_600);
+        assert_eq!(config.storage.bdpan_timeout_secs, 300);
+        assert_eq!(config.storage.bdpan_min_throughput_bytes_per_sec, 102_400);
         assert_eq!(config.cache.dir, PathBuf::from("/var/lib/netdisk-lfs/cache"));
         assert_eq!(config.cache.max_bytes, 214_748_364_800);
         assert_eq!(config.auth.users.len(), 2);
