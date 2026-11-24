@@ -543,8 +543,11 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
   grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
   gap: 64px;
   align-items: start;
+  align-content: center;
+  min-height: calc(100vh - 145px);
   padding: 48px 0 40px;
 }
+.scroll-hint { display: none; }
 .gate-brand { min-width: 0; padding-top: 20px; border-top: 1px solid var(--ink); }
 .gate-brand .brand-mark { margin-bottom: 20px; }
 .gate-lede { margin: 0; max-width: 26em; font-size: 19px; font-weight: 600; line-height: 1.45; letter-spacing: -0.01em; }
@@ -556,6 +559,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
 .ticket h1 { font-size: 26px; }
 .ticket .form { margin-top: 24px; }
 @media (max-width: 880px) {
+  .gate { align-content: start; }
   .gate { grid-template-columns: minmax(0, 1fr); gap: 32px; padding-top: 32px; }
   .gate-lede { max-width: none; }
   /* 单栏时表单不跟着整页拉宽：一张 700px 宽的输入框比两栏更难用。 */
@@ -574,6 +578,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
   .chip .btn-small { min-height: 26px; padding: 0 8px; font-size: 12px; }
   .chip-note { max-width: 100%; }
   .page { padding-top: 24px; }
+  .scroll-hint { display: block; }
   .split { grid-template-columns: minmax(0, 1fr); gap: 24px; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat { padding: 12px 12px 12px 0; }
