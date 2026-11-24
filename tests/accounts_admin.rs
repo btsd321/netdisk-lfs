@@ -239,6 +239,30 @@ fn api(
     request(method, uri, Some(&basic_header(username, password)), None, content_type, body)
 }
 
+/// 带任意附加头的请求：跨站/同站判定与媒体类型用例用。
+fn request_extra(
+    method: Method,
+    uri: &str,
+    username: &str,
+    password: &str,
+    extra: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, TEST_HOST)
+        .header(header::AUTHORIZATION, basic_header(username, password));
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from(body.to_owned())).expect("构造请求")
+}
+
 /// 管理页的表单 POST（浏览器会带 `Accept: text/html`）。
 fn form_post(uri: &str, username: &str, password: &str, body: &str) -> Request<Body> {
     request(
@@ -325,6 +349,171 @@ async fn given_non_admin_when_admin_endpoints_then_403_json_or_html_page() {
     let anonymous = request(Method::GET, "/admin/users", None, None, None, String::new());
     let (status, _, _) = app.send_json(anonymous).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_cross_site_write_when_admin_endpoint_then_403() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+    let payload = json!({ "username": "someone", "password": PASSWORD, "role": "readwrite" });
+
+    // 恶意页面提交的表单会带跨站 Origin。
+    let (status, headers, body) = app
+        .send_json(request_extra(
+            Method::POST,
+            "/admin/users",
+            "root",
+            PASSWORD,
+            &[("origin", "https://evil.example")],
+            Some("application/json"),
+            &payload.to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("跨站")),
+        "应明确拒绝跨站写请求：{body}"
+    );
+
+    // 现代浏览器还会带 Sec-Fetch-Site；cross-site 同样拒绝。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "cross-site")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(app.store().get("victim").await.expect("查询").is_some(), "跨站请求不得产生副作用");
+
+    // 同站（管理页自己的表单）放行。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "same-origin")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // 读请求不受同站校验限制（跨站也读不到响应体，没有 CORS 头）。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::GET,
+            "/admin",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "cross-site")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn given_same_host_origin_when_admin_write_then_allowed() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+
+    // Origin 与 Host 同主机名即可：scheme 与端口不参与比较（反代可能换端口/加 TLS）。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("origin", "https://lfs.test:8443")],
+            None,
+            "",
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "同主机名的 Origin 不应被拒");
+    assert_eq!(app.store().get("victim").await.expect("查询"), None);
+}
+
+#[tokio::test]
+async fn given_wrong_content_type_when_admin_write_then_415() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+
+    // text/plain 的 JSON 体不触发 CORS 预检，必须在媒体类型上拒掉。
+    let payload = json!({ "username": "someone", "password": PASSWORD, "role": "readwrite" });
+    let (status, headers, body) = app
+        .send_json(request_extra(
+            Method::POST,
+            "/admin/users",
+            "root",
+            PASSWORD,
+            &[],
+            Some("text/plain"),
+            &payload.to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("application/json")),
+        "应说明期望的媒体类型：{body}"
+    );
+
+    // 缺 Content-Type 的 JSON 写请求同样拒绝。
+    let (status, _, _) = app
+        .send_json(request_extra(
+            Method::PATCH,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // 表单端点收到 JSON 也是 415（错误页按 Accept 分流）。
+    let (status, headers, body) = app
+        .send(request_extra(
+            Method::POST,
+            "/admin/users/victim/delete",
+            "root",
+            PASSWORD,
+            &[("accept", "text/html")],
+            Some("application/json"),
+            r#"{"confirm":"yes"}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_html_error(status, &headers, &body_text(body));
+    assert!(app.store().get("victim").await.expect("查询").is_some(), "被拒请求不得删账户");
+
+    // 带 charset 的 JSON 仍接受（媒体类型部分一致即可）。
+    let (status, _, body) = app
+        .send_json(request_extra(
+            Method::PATCH,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[],
+            Some("application/json; charset=utf-8"),
+            &json!({ "role": "readonly" }).to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "readonly");
 }
 
 #[tokio::test]

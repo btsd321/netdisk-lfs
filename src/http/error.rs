@@ -49,6 +49,12 @@ pub enum ApiError {
     /// 409：与现有状态冲突（用户名已被占用、删除最后一个管理员等）。
     #[error("{0}")]
     Conflict(String),
+    /// 415：请求体的媒体类型不受支持（管理端点只接受 JSON 或表单）。
+    ///
+    /// 单独一个状态码而不是 400：客户端要能区分「格式对但类型不对」，
+    /// 这也正是挡住 `text/plain` 绕 CORS 预检的关卡。
+    #[error("{0}")]
+    UnsupportedMediaType(String),
     /// 416：`Range` 语法合法但起点越界（RFC 9110 §15.5.17）。
     ///
     /// `api.md` 的状态码表没有 416（它只约束「单区间 206 / 多区间 200」），但把越界
@@ -90,6 +96,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -107,6 +114,7 @@ impl ApiError {
             | Self::Forbidden(message)
             | Self::NotFound(message)
             | Self::Conflict(message)
+            | Self::UnsupportedMediaType(message)
             | Self::Unprocessable(message)
             | Self::BadGateway(message)
             | Self::Unavailable(message)

@@ -4,6 +4,11 @@
 //! [`require_admin`]（判定「能不能进」）。非管理员一律 403：脚本客户端拿到统一
 //! JSON 错误体，浏览器（`Accept: text/html`）拿到 403 页。
 //!
+//! 写请求还有两道与「谁」无关的关卡：`require_admin` 里的同站校验（`Sec-Fetch-Site`
+//! / `Origin`，挡浏览器 CSRF），以及各 handler 的 `Content-Type` 校验（JSON 端点
+//! 只收 `application/json`、表单端点只收 `application/x-www-form-urlencoded`，
+//! 否则 415——`text/plain` 请求体不触发 CORS 预检，是另一条绕过路径）。
+//!
 //! 两条入口、一套逻辑：
 //!
 //! - JSON API 是规范入口，供脚本与将来的 UI 使用；
@@ -27,8 +32,8 @@ use std::collections::HashMap;
 use axum::Extension;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::header::LOCATION;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::header::{CONTENT_TYPE, HOST, LOCATION, ORIGIN};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
@@ -59,28 +64,136 @@ fn accounts_unavailable() -> ApiError {
     ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned())
 }
 
-/// 管理员判定：请求扩展里的角色不是 [`Role::Admin`] 就 403。
+/// 管理员判定 + 写操作的同站校验。
 ///
-/// 必须挂在 [`super::auth::require`] **之内**（先认证、后判角色），装配顺序见
-/// `http::admin_router`。这里只读扩展不重新解析凭据：认证只做一次。
+/// 挂在 [`super::auth::require`] **之内**（先认证、后判角色），装配顺序见
+/// `http::admin_router`。这里只读扩展、不重新解析凭据：认证只做一次。
+///
+/// 除了角色，这里还要挡 CSRF。Basic 凭据是浏览器的「环境凭据」：表单 POST 属于
+/// CORS simple request，恶意页面不需要读到响应，就能让浏览器带着已缓存的凭据
+/// 删账户、重置口令。判定顺序（读请求一律放行，跨站读没有 CORS 头也读不到内容）：
+///
+/// 1. `Sec-Fetch-Site` 存在时只认 `same-origin` / `same-site` / `none`，其余 403；
+/// 2. 否则看 `Origin`：与请求 `Host` 的主机名比对（忽略 scheme 与端口），不一致 403；
+/// 3. 两者都没有（curl / CLI / 老客户端）放行——这类客户端不会自动附带凭据，
+///    不存在 CSRF 面。
 pub(crate) async fn require_admin(request: Request, next: Next) -> Response {
-    let allowed = request.extensions().get::<Role>().is_some_and(|role| *role == Role::Admin);
-    if allowed {
-        return next.run(request).await;
-    }
+    let actor = request
+        .extensions()
+        .get::<AuthUser>()
+        .map(|auth| auth.username.clone())
+        .unwrap_or_default();
     let request_id =
         request.extensions().get::<RequestId>().cloned().unwrap_or_else(RequestId::generate);
-    tracing::warn!(request_id = %request_id, "非管理员访问管理端点");
-    if wants_html(request.headers()) {
+    let wants_html = wants_html(request.headers());
+
+    if request.extensions().get::<Role>().copied() != Some(Role::Admin) {
+        tracing::warn!(request_id = %request_id, actor = %actor, "非管理员访问管理端点");
+        return forbidden(&request_id, wants_html, "需要管理员权限：当前账户不是管理员");
+    }
+
+    if is_write_method(request.method())
+        && let Some(reason) = cross_site_reason(&request)
+    {
+        tracing::warn!(
+            request_id = %request_id,
+            actor = %actor,
+            reason = reason,
+            "拒绝跨站写请求"
+        );
+        return forbidden(
+            &request_id,
+            wants_html,
+            "拒绝跨站写请求：请从管理页操作，或使用 API 客户端",
+        );
+    }
+    next.run(request).await
+}
+
+/// 403：浏览器给页面，脚本客户端给统一 JSON 错误体。
+fn forbidden(request_id: &RequestId, wants_html: bool, message: &str) -> Response {
+    if wants_html {
         let body = format!(
-            r#"<h1>禁止访问</h1><p class="error">管理页只对管理员开放：当前账户不是管理员。</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+            r#"<h1>禁止访问</h1><p class="error">{}</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+            escape_html(message),
             escape_html(request_id.as_str())
         );
         html_response(StatusCode::FORBIDDEN, page_shell("禁止访问", &body))
     } else {
-        ApiError::Forbidden("需要管理员权限：当前账户不是管理员".to_owned())
-            .into_response_with(&request_id)
+        ApiError::Forbidden(message.to_owned()).into_response_with(request_id)
     }
+}
+
+/// 会改状态的方法；读方法不参与同站校验。
+fn is_write_method(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// 跨站写请求的原因；`None` 表示可以放行。
+///
+/// `Sec-Fetch-Site` 优先于 `Origin`：现代浏览器一定会带前者，它无法被页面脚本
+/// 伪造；`Origin` 是给不带 Fetch Metadata 的客户端的兜底。
+fn cross_site_reason(request: &Request) -> Option<&'static str> {
+    let headers = request.headers();
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|value| value.to_str().ok()) {
+        return match site.trim().to_ascii_lowercase().as_str() {
+            "same-origin" | "same-site" | "none" => None,
+            _ => Some("sec_fetch_site"),
+        };
+    }
+    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok())?;
+    let origin_host = authority_host(origin);
+    let request_host =
+        headers.get(HOST).and_then(|value| value.to_str().ok()).and_then(authority_host);
+    match (origin_host, request_host) {
+        (Some(origin_host), Some(request_host)) if origin_host == request_host => None,
+        _ => Some("origin_mismatch"),
+    }
+}
+
+/// 从 `Origin` / `Host` 值里取主机名：去掉 scheme、路径与端口，IPv6 保留方括号。
+fn authority_host(value: &str) -> Option<String> {
+    let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
+    let authority = rest.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        format!("[{}]", &stripped[..end])
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(host, _)| host).to_owned()
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// JSON 写端点要求 `application/json`（含 `+json`），否则 415。
+///
+/// 只靠同站校验不够：`text/plain` 的请求体不触发 CORS 预检，是「no-cors 就能打
+/// 进来」的经典入口，媒体类型上必须再关一道。
+fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
+    match media_type(headers).as_deref() {
+        Some(media) if media == "application/json" || media.ends_with("+json") => Ok(()),
+        _ => Err(ApiError::UnsupportedMediaType(
+            "管理 API 只接受 Content-Type: application/json".to_owned(),
+        )),
+    }
+}
+
+/// 表单端点要求 `application/x-www-form-urlencoded`，否则 415。
+fn require_form(headers: &HeaderMap) -> Result<(), ApiError> {
+    match media_type(headers).as_deref() {
+        Some("application/x-www-form-urlencoded") => Ok(()),
+        _ => Err(ApiError::UnsupportedMediaType(
+            "管理页表单只接受 Content-Type: application/x-www-form-urlencoded".to_owned(),
+        )),
+    }
+}
+
+/// `Content-Type` 的媒体类型部分：小写、去掉 `; charset=...` 之类的参数。
+fn media_type(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    Some(raw.split(';').next()?.trim().to_ascii_lowercase())
 }
 
 /// 对外暴露的账户视图；字段与 `/account/me` 保持一致，额外包含管理需要的 `status`。
@@ -213,8 +326,12 @@ pub(crate) async fn create(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_json(&headers) {
+        return error.into_response_with(&request_id);
+    }
     let payload: CreatePayload = match read_json(&body) {
         Ok(payload) => payload,
         Err(error) => return error.into_response_with(&request_id),
@@ -233,8 +350,12 @@ pub(crate) async fn patch(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_json(&headers) {
+        return error.into_response_with(&request_id);
+    }
     let changes: PatchPayload = match read_json(&body) {
         Ok(changes) => changes,
         Err(error) => return error.into_response_with(&request_id),
@@ -264,8 +385,12 @@ pub(crate) async fn reset_password(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_json(&headers) {
+        return error.into_response_with(&request_id);
+    }
     let payload: PasswordPayload = match read_json(&body) {
         Ok(payload) => payload,
         Err(error) => return error.into_response_with(&request_id),
@@ -735,8 +860,12 @@ pub(crate) async fn approve(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     set_status(state, auth, request_id, name, body, UserStatus::Active).await
 }
 
@@ -746,8 +875,12 @@ pub(crate) async fn disable(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     set_status(state, auth, request_id, name, body, UserStatus::Disabled).await
 }
 
@@ -757,8 +890,12 @@ pub(crate) async fn enable(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     set_status(state, auth, request_id, name, body, UserStatus::Active).await
 }
 
@@ -789,8 +926,12 @@ pub(crate) async fn role_form(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     let fields = match form_fields(&body) {
         Ok(fields) => fields,
         Err(error) => return error_page(&error, &request_id),
@@ -824,8 +965,12 @@ pub(crate) async fn password_form(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     let fields = match form_fields(&body) {
         Ok(fields) => fields,
         Err(error) => return error_page(&error, &request_id),
@@ -850,8 +995,12 @@ pub(crate) async fn delete_form(
     Extension(auth): Extension<AuthUser>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(error) = require_form(&headers) {
+        return error_page(&error, &request_id);
+    }
     let fields = match form_fields(&body) {
         Ok(fields) => fields,
         Err(error) => return error_page(&error, &request_id),

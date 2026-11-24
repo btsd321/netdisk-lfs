@@ -187,10 +187,15 @@ pub(crate) fn percent_decode(raw: &str) -> Result<String, ApiError> {
                 let pair = bytes
                     .get(index + 1..index + 3)
                     .ok_or_else(|| ApiError::BadRequest("表单转义不完整".to_owned()))?;
-                let pair = std::str::from_utf8(pair)
-                    .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?;
-                let byte = u8::from_str_radix(pair, 16)
-                    .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?;
+                // 先逐字节校验是 ASCII 十六进制：`u8::from_str_radix` 接受正负号，
+                // `%+b` / `%-b` 会被解析成 0x0b / 0x-b 的怪异结果，绕开「非法转义」判断。
+                let is_hex = pair.iter().all(u8::is_ascii_hexdigit);
+                let byte = if is_hex {
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap_or_default(), 16)
+                        .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?
+                } else {
+                    return Err(ApiError::BadRequest("表单转义不是十六进制".to_owned()));
+                };
                 decoded.push(byte);
                 index += 3;
             },
@@ -244,6 +249,11 @@ mod tests {
         assert!(percent_decode("%2").is_err(), "不完整的转义应被拒");
         assert!(percent_decode("%zz").is_err(), "非十六进制应被拒");
         assert!(percent_decode("%ff").is_err(), "非 UTF-8 字节应被拒");
+        // `u8::from_str_radix` 会把 `+`/`-` 当符号：带符号的「十六进制」必须被拒，
+        // 否则 `%+b` 会被解码成 0x0b 而绕过转义校验。
+        assert!(percent_decode("%+b").is_err(), "带符号的转义应被拒");
+        assert!(percent_decode("%-b").is_err(), "带负号的转义应被拒");
+        assert_eq!(percent_decode("%2B").expect("合法转义"), "+", "%2B 才是加号");
         assert_eq!(percent_decode("a%20b").expect("合法转义"), "a b");
     }
 
