@@ -95,8 +95,8 @@ pub(super) fn strip_ansi(input: &str) -> String {
 /// 先剥 ANSI，再按 `\n`/`\r` 切行，从**后往前**尝试从每个「看起来像 JSON 起点」的行
 /// 解析出完整值：CLI 把结果打印在进度条之后，倒序能优先拿到最终结果；进度条
 /// `[=====>] 50%` 虽然以 `[` 开头，但过不了 `serde_json`，会被自然跳过。再要求解析出的
-/// 值带 `code`/`data`/`error`/`status` 之一（或本身是数组），避免把结果里的嵌套对象
-/// 误当成整段结果。
+/// 值「像命令结果」（见 [`looks_like_result`]：数组、带 `code`/`data`/`error`/`status`
+/// 的信封对象，或 `whoami` 的扁平对象），避免把结果里的嵌套对象误当成整段结果。
 ///
 /// 尾部残留的非 JSON 行不影响解析：`Deserializer::into_iter` 在第一个完整值处停下。
 pub(super) fn first_json(stdout: &str) -> Option<Value> {

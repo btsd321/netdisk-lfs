@@ -447,8 +447,8 @@ impl BdpanClient {
     /// `docs/git-workflow.md` 不得进日志或入库。
     pub async fn whoami(&self) -> Result<(), BdpanError> {
         let value = self.invoke("whoami", &[], CallSite::default()).await?;
-        let authenticated = value.get("authenticated").and_then(serde_json::Value::as_bool);
-        let valid_token = value.get("has_valid_token").and_then(serde_json::Value::as_bool);
+        let authenticated = whoami_flag(&value, "authenticated")?;
+        let valid_token = whoami_flag(&value, "has_valid_token")?;
         match (authenticated, valid_token) {
             (Some(false), _) | (_, Some(false)) => Err(BdpanError::Auth {
                 command: "whoami",
@@ -619,6 +619,22 @@ fn unexpected(command: &'static str, err: &ShapeError) -> BdpanError {
     BdpanError::Unexpected { command, detail: err.to_string() }
 }
 
+/// 读取 `whoami` 的布尔标志：缺键 → `None`（CLI 没报告该字段，以成功退出为准）；
+/// 非布尔 → 形状漂移，按 [`BdpanError::Unexpected`] 失败（healthz 映射 503）。
+///
+/// 不能只用 `as_bool()` 然后 `unwrap_or(false)` 式的宽容：`1`/`"true"`/`null`
+/// 这类近似编码会让 `as_bool()` 返回 `None`，从而在登录态不可读时谎报健康。
+fn whoami_flag(value: &serde_json::Value, key: &str) -> Result<Option<bool>, BdpanError> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(_) => Err(BdpanError::Unexpected {
+            command: "whoami",
+            detail: format!("字段 {key} 不是布尔值"),
+        }),
+    }
+}
+
 /// 子进程参数只接受 UTF-8 路径；非 UTF-8 在本地就已经错了，不必下传到网盘。
 fn utf8_path<'a>(command: &'static str, path: &'a Path) -> Result<&'a str, BdpanError> {
     path.to_str().ok_or_else(|| BdpanError::Unexpected {
@@ -629,10 +645,30 @@ fn utf8_path<'a>(command: &'static str, path: &'a Path) -> Result<&'a str, Bdpan
 
 #[cfg(test)]
 mod tests {
-    use super::{BdpanError, ProcessOutput, RetryPolicy, classify, interpret};
+    use super::{BdpanError, ProcessOutput, RetryPolicy, classify, interpret, whoami_flag};
 
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn given_whoami_flag_when_missing_or_non_boolean_then_fail_safe() {
+        // 缺键：CLI 没报告该字段，以成功退出为准。
+        assert_eq!(whoami_flag(&serde_json::json!({}), "authenticated").expect("缺键"), None);
+        assert_eq!(
+            whoami_flag(&serde_json::json!({"authenticated": false}), "authenticated")
+                .expect("布尔"),
+            Some(false)
+        );
+        // 非布尔（1/"true"/null）：形状漂移，必须失败而不是谎报健康。
+        for broken in [
+            serde_json::json!({"authenticated": 1}),
+            serde_json::json!({"authenticated": "true"}),
+            serde_json::json!({"authenticated": null}),
+        ] {
+            let err = whoami_flag(&broken, "authenticated").expect_err("非布尔应报形状错误");
+            assert!(matches!(err, BdpanError::Unexpected { .. }), "实际错误：{err}");
+        }
+    }
 
     #[test]
     fn given_default_policy_when_delay_then_one_four_sixteen_seconds() {
