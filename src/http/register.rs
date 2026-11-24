@@ -365,8 +365,9 @@ fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
         RegistrationPolicy::Open => "注册后账户立即可用。",
         RegistrationPolicy::Approval => "注册后需要管理员审批，审批通过前无法登录。",
         RegistrationPolicy::Closed => {
-            return r#"<h1>注册已关闭</h1><p class="hint">当前不接受自助注册，请联系管理员开通账户。</p>"#
-                .to_owned();
+            return format!(
+                r#"<h1>注册已关闭</h1><p class="hint">当前不接受自助注册，请联系管理员开通账户。</p>{BACK_TO_LOGIN}"#
+            );
         },
     };
     format!(
@@ -384,10 +385,13 @@ fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
 </label>
 <button type="submit">注册</button>
 </form>
-<p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>"#,
+<p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>{BACK_TO_LOGIN}"#,
         hint = escape_html(hint),
     )
 }
+
+/// 注册页底部的「返回登录」链接：注册与登录必须能互相走回去，否则用户只能靠改地址栏。
+const BACK_TO_LOGIN: &str = r#"<p class="hint"><a href="/">返回登录</a></p>"#;
 
 /// 注册限速的来源键：信任反代时取 `X-Forwarded-For` 第一段，否则用远端 IP。
 ///

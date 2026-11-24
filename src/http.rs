@@ -4,10 +4,11 @@
 //! 探针，后者只在本机被抓取）；`/lfs` 子路由统一挂 Basic 认证，batch 与 PUT/GET/verify
 //! 都长在这条子路由下，新增端点自动继承认证。
 //!
-//! 分工：`auth` 负责认证与角色，`admin` 负责管理员账户管理（JSON API + HTML 页），
-//! `html` 负责极简页面的外壳/转义/表单解析，`error` 负责统一错误体与状态码映射，
-//! `batch` 负责批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责
-//! Prometheus 文本。本文件只做装配与请求级横切（span、request id）。
+//! 分工：`auth` 负责认证与角色，`login` 负责浏览器登录页/登录/退出，`account` 与
+//! `admin` 负责自身账户页与管理员账户管理（JSON API + HTML 页），`html` 负责极简
+//! 页面的外壳/转义/表单解析，`error` 负责统一错误体与状态码映射，`batch` 负责批量
+//! 协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
+//! 本文件只做装配与请求级横切（span、request id）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ mod error;
 mod health;
 mod html;
 mod limits;
+mod login;
 mod metrics;
 mod passwords;
 mod register;
@@ -241,6 +243,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(metrics::metrics))
+        .merge(login_router())
         .merge(register_router())
         .merge(account_router(state.clone()))
         .merge(admin_router(state.clone()))
@@ -251,6 +254,15 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf::guard))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
+}
+
+/// 登录与退出路由：都不需要认证——登录本来就是拿凭据的入口，退出必须对「Cookie
+/// 已失效」的请求幂等。
+fn login_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(login::page))
+        .route("/login", post(login::submit))
+        .route("/logout", post(login::logout))
 }
 
 /// 公开的注册路由：注册页与注册提交都不需要认证（否则没人能注册）。

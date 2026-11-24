@@ -22,7 +22,13 @@
 //! 认证失败的具体原因只进日志（`reason` 字段），不进响应体。登录失败按小写用户名
 //! 在 5 分钟窗口内计数，超过 `[accounts] login_failures_per_5min` 后一律 429——
 //! 这条限制对「口令正确」的请求同样生效，否则限速对爆破毫无意义。
-//!//!
+//!
+//! **凭据判定只有一份**：[`verify_credentials`] 把「限速 → DB 优先（active/角色）→
+//! config 回落（sha256）→ 懒升级」连同「成功清零失败计数」收成一个函数，Basic 中间件
+//! 与表单登录（`login`）都调它。两边各写一份的话，最先坏掉的会是「config-only 用户
+//! 登录成功、下一个请求 401」——判定口径一旦分叉，登录端点多放行的身份认证端点就会
+//! 拒掉。
+//!
 use std::time::Duration;
 
 use axum::extract::{Request, State};
@@ -240,7 +246,7 @@ impl Rejection {
 
 /// 会话认证失败的原因；只写日志，不写响应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionFailure {
+pub(crate) enum SessionFailure {
     /// 既没有 `Authorization` 头也没有会话 Cookie。
     Missing,
     /// 带了会话 Cookie，但值不是合法的会话 id：清掉它，别让浏览器无限重发。
@@ -263,6 +269,14 @@ impl SessionFailure {
             Self::Revoked => "session_revoked",
             Self::AccountsUnavailable => "accounts_unavailable",
         }
+    }
+
+    /// 是否该顺手清掉浏览器里那条 Cookie。
+    ///
+    /// 畸形、失效、被撤销三种情况都要清：浏览器会一直重发同一个值，不清就永远没有
+    /// 出口。「没带 Cookie」本来没有可清的，「账户库故障」则要保留它等恢复。
+    pub(crate) fn clears_cookie(self) -> bool {
+        matches!(self, Self::Malformed | Self::Expired | Self::Revoked)
     }
 }
 
@@ -290,11 +304,26 @@ fn session_failure_response(
 }
 
 /// 给响应附加一条清除会话 Cookie 的 `Set-Cookie`。
-fn with_clear_cookie(mut response: Response, secure: bool) -> Response {
+///
+/// `pub(crate)`：登录页（畸形/失效 Cookie）与退出端点都要用，`secure` 的取值口径
+/// 必须与签发时一致，否则 HTTPS 站点上清不掉。
+pub(crate) fn with_clear_cookie(mut response: Response, secure: bool) -> Response {
     if let Ok(value) = HeaderValue::from_str(&session::secure_clear_cookie(secure)) {
         response.headers_mut().append(SET_COOKIE, value);
     }
     response
+}
+
+/// 按会话 Cookie 确认当前身份（账户库优先、config 回落）。
+///
+/// 与 [`require`] 的会话通道是同一个函数：登录页判断「你已经登录了」、退出端点判断
+/// 「这条会话还属于谁」时不能另写一份判定，否则会出现「登录页认为已登录、下一个
+/// 请求 401」。失败语义见 [`SessionFailure::clears_cookie`]。
+pub(crate) async fn session_identity(
+    state: &AppState,
+    cookie: &SessionCookieState,
+) -> Result<AuthUser, SessionFailure> {
+    authenticate_session(state, cookie).await
 }
 
 /// 会话 Cookie 通道：查会话、再按「账户库优先、config 回落」确认账户仍可用。

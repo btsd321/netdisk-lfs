@@ -62,7 +62,10 @@ pub(crate) async fn guard(request: Request, next: Next) -> Response {
 }
 
 /// 403：浏览器给页面，脚本客户端给统一 JSON 错误体（与管理员端点同一形态）。
-fn forbidden(request_id: &RequestId, html_page: bool, message: &str) -> Response {
+///
+/// `pub(crate)`：登录端点（`POST /login`）自己没有会话 Cookie，全局守卫覆盖不到，
+/// 它还要用同一形态的 403 页，不能另写一份文案与样式。
+pub(crate) fn forbidden(request_id: &RequestId, html_page: bool, message: &str) -> Response {
     if html_page {
         let body = format!(
             r#"<h1>禁止访问</h1><p class="error">{}</p><p class="hint">请求 id：{}</p>"#,

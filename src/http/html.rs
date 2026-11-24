@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use axum::body::Body;
-use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
@@ -39,6 +39,8 @@ table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .9r
 th, td { border-bottom: 1px solid #d0d7de; padding: .4rem .5rem; text-align: left;
          vertical-align: top; }
 th { font-weight: 600; white-space: nowrap; }
+pre { background: #f6f8fa; padding: .75rem; border-radius: .375rem; overflow-x: auto;
+      font-size: .9rem; }
 .actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
 .actions form { display: inline-flex; gap: .25rem; align-items: center; margin: 0;
                 max-width: none; }
@@ -105,6 +107,25 @@ pub(crate) fn wants_html(headers: &HeaderMap) -> bool {
         .get(ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+}
+
+/// 303 See Other：浏览器按 GET 跟随目标，不会把原来的 POST 再提交一次。
+///
+/// 回跳地址由本服务构造（登录页的 `?next=` 只保留站内路径），正常情况下一定合法；
+/// 万一不是合法头值（含控制字符等）就只记日志、不发 `Location`——宁可少一个跳转，
+/// 也不能让脏值进响应头。
+pub(crate) fn see_other(location: &str) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    match HeaderValue::from_str(location) {
+        Ok(value) => {
+            response.headers_mut().insert(LOCATION, value);
+        },
+        Err(error) => {
+            tracing::error!(location = %location, error = %error, "回跳地址不是合法的响应头值");
+        },
+    }
+    response
 }
 
 /// 渲染一张表：表头按纯文本转义，单元格是**已渲染的 HTML 片段**。
