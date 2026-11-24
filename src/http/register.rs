@@ -25,7 +25,8 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::html::{escape_html, html_response, page_shell, parse_form};
+use super::html::{escape_html, html_response, parse_form};
+use super::layout;
 use super::{
     ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
     config_username, json_with_status, passwords,
@@ -36,22 +37,41 @@ use crate::config::RegistrationPolicy;
 /// 注册请求体上限：表单只有三个短字段，16 KiB 足够，超出直接 400。
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// `GET /account/register`：极简注册页（无 JavaScript）。
+/// 注册页左侧的一句话定位（与登录页同一套说明）。
+const SUBTITLE: &str = "创建一个账户，用于浏览器登录与 Git 客户端的 HTTP Basic 凭据。";
+
+/// `GET /account/register`：注册页（无 JavaScript）。
 pub(crate) async fn page(State(state): State<AppState>) -> Response {
     let policy = state.config().accounts.registration;
     if state.accounts().is_none() {
         return html_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            page_shell(
+            layout::public_page(
                 "注册不可用",
+                SUBTITLE,
                 &format!(
-                    r#"<h1>注册不可用</h1><p class="error">{ACCOUNTS_NOT_CONFIGURED_MESSAGE}</p>"#
+                    r#"<p class="alert" role="alert">{ACCOUNTS_NOT_CONFIGURED_MESSAGE}</p>{BACK_TO_LOGIN}"#
                 ),
             ),
         );
     }
     let min_len = state.config().accounts.min_password_len;
-    html_response(StatusCode::OK, page_shell("注册账户", &render_form(policy, min_len)))
+    match policy {
+        RegistrationPolicy::Closed => html_response(
+            StatusCode::OK,
+            layout::public_page(
+                "注册已关闭",
+                SUBTITLE,
+                &format!(
+                    r#"<p class="note">当前不接受自助注册，请联系管理员开通账户。</p>{BACK_TO_LOGIN}"#
+                ),
+            ),
+        ),
+        _ => html_response(
+            StatusCode::OK,
+            layout::public_page("注册账户", SUBTITLE, &render_form(policy, min_len)),
+        ),
+    }
 }
 
 /// `POST /account/register`：按 `Content-Type` 分流 JSON 与表单。
@@ -327,10 +347,11 @@ fn success_response(mode: BodyMode, registered: &Registered, request_id: &Reques
                 if status == StatusCode::CREATED { "注册成功" } else { "注册已提交" };
             html_response(
                 status,
-                page_shell(
+                layout::public_page(
                     title,
+                    SUBTITLE,
                     &format!(
-                        r#"<h1>{title}</h1><p>{message}</p><p class="hint"><a href="/account/register">返回注册页</a></p>"#
+                        r#"<p>{message}</p><p class="note"><a href="/account/register">返回注册页</a></p>"#
                     ),
                 ),
             )
@@ -346,10 +367,11 @@ fn error_response(mode: BodyMode, error: ApiError, request_id: &RequestId) -> Re
             let status = error.status();
             html_response(
                 status,
-                page_shell(
+                layout::public_page(
                     "注册失败",
+                    SUBTITLE,
                     &format!(
-                        r#"<h1>注册失败</h1><p class="error">{}</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/account/register">返回注册页</a></p>"#,
+                        r#"<p class="alert" role="alert">{}</p><p class="note">请求 id：{}</p><p class="note"><a href="/account/register">返回注册页</a></p>"#,
                         escape_html(error.message()),
                         escape_html(request_id.as_str())
                     ),
@@ -360,38 +382,37 @@ fn error_response(mode: BodyMode, error: ApiError, request_id: &RequestId) -> Re
 }
 
 /// 按策略渲染表单与提示；`min_password_len` 来自配置，写进输入框的 `minlength`。
+///
+/// 只返回票根里的正文：标题由 [`layout::public_page`] 渲染；`closed` 策略在
+/// [`page`] 里单独处理（标题不同）。
 fn render_form(policy: RegistrationPolicy, min_password_len: usize) -> String {
     let hint = match policy {
         RegistrationPolicy::Open => "注册后账户立即可用。",
         RegistrationPolicy::Approval => "注册后需要管理员审批，审批通过前无法登录。",
-        RegistrationPolicy::Closed => {
-            return format!(
-                r#"<h1>注册已关闭</h1><p class="hint">当前不接受自助注册，请联系管理员开通账户。</p>{BACK_TO_LOGIN}"#
-            );
-        },
+        // closed 不会走到这里（[`page`] 直接给「注册已关闭」页），保留一句兜底文案。
+        RegistrationPolicy::Closed => "当前不接受自助注册，请联系管理员开通账户。",
     };
     format!(
-        r#"<h1>注册账户</h1>
-<p class="hint">{hint}</p>
-<form method="post" action="/account/register">
-<label>用户名
+        r#"<p class="note">{hint}</p>
+<form method="post" action="/account/register" class="form">
+<label class="field"><span>用户名</span>
 <input name="username" autocomplete="username" required minlength="3" maxlength="32">
 </label>
-<label>口令
+<label class="field"><span>口令</span>
 <input type="password" name="password" autocomplete="new-password" required minlength="{min_password_len}">
 </label>
-<label>确认口令
+<label class="field"><span>确认口令</span>
 <input type="password" name="confirm_password" autocomplete="new-password" required minlength="{min_password_len}">
 </label>
-<button type="submit">注册</button>
+<button type="submit" class="btn btn-wide">注册</button>
 </form>
-<p class="hint">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>{BACK_TO_LOGIN}"#,
+<p class="note">用户名 3–32 个字符，可用字母、数字、点、下划线与连字符；口令至少 {min_password_len} 个字符，且不能与用户名相同。</p>{BACK_TO_LOGIN}"#,
         hint = escape_html(hint),
     )
 }
 
 /// 注册页底部的「返回登录」链接：注册与登录必须能互相走回去，否则用户只能靠改地址栏。
-const BACK_TO_LOGIN: &str = r#"<p class="hint"><a href="/">返回登录</a></p>"#;
+const BACK_TO_LOGIN: &str = r#"<p class="note"><a href="/">返回登录</a></p>"#;
 
 /// 注册限速的来源键：信任反代时取 `X-Forwarded-For` 第一段，否则用远端 IP。
 ///

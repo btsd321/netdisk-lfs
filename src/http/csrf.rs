@@ -24,7 +24,8 @@ use axum::response::Response;
 
 use super::RequestId;
 use super::error::ApiError;
-use super::html::{escape_html, html_response, page_shell, wants_html};
+use super::html::{escape_html, html_response, wants_html};
+use super::layout;
 use super::session;
 
 /// 跨站写请求的拒绝文案：说清「为什么」以及「怎么改」，不泄漏任何账户信息。
@@ -68,11 +69,14 @@ pub(crate) async fn guard(request: Request, next: Next) -> Response {
 pub(crate) fn forbidden(request_id: &RequestId, html_page: bool, message: &str) -> Response {
     if html_page {
         let body = format!(
-            r#"<h1>禁止访问</h1><p class="error">{}</p><p class="hint">请求 id：{}</p>"#,
+            r#"<p class="alert" role="alert">{}</p><p class="note">请求 id：{}</p>"#,
             escape_html(message),
             escape_html(request_id.as_str())
         );
-        html_response(StatusCode::FORBIDDEN, page_shell("禁止访问", &body))
+        html_response(
+            StatusCode::FORBIDDEN,
+            layout::public_page("禁止访问", "跨站请求不会被执行。", &body),
+        )
     } else {
         // 与管理员端点同样的错误体与状态码，脚本客户端只认一种形态。
         ApiError::Forbidden(message.to_owned()).into_response_with(request_id)
