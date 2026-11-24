@@ -14,6 +14,10 @@
 //!   fetch；持锁者被丢弃时锁自动释放、下一个请求重下，`.part` 由守卫与启动扫描兜底
 //!   （取消安全）；
 //! - **要么完整要么不存在**：下载写 `<oid>.part`，校验通过才 `rename` 到最终路径。
+//!
+//! 另有一组只读计数器（[`Cache::hits_total`] / [`Cache::misses_total`] /
+//! [`Cache::evictions_total`]）供 `/metrics` 观测：只做 `Relaxed` 累加，不参与任何
+//! 决策，也不改变命中/驱逐的既有语义。
 
 use std::future::Future;
 use std::io::ErrorKind;
@@ -98,6 +102,12 @@ struct Inner {
     shards: Box<[AsyncMutex<()>]>,
     /// `false` 表示启动扫描失败、降级为直通：不读不写缓存，只把对象下载到临时文件。
     enabled: bool,
+    /// [`Cache::get`] 命中次数（观测用，详见 [`Cache::hits_total`]）。
+    hits: AtomicU64,
+    /// [`Cache::get`] 未命中次数。
+    misses: AtomicU64,
+    /// 真正删掉的被驱逐对象数（含启动收敛时的淘汰）。
+    evictions: AtomicU64,
 }
 
 impl Cache {
@@ -157,6 +167,9 @@ impl Cache {
                 index: Mutex::new(index),
                 shards,
                 enabled,
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                evictions: AtomicU64::new(0),
             }),
         }
     }
@@ -191,6 +204,29 @@ impl Cache {
         self.inner.enabled
     }
 
+    /// [`Self::get`] 的命中次数。
+    ///
+    /// 只统计走 `get` 的查询：`fetch_once` 内部的「二次检查」用不计数的 `lookup`，
+    /// 否则一次并发冷读会同时记成 1 次未命中（外层）与 1 次未命中（锁内二次检查），
+    /// 未命中率被系统性高估。降级模式（`is_enabled() == false`）不读写缓存，也不
+    /// 计数——否则会把「缓存没开」算成 100% 未命中。
+    pub fn hits_total(&self) -> u64 {
+        self.inner.hits.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::get`] 的未命中次数；统计口径同 [`Self::hits_total`]。
+    pub fn misses_total(&self) -> u64 {
+        self.inner.misses.load(Ordering::Relaxed)
+    }
+
+    /// 被驱逐（真的从磁盘删掉）的缓存对象数。
+    ///
+    /// 只数删除成功的那些：索引已丢弃但文件本来就不在（`NotFound`）不算驱逐，
+    /// 否则「磁盘上没有的对象」也会被计入淘汰量。
+    pub fn evictions_total(&self) -> u64 {
+        self.inner.evictions.load(Ordering::Relaxed)
+    }
+
     /// 缓存对象的本地路径：`<root>/<aa>/<bb>/<oid>`。
     pub fn path(&self, oid: &Oid) -> PathBuf {
         object_file(&self.inner.root, oid)
@@ -201,7 +237,30 @@ impl Cache {
     /// 命中要按索引里的大小校验实际文件：大小不符说明文件被截断/替换/外部改过，
     /// 按规格驱逐后当作未命中重新下载。校验失败或文件消失只影响这一次请求，
     /// 不向上报错——缓存坏了不是请求的错。
+    ///
+    /// 命中/未命中在这里记计数器（`/metrics` 的数据源）；降级模式直接返回 `None`
+    /// 且不计数，理由见 [`Self::hits_total`]。
     pub async fn get(&self, oid: &Oid) -> Option<PathBuf> {
+        if !self.inner.enabled {
+            return None;
+        }
+        match self.lookup(oid).await {
+            Some(path) => {
+                self.inner.hits.fetch_add(1, Ordering::Relaxed);
+                Some(path)
+            },
+            None => {
+                self.inner.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+        }
+    }
+
+    /// [`Self::get`] 的实现，**不**动计数器。
+    ///
+    /// 单飞锁内的二次检查与 GET 前置检查走同一份逻辑却只该记一次，所以计数留在
+    /// 公开的 `get` 上，内部重复查询走这里。
+    async fn lookup(&self, oid: &Oid) -> Option<PathBuf> {
         if !self.inner.enabled {
             return None;
         }
@@ -259,7 +318,7 @@ impl Cache {
         F: FnOnce(PathBuf) -> Fut + Send,
         Fut: Future<Output = Result<(), StoreError>> + Send,
     {
-        if let Some(path) = self.get(oid).await {
+        if let Some(path) = self.lookup(oid).await {
             return Ok(CachedFile::Cached(path));
         }
 
@@ -268,7 +327,7 @@ impl Cache {
         let serialized = self.shard(oid).lock().await;
 
         // 二次检查：排到我们时，前一个请求可能已经把对象放进来了。
-        if let Some(path) = self.get(oid).await {
+        if let Some(path) = self.lookup(oid).await {
             return Ok(CachedFile::Cached(path));
         }
 
@@ -413,7 +472,10 @@ impl Cache {
         for (victim, size) in victims {
             let path = self.path(&victim);
             match fs::remove_file(&path).await {
-                Ok(()) => tracing::debug!(oid = %victim, size, "LRU 驱逐缓存对象"),
+                Ok(()) => {
+                    self.inner.evictions.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(oid = %victim, size, "LRU 驱逐缓存对象");
+                },
                 Err(error) if error.kind() == ErrorKind::NotFound => {},
                 Err(error) => tracing::warn!(
                     oid = %victim,

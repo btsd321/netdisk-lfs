@@ -1,11 +1,12 @@
 //! HTTP 协议层：路由装配、请求级 span、请求 id 与共享状态。
 //!
-//! 端点与流程见 `specs/api.md`：既有 `GET /healthz` 保持无认证；`/lfs` 子路由统一
-//! 挂 Basic 认证，`POST /lfs/objects/batch` 与后续分支的 PUT/GET/verify 都长在这条
-//! 子路由下，新增端点自动继承认证。
+//! 端点与流程见 `specs/api.md`：`GET /healthz` 与 `GET /metrics` 保持无认证（前者给
+//! 探针，后者只在本机被抓取）；`/lfs` 子路由统一挂 Basic 认证，batch 与 PUT/GET/verify
+//! 都长在这条子路由下，新增端点自动继承认证。
 //!
 //! 分工：`auth` 负责认证与角色，`error` 负责统一错误体与状态码映射，`batch` 负责
-//! 批量协商。本文件只做装配与请求级横切（span、request id）。
+//! 批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
+//! 本文件只做装配与请求级横切（span、request id）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -31,9 +32,12 @@ use crate::store::{ObjectStore, Oid};
 mod auth;
 mod batch;
 mod error;
+mod health;
+mod metrics;
 mod transfer;
 
 pub use error::ApiError;
+pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
 // 上传缓冲目录由 `transfer` 唯一实现（含 `data_dir` 缺省时的回退）；`main` 的启动
 // 清理要清同一批目录，所以从这里导出，避免两处各推导一遍导致清理漏目录。
 pub use transfer::upload_dir;
@@ -47,15 +51,18 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 /// 进程内请求序号，与毫秒时间戳拼成可排序的 request id。
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 请求处理共享状态：存储后端、已校验的配置与本地读缓存。
+/// 请求处理共享状态：存储后端、已校验的配置、本地读缓存与 `bdpan` 探活器。
 ///
-/// 三者都是轻量句柄（`Arc` / 内部 `Arc` 的 `Cache`），handler 随便 clone；配置与
-/// 后端在启动后不可变，认证、batch 与传输读的都是同一份快照。
+/// 都是轻量句柄（`Arc` / 内部 `Arc` 的 `Cache`），handler 随便 clone；配置与后端在
+/// 启动后不可变，认证、batch、传输与探活读的都是同一份快照。
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<dyn ObjectStore>,
     config: Arc<Config>,
     cache: Cache,
+    /// `/healthz` 的 `bdpan` 探活器；`None` 表示未注入（嵌入用法/测试），此时
+    /// `/healthz` 按不可用报降级，不谎报健康。
+    probe: Option<Arc<BdpanProbe>>,
 }
 
 impl AppState {
@@ -72,7 +79,16 @@ impl AppState {
 
     /// 注入已扫描、已清理的缓存；`main` 的启动路径用这个。
     pub fn with_cache(store: Arc<dyn ObjectStore>, config: Arc<Config>, cache: Cache) -> Self {
-        Self { store, config, cache }
+        Self { store, config, cache, probe: None }
+    }
+
+    /// 注入 `bdpan` 探活器；`main` 在启动时接上它，`/healthz` 才会真的探测登录态。
+    ///
+    /// 不放进构造函数：探活要真起 `bdpan` 子进程，只有真正对外服务的进程（`main`）
+    /// 才应该有这个副作用；测试与嵌入用法默认不探测。
+    pub fn with_bdpan_probe(mut self, probe: Arc<BdpanProbe>) -> Self {
+        self.probe = Some(probe);
+        self
     }
 
     /// 对象存储后端句柄。
@@ -92,15 +108,22 @@ impl AppState {
     pub fn cache(&self) -> &Cache {
         &self.cache
     }
+
+    /// `bdpan` 探活器；未注入时为 `None`。
+    pub fn bdpan_probe(&self) -> Option<&BdpanProbe> {
+        self.probe.as_deref()
+    }
 }
 
 /// 构造路由表。
 ///
 /// 装配顺序即请求经过顺序：请求级 span（含 request id）在最外层，之后才是
-/// `/lfs` 子路由上的认证。`/healthz` 不经过认证，供探活与负载均衡使用。
+/// `/lfs` 子路由上的认证。`/healthz` 与 `/metrics` 不经过认证：前者给探针用，
+/// 后者只在本机被 Prometheus 抓取（对外暴露必须在反代上加 ACL，见 `metrics` 模块）。
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(health::healthz))
+        .route("/metrics", get(metrics::metrics))
         .merge(lfs_router(state.clone()))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
@@ -130,17 +153,6 @@ fn lfs_router(state: AppState) -> Router<AppState> {
 /// `usize::MAX`，此时业务层按 `u64` 计数仍会先于框架拒绝。
 fn body_limit_bytes(max_object_bytes: u64) -> usize {
     usize::try_from(max_object_bytes).unwrap_or(usize::MAX)
-}
-
-/// `/healthz` 响应体：`{"status":"ok"}`。
-#[derive(Debug, serde::Serialize)]
-struct HealthStatus {
-    status: &'static str,
-}
-
-/// 存活探针；`bdpan whoami` 探测留给部署分支。
-async fn healthz() -> axum::Json<HealthStatus> {
-    axum::Json(HealthStatus { status: "ok" })
 }
 
 /// 本次请求的服务端 id：中间件生成后放进请求扩展，handler 与错误体共用。

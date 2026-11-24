@@ -14,8 +14,8 @@ use std::sync::Arc;
 use clap::Parser;
 use netdisk_lfs::http::upload_dir;
 use netdisk_lfs::{
-    AppState, BdpanStore, Cache, Config, ConfigError, EnvSource, ObjectStore, init_logging, router,
-    transient_dir,
+    AppState, BdpanProbe, BdpanStore, Cache, Config, ConfigError, EnvSource, ObjectStore,
+    init_logging, router, transient_dir,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -115,7 +115,16 @@ async fn run(config: Config) -> Result<(), StartupError> {
         "缓存启动扫描完成"
     );
 
-    let state = AppState::with_cache(store, Arc::new(config), cache);
+    // `bdpan` 探活器：自己的子进程与超时，给 `/healthz` 用。构造它不起子进程，
+    // 第一次探测发生在首个 `/healthz` 请求（或探针轮询）时。
+    let probe = BdpanProbe::from_storage(&config.storage);
+    info!(
+        probe_ttl_secs = probe.ttl().as_secs(),
+        "bdpan 探活已启用：/healthz 会按 TTL 复用 whoami 结论"
+    );
+
+    let state =
+        AppState::with_cache(store, Arc::new(config), cache).with_bdpan_probe(Arc::new(probe));
 
     let listener =
         TcpListener::bind(addr).await.map_err(|source| StartupError::Bind { addr, source })?;
