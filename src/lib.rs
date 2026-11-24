@@ -6,6 +6,7 @@
 //!
 //! 对外契约从 crate 根导出，模块路径不作为对外 API 的一部分。
 
+pub mod accounts;
 pub mod bdpan;
 pub mod cache;
 pub mod config;
@@ -16,6 +17,10 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 
+pub use accounts::{
+    AccountError, User, UserStatus, UserStore, hash_password, validate_password, validate_username,
+    verify_password,
+};
 pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, BdpanStore, LsEntry, RetryPolicy};
 pub use cache::{Cache, CachedFile, SweepReport, transient_dir};
 pub use config::{
