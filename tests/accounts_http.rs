@@ -285,6 +285,22 @@ async fn given_approval_policy_when_register_then_202_pending_until_approved() {
 }
 
 #[tokio::test]
+async fn given_disabled_account_when_login_then_401_same_message() {
+    let app = TestApp::new();
+    app.create_user("dora", PASSWORD, Role::Readwrite, UserStatus::Disabled).await;
+
+    let (status, headers, body) =
+        app.send_json(authed(Method::GET, "/account/me", "dora", PASSWORD, None)).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_error_contract(&headers, &body);
+    assert_eq!(
+        body["message"], "需要 HTTP Basic 认证",
+        "禁用账户与口令错误必须同一文案，不泄漏账户状态"
+    );
+}
+
+#[tokio::test]
 async fn given_closed_policy_when_register_then_403_and_no_account() {
     let app = TestApp::with(|config| config.accounts.registration = RegistrationPolicy::Closed);
 
