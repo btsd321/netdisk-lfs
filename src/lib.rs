@@ -14,7 +14,10 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 
-pub use config::{Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, RuntimeEnv};
+pub use config::{
+    AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, Role, RuntimeEnv,
+    ServerConfig, StorageConfig, UserConfig,
+};
 pub use http::router;
 pub use logging::init as init_logging;
 pub use store::{
