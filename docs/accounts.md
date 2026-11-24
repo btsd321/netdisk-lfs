@@ -70,9 +70,11 @@ maintainer = { password_sha256 = "<sha256>", role = "admin" }
 
 注册页与结果页都是无脚本的静态 HTML，内联样式、不引外部资源，也不回显口令。
 
-**保留用户名**：`[auth.users]` 里已有的用户名不能自助注册（409）。否则账户库优先会让
-原 config 账户——通常就是引导管理员——再也登不上，属于可被利用的抢占路径。管理员在
-`POST /admin/users` 显式创建同名账户不受限，那是迁移动作。
+**保留用户名**：`[auth.users]` 里已有的用户名不能自助注册。否则账户库优先会让原 config
+账户——通常就是引导管理员——再也登不上，属于可被利用的抢占路径。对外与普通重名返回
+**同一条 409 文案**「用户名已被占用」，不暴露哪些名字是配置里的引导账户；管理员在
+`POST /admin/users` 显式创建同名账户不受限，那是迁移动作。`closed` 策略下注册一律 403，
+且策略判定先于任何用户名/口令检查（连非法用户名也 403），不给探测留差异。
 
 ### 4.2 管理员视角
 
@@ -102,7 +104,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 |---|---|---|
 | `approval`（默认） | 202 | 建 `pending`，等管理员批准 |
 | `open` | 201 | 建 `active`，立即可登录 |
-| 用户名已存在，或在 `[auth.users]` 里保留 | 409 | 换一个用户名 |
+| 用户名已存在，或在 `[auth.users]` 里保留 | 409 | 同一文案「用户名已被占用」，不区分原因 |
 | 用户名/口令不合法 | 400 | 按提示修正；口令至少 `min_password_len` 位 |
 | 超过注册限速 | 429 | 按 `Retry-After` 等待 |
 | `closed` | 403 | 自助注册关闭，只能由管理员开户 |
@@ -208,9 +210,13 @@ curl -sS -o /dev/null -w '%{http_code}\n' -u "$AUTH" -X DELETE \
 | 删除库里有、`[auth.users]` 也有同名条目的账户 | 409：删掉库行会让旧 config 口令复活，先移除配置条目 |
 | 非 admin 访问 `/admin` 或 `/admin/*` | 403 |
 | 账户不存在，或只在 `[auth.users]`、尚未登录升级入库 | 404（提示先登录一次完成入库） |
+| 写请求跨站（`Origin`/`Sec-Fetch-Site` 不符） | 403；用 curl 等无来源头的客户端不受影响 |
+| JSON 写请求的 `Content-Type` 不是 JSON | 415 |
 
 最后一个 admin 的判定同时看账户库与 `[auth.users]`；config 里的**同名**条目不算
-「另一个管理员」（删掉库行只是同一个人重新拿到 config 权限）。
+「另一个管理员」（删掉库行只是同一个人重新拿到 config 权限）。检查与写入在账户库的
+同一个事务里完成，两个管理员并发互相降级/删除时只会成功一个，不会出现「零管理员」。
+已知边界：config 兜底管理员若在账户库里的行已被 `disabled`，仍会被算作「另一个管理员」。
 
 ### 6.2 HTML 管理页
 
@@ -230,8 +236,15 @@ curl -sS -o /dev/null -w '%{http_code}\n' -u "$AUTH" -X DELETE \
 | `POST /admin/users/{name}/password-form` | `password` | 重置口令 |
 | `POST /admin/users/{name}/delete` | `confirm`（必填勾选） | 删除账户 |
 
-页面上的时间按 **UTC** 显示；每页最多 100 行、暂时没有翻页 UI，更多用 JSON API 的
-`offset`。
+页面上的时间按 **UTC** 显示；每页最多 100 行，底部有上一页/下一页链接（保留
+`?status=`），也可以直接用 `?offset=` 跳页。
+
+**CSRF 与媒体类型**：管理端所有写请求（JSON 与表单）都会校验同站来源——
+`Sec-Fetch-Site` 只接受 `same-origin`/`same-site`/`none`，否则回落比对 `Origin` 与
+`Host` 的主机名；两者都没有的 CLI 请求放行。因此反代必须保留原始 `Host`
+（Caddy 默认满足），否则浏览器写操作会被 403。JSON 写端点只收
+`Content-Type: application/json`（可带 `+json`），表单端点只收
+`application/x-www-form-urlencoded`，其余一律 **415**。
 
 ## 7. 配置
 
@@ -378,6 +391,8 @@ curl -fsS http://127.0.0.1:9001/healthz
 - **口令不要复用**：这是存在 LFS 客户端里的第三方口令，泄露影响面要按「网盘里所有
   对象」评估。
 - **管理员越少越好**，改完权限后过一眼审计日志。
+- **登录与管理页**：401 同时带 `WWW-Authenticate: Basic realm="netdisk-lfs"`，浏览器
+  打开 `/admin` 会正常弹登录框（git-lfs 仍优先看 `lfs-authenticate`）。
 - **审计日志走 journald**（写操作 `actor/action/target/request_id`，`action` 取
   `user.create` / `user.update` / `user.delete` / `user.reset_password`，口令不落日志）：
 

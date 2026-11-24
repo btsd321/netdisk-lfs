@@ -522,6 +522,8 @@ sudo sqlite3 /var/lib/netdisk-lfs/accounts.db \
 | 账户端点回 503「账户库暂时不可用」 | 库在运行期打不开或查询失败（磁盘满、库文件被删、权限不对）。看 `journalctl` 里带「账户库」的 error；启动期开库失败会直接启动失败，不会带病运行 |
 | 注册成功但登录 401 | `approval` 策略下账户还是 `pending`，到 `/admin` 批准；`closed` 下不会有新账户 |
 | 登录 429 | 该用户名 5 分钟内失败次数超 `login_failures_per_5min`；等窗口滑出，或管理员确认没有爆破 |
-| `/admin` 403 | 当前账户不是 `admin`：改 `[auth.users]` 的 `role` 后重启；检查是否已有其他 admin 生效 |
+| `/admin` 403 | 当前账户不是 `admin`：改 `[auth.users]` 的 `role` 后重启；检查是否已有其他 admin 生效；若只在**写操作**上 403，检查反代是否保留了原始 `Host`（CSRF 同站校验依赖它） |
+| 管理端写请求 415 | JSON 请求要带 `Content-Type: application/json`；表单端点只收 urlencoded |
+| 浏览器打开 `/admin` 不弹登录框 | 新版本 401 已带 `WWW-Authenticate`；仍不弹则清除该站点已保存的错误凭据后重试 |
 | 引导管理员突然登不上 | 新版本已拒绝用 `[auth.users]` 保留名自助注册（409）；若库里已有历史同名记录（旧版本遗留），用另一个未入库的 config admin 登录删掉它，或按 accounts.md 8.4 改库 |
 | 改了 config 口令却登不上 | 该账户已入库，库优先；用旧口令或管理员重置（见 accounts.md 7.2） |
