@@ -1,30 +1,23 @@
-//! 自身账户端点：`GET /account/me`、`POST /account/password`、`DELETE /account`。
-//!
-//! 三个端点都挂 Basic 认证（任意角色），只能操作**自己**——用户名取自认证中间件
-//! 写进请求扩展的 [`AuthUser`]，没有「按用户名指定目标」的入口，因此不存在越权
-//! 修改他人账户的可能；管理员管理他人账户是 C3 的 `/admin/*`。
-//!
-//! 账户库未接入时统一 503：没有库就没有可改的账户（config 用户改口令请直接改
-//! `config.toml` 后重启）。
-
 //! 自身账户端点：`GET /account`（HTML 落地页）、`GET /account/me`、
 //! `POST /account/password`、`DELETE /account`。
 //!
-//! 三个 API 端点挂认证（任意角色），只能操作**自己**——用户名取自认证中间件写进
-//! 请求扩展的 [`AuthUser`]，没有「按用户名指定目标」的入口，因此不存在越权修改他人
-//! 账户的可能；管理员管理他人账户是 C3 的 `/admin/*`。
+//! 四个端点都挂认证（会话 Cookie 或 HTTP Basic，任意角色），只能操作**自己**——用户名
+//! 取自认证中间件写进请求扩展的 [`AuthUser`]，没有「按用户名指定目标」的入口，因此
+//! 不存在越权修改他人账户的可能；管理员管理他人账户是 C3 的 `/admin/*`。
 //!
 //! `GET /account` 是浏览器登录后的落地页：只读展示「我是谁 + LFS 端点怎么配 + 退出」，
-//! 不提供任何改密/注销按钮（那两个是 API，走 `POST /account/password` 与
-//! `DELETE /account`，需要重新确认口令）。账户库未接入时它照样能渲染：config-only
-//! 用户本来就该有落地页，只是创建/最后登录时间显示 `—`。
+//! 不提供改密/注销按钮（那两个是 API，走 `POST /account/password` 与 `DELETE /account`，
+//! 需要重新确认口令）。账户库未接入时它照样能渲染：config-only 用户本来就该有落地页，
+//! 只是创建/最后登录时间显示 `—`；`GET /account/me` 与两个写端点仍保持「没有库就 503」
+//! （没有库就没有可改的账户，config 用户改口令请直接改 `config.toml` 后重启）。
 //!
-//! 账户库未接入时 API 端点统一 503：没有库就没有可改的账户（config 用户改口令请
-//! 直接改 `config.toml` 后重启）。
+//! 页面会按「这次是怎么认证的」给出不同提示：Basic 是浏览器缓存的凭据，页面上的退出
+//! 按钮只清会话 Cookie，对 Basic 用户无效，所以那种情况下不显示退出表单而提示清除
+//! 浏览器凭据，避免给出一个按了也不生效的按钮。
 
 use axum::Extension;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -115,8 +108,39 @@ pub(crate) async fn page(
     };
     // 与 batch 下发的 href 同一份推导：`public_base` 优先，否则按请求头算。
     let base = action_base(state.config(), &headers);
-    tracing::debug!(request_id = %request_id, username = %view.username, "渲染账户页");
-    html_response(StatusCode::OK, page_shell("我的账户", &render_page(&view, &base)))
+    // 同一路径两条通道都通：有 `Authorization` 就是 Basic（它的优先级高于 Cookie），
+    // 页面必须据此给出「退出按钮能不能真的退出」的准确提示。
+    let channel = if headers.contains_key(header::AUTHORIZATION) {
+        CredentialChannel::Basic
+    } else {
+        CredentialChannel::Session
+    };
+    tracing::debug!(
+        request_id = %request_id,
+        username = %view.username,
+        channel = channel.as_str(),
+        "渲染账户页"
+    );
+    html_response(StatusCode::OK, page_shell("我的账户", &render_page(&view, &base, channel)))
+}
+
+/// 这次请求是怎么认证的：决定页面上的提示与是否显示退出按钮。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialChannel {
+    /// 会话 Cookie（登录页签发）：退出按钮会真的撤销会话。
+    Session,
+    /// HTTP Basic（浏览器缓存的凭据）：退出按钮清不掉它。
+    Basic,
+}
+
+impl CredentialChannel {
+    /// 日志字段值。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Basic => "basic",
+        }
+    }
 }
 
 /// 账户页读库失败时的 503 页。
@@ -130,7 +154,7 @@ fn problem_page(message: &str) -> Response {
 ///
 /// 所有动态文本都过 [`escape_html`]：`base` 在没有 `public_base` 时来自 `Host` 头，
 /// 用户名来自账户库，两者都必须按不可信输入处理。
-fn render_page(view: &AccountView, base: &str) -> String {
+fn render_page(view: &AccountView, base: &str, channel: CredentialChannel) -> String {
     let time = |seconds: Option<i64>| match seconds {
         Some(seconds) => format_unix_seconds(seconds),
         // 只有 config-only 用户会走到这里（库里有行就一定有 created_at）。
@@ -159,25 +183,39 @@ fn render_page(view: &AccountView, base: &str) -> String {
     ];
 
     let mut body = String::from("<h1>我的账户</h1>");
-    body.push_str(
-        r#"<p class="hint">当前以会话 Cookie 登录，无需再输入口令；Git 客户端请用同一账户的 HTTP Basic 凭据。</p>"#,
-    );
+    match channel {
+        CredentialChannel::Session => body.push_str(
+            r#"<p class="hint">当前以会话 Cookie 登录，无需再输入口令；Git 客户端请用同一账户的 HTTP Basic 凭据。</p>"#,
+        ),
+        // Basic 用户看到的提示必须诚实：页面上的退出按钮清不掉浏览器缓存的凭据。
+        CredentialChannel::Basic => body.push_str(
+            r#"<p class="hint">当前以 HTTP Basic 凭据登录（由浏览器缓存）。本页面无法代为清除 Basic 凭据：要退出请关闭浏览器，或清除浏览器为该站点保存的凭据。</p>"#,
+        ),
+    }
     body.push_str(&table(&["项目", "值"], &rows));
+    // git-lfs 会把 `objects/batch` 拼在 `lfs.url` 后面，所以这里必须给到 `/lfs/`；
+    // 只给站点根地址的话，用户照抄示例会在 `/objects/batch` 上拿到 404。
     body.push_str(&format!(
         r#"<h2>LFS 端点</h2>
-<p>把仓库的 LFS 地址指向 <code>{}</code>：</p>
+<p>把仓库的 LFS 地址指向 <code>{}/lfs/</code>：</p>
 <pre>[lfs]
-	url = {}</pre>
+	url = {}/lfs/</pre>
 <p class="hint">在仓库根目录提交 <code>.lfsconfig</code> 后，<code>git lfs push/pull</code> 会自动使用该地址（凭据仍走 HTTP Basic）。</p>"#,
         escape_html(base),
         escape_html(base)
     ));
-    body.push_str(
-        r#"<h2>退出</h2>
-<form method="post" action="/logout">
+    body.push_str("<h2>退出</h2>");
+    match channel {
+        CredentialChannel::Session => body.push_str(
+            r#"<form method="post" action="/logout">
 <button type="submit" class="danger">退出登录</button>
 </form>"#,
-    );
+        ),
+        // 不给出一个按了也不生效的按钮：Basic 用户只能靠清除浏览器凭据退出。
+        CredentialChannel::Basic => body.push_str(
+            r#"<p class="hint">退出方式：关闭浏览器，或清除浏览器为本站点保存的凭据（Basic 认证没有服务端可撤销的会话）。</p>"#,
+        ),
+    }
     if view.role == Role::Admin {
         body.push_str(r#"<p class="hint"><a href="/admin">管理账户</a></p>"#);
     }
