@@ -145,6 +145,11 @@ impl BdpanProbe {
 }
 
 /// 日志里的失败描述：去掉可能含凭据的原始文案，只留命令名与分类。
+///
+/// 带 `message` / `detail` / `path` 的变体一律显式脱敏：这些字段直接来自 CLI 输出
+/// 或本地路径，`whoami --json` 的数据可能含账号凭据，绝不能进日志（本函数存在的
+/// 唯一理由就是这条契约）。这里是穷尽匹配（`#[non_exhaustive]` 只约束下游 crate）：
+/// 新增变体时编译器会强制在这里补一条脱敏分支，不会静默回显。
 fn describe(error: &BdpanError) -> String {
     match error {
         BdpanError::Timeout { command, timeout } => {
@@ -154,7 +159,18 @@ fn describe(error: &BdpanError) -> String {
         BdpanError::Decode { command, .. } | BdpanError::Exit { command, .. } => {
             format!("{command} 输出无法解析")
         },
-        other => other.to_string(),
+        BdpanError::Auth { command, .. } => format!("{command} 登录态失效"),
+        BdpanError::NotFound { command, .. } => format!("{command} 报告对象不存在"),
+        BdpanError::DestinationExists { command, .. } => format!("{command} 目标已存在"),
+        BdpanError::Unavailable { command, .. } => format!("{command} 暂时不可用"),
+        BdpanError::Command { command, code, .. } => {
+            format!("{command} 业务失败（code {code:?}）")
+        },
+        BdpanError::Unexpected { command, .. } => format!("{command} 输出不符合预期"),
+        BdpanError::UploadRenamed { expected, .. } => {
+            format!("upload 被自动重命名（期望 {expected}）")
+        },
+        BdpanError::LocalIo { .. } => "本地文件不可用".to_owned(),
     }
 }
 
@@ -187,4 +203,33 @@ pub(crate) async fn healthz(State(state): State<AppState>) -> Response {
     };
     let status = if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe;
+    use crate::bdpan::BdpanError;
+
+    #[test]
+    fn given_message_bearing_errors_when_describe_then_credentials_stripped() {
+        // whoami 的输出可能含账号凭据：所有带 CLI 文案的变体都不得把原文带进日志。
+        let secret = "token=SECRET-VALUE";
+        let errors = [
+            BdpanError::Command { command: "whoami", code: Some(1), message: secret.to_owned() },
+            BdpanError::Unavailable { command: "whoami", message: secret.to_owned() },
+            BdpanError::NotFound { command: "whoami", message: secret.to_owned() },
+            BdpanError::DestinationExists { command: "whoami", message: secret.to_owned() },
+            BdpanError::Unexpected { command: "whoami", detail: secret.to_owned() },
+            BdpanError::Auth { command: "whoami", message: secret.to_owned() },
+            BdpanError::UploadRenamed {
+                expected: "abc".to_owned(),
+                actual: Some(secret.to_owned()),
+            },
+        ];
+
+        for error in errors {
+            let text = describe(&error);
+            assert!(!text.contains("SECRET"), "日志描述不得回显原始文案：{text}");
+        }
+    }
 }
