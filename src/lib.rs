@@ -20,7 +20,7 @@ pub use config::{
     AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, Role, RuntimeEnv,
     ServerConfig, StorageConfig, UserConfig,
 };
-pub use http::router;
+pub use http::{ApiError, AppState, router};
 pub use logging::init as init_logging;
 pub use store::{
     FakeStore, ObjectMeta, ObjectStore, Oid, OidError, Quota, Sha256Writer, StoreError, hash_file,
