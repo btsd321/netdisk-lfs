@@ -10,13 +10,14 @@ use crate::config::error::ConfigError;
 
 /// `.env` 契约中的四个键，键名语义见 `plans/2026-11-24-execution-plan.md`。
 pub(crate) const BDPAN_BIN: &str = "BDPAN_BIN";
-pub(crate) const NETDISK_LFS_CONFIG: &str = "NETDISK_LFS_CONFIG";
+/// 配置文件路径（TOML）的变量名：`--config` 未给出时的来源。
+pub const NETDISK_LFS_CONFIG: &str = "NETDISK_LFS_CONFIG";
 pub(crate) const NETDISK_LFS_DATA_DIR: &str = "NETDISK_LFS_DATA_DIR";
 pub(crate) const NETDISK_LFS_ENV: &str = "NETDISK_LFS_ENV";
 
 /// 进程环境与 `.env` 的只读合并结果，进程环境优先。
 #[derive(Debug, Default, Clone)]
-pub(crate) struct EnvSource {
+pub struct EnvSource {
     vars: HashMap<String, String>,
 }
 
@@ -26,7 +27,7 @@ impl EnvSource {
     /// `dotenv_path` 按原样读取（通常是工作目录下的 `.env`），不向父目录回溯。
     ///
     /// 只解析文件、不修改进程环境，避免全局副作用影响测试与后续库调用。
-    pub(crate) fn load(dotenv_path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(dotenv_path: &Path) -> Result<Self, ConfigError> {
         // 跳过非 UTF-8 的环境变量：vars() 遇到它们会 panic，而本模块
         // 只消费少量 ASCII 键，忽略个别异常项比未类型化的启动崩溃更可接受。
         let mut vars: HashMap<String, String> = std::env::vars_os()
@@ -38,21 +39,24 @@ impl EnvSource {
         Ok(Self { vars })
     }
 
-    /// 用给定的键值对构造快照；只在测试里构造受控环境。
-    #[cfg(test)]
-    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+    /// 用显式键值对构造快照，不读进程环境与 `.env`。
+    ///
+    /// 测试与需要注入配置的调用方使用：集成测试要构造确定性的
+    /// [`Config`](crate::config::Config)，而 Rust 2024 里修改进程环境是 `unsafe`
+    /// （本仓库 `unsafe_code = "forbid"`），只能走显式注入。
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         let vars =
             pairs.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect();
         Self { vars }
     }
 
     /// 取原始字符串；空值按「未设置」处理，避免误把空路径当成合法配置。
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.vars.get(key).map(String::as_str).filter(|value| !value.is_empty())
     }
 
     /// 取路径类变量；空值同样视为未设置。
-    pub(crate) fn path(&self, key: &str) -> Option<PathBuf> {
+    pub fn path(&self, key: &str) -> Option<PathBuf> {
         self.get(key).map(PathBuf::from)
     }
 }

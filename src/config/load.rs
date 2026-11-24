@@ -22,7 +22,7 @@ const AUTHORIZED_REMOTE_PREFIX: &str = "/apps/bdpan";
 
 impl Config {
     /// 读取并校验配置文件；`env` 中的机器相关值覆盖 TOML 中的同名配置。
-    pub(crate) fn load_with(config_path: &Path, env: &EnvSource) -> Result<Self, ConfigError> {
+    pub fn load_with(config_path: &Path, env: &EnvSource) -> Result<Self, ConfigError> {
         let raw_text = std::fs::read_to_string(config_path)
             .map_err(|source| ConfigError::Read { path: config_path.to_path_buf(), source })?;
         let raw: RawConfig = toml::from_str(&raw_text)

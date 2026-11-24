@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::config::{EnvSource, NETDISK_LFS_CONFIG};
+use netdisk_lfs::{EnvSource, NETDISK_LFS_CONFIG};
 
 /// 缺省配置文件路径；环境变量与 `--config` 都未提供时使用。
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -31,7 +31,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::{Cli, DEFAULT_CONFIG_PATH};
-    use crate::config::{EnvSource, NETDISK_LFS_CONFIG};
+    use netdisk_lfs::{EnvSource, NETDISK_LFS_CONFIG};
 
     use clap::Parser;
     use std::path::PathBuf;
