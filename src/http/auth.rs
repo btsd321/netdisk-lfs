@@ -22,7 +22,7 @@
 //! 认证失败的具体原因只进日志（`reason` 字段），不进响应体。登录失败按小写用户名
 //! 在 5 分钟窗口内计数，超过 `[accounts] login_failures_per_5min` 后一律 429——
 //! 这条限制对「口令正确」的请求同样生效，否则限速对爆破毫无意义。
-
+//!//!
 use std::time::Duration;
 
 use axum::extract::{Request, State};
@@ -56,7 +56,10 @@ pub(crate) struct AuthUser {
     pub(crate) role: Role,
 }
 
-/// 认证失败的原因；只写日志，不写响应。
+/// `Authorization` 头解析失败的原因；只写日志，不写响应。
+///
+/// 只管「头本身读不出用户名与口令」，与「凭据对不对」分开：这类失败一律 401，
+/// 且和凭据错误共用同一条文案（不泄漏「头格式错」还是「口令错」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthFailure {
     /// 没有 `Authorization` 头。
@@ -69,19 +72,6 @@ enum AuthFailure {
     MissingSeparator,
     /// 用户名不是合法 UTF-8。
     NonUtf8Username,
-    /// 用户名不在账户库与 `[auth.users]` 里。
-    UnknownUser,
-    /// 口令不匹配。
-    WrongPassword,
-    /// 账户存在且口令正确，但状态不是 `active`（待审批 / 已禁用）。
-    InactiveAccount,
-    /// 登录失败次数超过窗口上限。
-    TooManyRequests {
-        /// 建议的重试间隔。
-        retry_after: Duration,
-    },
-    /// 账户库故障：无法判定凭据，按 503 让客户端稍后重试。
-    AccountsUnavailable,
 }
 
 impl AuthFailure {
@@ -93,11 +83,42 @@ impl AuthFailure {
             Self::InvalidBase64 => "invalid_base64",
             Self::MissingSeparator => "missing_separator",
             Self::NonUtf8Username => "non_utf8_username",
-            Self::UnknownUser => "unknown_user",
-            Self::WrongPassword => "wrong_password",
-            Self::InactiveAccount => "inactive_account",
-            Self::TooManyRequests { .. } => "too_many_requests",
-            Self::AccountsUnavailable => "accounts_unavailable",
+        }
+    }
+}
+
+/// 凭据判定的失败分类：Basic 中间件与表单登录共用同一套结论。
+///
+/// 对外只有三种响应形态（401 / 429 / 503），具体原因只进日志。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginFailure {
+    /// 用户名不存在或口令不符。
+    ///
+    /// `reason` 只进日志，用来区分「没这个人」与「口令错」——两者对外必须是同一条
+    /// 文案，否则一次登录就能把用户名枚举出来（CWE-204）。
+    BadCredentials {
+        /// 精确原因（`unknown_user` / `wrong_password`），只进日志。
+        reason: &'static str,
+    },
+    /// 账户存在且口令正确，但状态不是 `active`（待审批 / 已禁用）。
+    Inactive,
+    /// 登录失败次数超过窗口上限。
+    RateLimited {
+        /// 建议的重试间隔。
+        retry_after: Duration,
+    },
+    /// 账户库故障：无法判定凭据，按 503 让客户端稍后重试。
+    Unavailable,
+}
+
+impl LoginFailure {
+    /// 日志字段值；固定小写英文，避免把用户输入带进日志。
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::BadCredentials { reason } => reason,
+            Self::Inactive => "inactive_account",
+            Self::RateLimited { .. } => "too_many_requests",
+            Self::Unavailable => "accounts_unavailable",
         }
     }
 
@@ -106,7 +127,26 @@ impl AuthFailure {
     /// 429 是限速本身的结论，503 是基础设施故障——两者都不该继续延长封锁窗口，
     /// 否则攻击者只要持续打就能把真实用户永久锁在外面。
     fn counts_as_login_failure(self) -> bool {
-        !matches!(self, Self::TooManyRequests { .. } | Self::AccountsUnavailable)
+        !matches!(self, Self::RateLimited { .. } | Self::Unavailable)
+    }
+}
+
+/// Basic 通道的失败：头解析失败与凭据判定失败对外都是 401，但日志原因不同。
+#[derive(Debug, Clone, Copy)]
+enum BasicFailure {
+    /// `Authorization` 头本身读不出来。
+    Malformed(AuthFailure),
+    /// 头合法，但凭据不通过。
+    Credentials(LoginFailure),
+}
+
+impl BasicFailure {
+    /// 日志字段值。
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed(failure) => failure.as_str(),
+            Self::Credentials(failure) => failure.reason(),
+        }
     }
 }
 
@@ -166,7 +206,7 @@ pub(crate) async fn require(
 /// 认证失败的通道归属：两条通道的失败语义不同（Basic 有 429、Cookie 要清 Cookie）。
 enum Rejection {
     /// Basic 通道失败。
-    Basic(AuthFailure),
+    Basic(BasicFailure),
     /// 会话 Cookie 通道失败。
     Session(SessionFailure),
 }
@@ -184,7 +224,7 @@ impl Rejection {
     /// 日志字段值：为什么失败（Basic 与 Session 的取值集合不同）。
     fn reason(&self) -> &'static str {
         match self {
-            Self::Basic(failure) => failure.as_str(),
+            Self::Basic(failure) => failure.reason(),
             Self::Session(failure) => failure.as_str(),
         }
     }
@@ -192,7 +232,7 @@ impl Rejection {
     /// 映射成响应；`secure` 决定清除 Cookie 时是否带 `Secure`。
     fn into_response(self, request_id: &RequestId, secure: bool) -> Response {
         match self {
-            Self::Basic(failure) => failure_response(failure, request_id),
+            Self::Basic(failure) => basic_failure_response(failure, request_id),
             Self::Session(failure) => session_failure_response(failure, request_id, secure),
         }
     }
@@ -338,39 +378,72 @@ fn session_config_user(
     }
 }
 
-/// 把失败原因映射成响应：401 统一文案、429 带 `Retry-After`、503 带认证挑战头。
-fn failure_response(failure: AuthFailure, request_id: &RequestId) -> Response {
+/// Basic 通道的失败响应：头解析失败只可能是 401；凭据判定按 [`LoginFailure`] 分流。
+fn basic_failure_response(failure: BasicFailure, request_id: &RequestId) -> Response {
     match failure {
-        AuthFailure::TooManyRequests { retry_after } => ApiError::TooManyRequests {
+        BasicFailure::Malformed(_) => {
+            ApiError::Unauthorized(AUTH_FAILURE_MESSAGE.to_owned()).into_response_with(request_id)
+        },
+        BasicFailure::Credentials(failure) => login_failure_response(failure, request_id),
+    }
+}
+
+/// 把凭据判定的失败映射成响应：401 统一文案、429 带 `Retry-After`、503 带认证挑战头。
+fn login_failure_response(failure: LoginFailure, request_id: &RequestId) -> Response {
+    match failure {
+        LoginFailure::RateLimited { retry_after } => ApiError::TooManyRequests {
             message: format!("登录失败次数过多，请 {} 秒后重试", retry_after.as_secs().max(1)),
             retry_after_secs: retry_after.as_secs().max(1),
         }
         .into_response_with(request_id),
-        AuthFailure::AccountsUnavailable => error::with_auth_challenge(
+        LoginFailure::Unavailable => error::with_auth_challenge(
             ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned())
                 .into_response_with(request_id),
         ),
-        _ => ApiError::Unauthorized(AUTH_FAILURE_MESSAGE.to_owned()).into_response_with(request_id),
+        // 凭据不对与「账户未激活」必须是同一条文案、同一个状态码：区分两者等于把
+        // 「这个用户名存在且待审批」告诉任何人。
+        LoginFailure::BadCredentials { .. } | LoginFailure::Inactive => {
+            ApiError::Unauthorized(AUTH_FAILURE_MESSAGE.to_owned()).into_response_with(request_id)
+        },
     }
 }
 
-/// 解析凭据并完成认证；先过登录失败限速，再按「DB 优先、config 回落」判定。
+/// Basic 通道：解析 `Authorization` 头，再交给 [`verify_credentials`] 判定凭据。
 async fn authenticate(
     state: &AppState,
     authorization: Option<HeaderValue>,
-) -> Result<AuthUser, AuthFailure> {
-    let (username, password) = parse_basic(authorization.as_ref())?;
+) -> Result<AuthUser, BasicFailure> {
+    let (username, password) =
+        parse_basic(authorization.as_ref()).map_err(BasicFailure::Malformed)?;
+    verify_credentials(state, &username, &password).await.map_err(BasicFailure::Credentials)
+}
+
+/// 校验用户名与口令：限速 → DB 优先（active/角色）→ config 回落（sha256）→ 懒升级。
+///
+/// Basic 中间件与 `POST /login` 共用这一个入口，因此两边对「谁能登录」的判断不可能
+/// 分叉：config-only 用户、被禁用账户、限速、账户库故障的表现完全一致。
+///
+/// 口令按**字节**接收而不是 `&str`：`Authorization` 头允许非 UTF-8 口令字节，而
+/// config 回落的 sha256 是按字节算的——收窄成 `&str` 会让这类历史口令登不上，属于
+/// 行为变更。表单口令本来就是 UTF-8，调用方传 `as_bytes()` 即可。
+///
+/// 成功时照旧做三件事：清零该用户名的失败计数、更新/懒升级库记录、`touch_last_login`。
+pub(crate) async fn verify_credentials(
+    state: &AppState,
+    username: &str,
+    password: &[u8],
+) -> Result<AuthUser, LoginFailure> {
     // 用户名大小写不敏感：库里的 UNIQUE COLLATE NOCASE 与 config 的键名都按字面量，
     // 但限速必须把 Alice/alice 算成同一个人，否则改个大小写就能绕开限速。
     let throttle_key = username.to_ascii_lowercase();
     let limit = state.config().accounts.login_failures_per_5min;
     if let Some(retry_after) = state.login_limits().blocked_for(&throttle_key, limit) {
-        return Err(AuthFailure::TooManyRequests { retry_after });
+        return Err(LoginFailure::RateLimited { retry_after });
     }
 
     let outcome = match state.accounts() {
-        Some(users) => authenticate_with_store(state.config(), users, &username, &password).await,
-        None => authenticate_config(state.config(), &username, &password),
+        Some(users) => authenticate_with_store(state.config(), users, username, password).await,
+        None => authenticate_config(state.config(), username, password),
     };
     match outcome {
         Ok(user) => {
@@ -383,6 +456,9 @@ async fn authenticate(
             if failure.counts_as_login_failure() {
                 state.login_limits().record(&throttle_key);
             }
+            // 精确原因（unknown_user / wrong_password）只在日志里出现，响应体里两者
+            // 完全一致；这里统一打一条，Basic 与表单登录都不会漏掉。
+            tracing::debug!(reason = failure.reason(), "凭据判定失败");
             Err(failure)
         },
     }
@@ -393,15 +469,15 @@ fn authenticate_config(
     config: &Config,
     username: &str,
     password: &[u8],
-) -> Result<AuthUser, AuthFailure> {
+) -> Result<AuthUser, LoginFailure> {
     let user = config.auth.users.get(username);
     // 未知用户名也付一次摘要+比较的开销，避免计时差泄漏用户名是否存在。
     let expected = user.map_or(DUMMY_DIGEST, |user| user.password_sha256.as_str());
     let matched = password_matches(password, expected);
     match user {
         Some(user) if matched => Ok(AuthUser { username: username.to_owned(), role: user.role }),
-        Some(_) => Err(AuthFailure::WrongPassword),
-        None => Err(AuthFailure::UnknownUser),
+        Some(_) => Err(LoginFailure::BadCredentials { reason: "wrong_password" }),
+        None => Err(LoginFailure::BadCredentials { reason: "unknown_user" }),
     }
 }
 
@@ -411,7 +487,7 @@ async fn authenticate_with_store(
     users: &UserStore,
     username: &str,
     password: &[u8],
-) -> Result<AuthUser, AuthFailure> {
+) -> Result<AuthUser, LoginFailure> {
     let stored = match users.get(username).await {
         Ok(user) => user,
         // 旧 config 用户名可能只有 2 个字符，达不到账户库 3–32 的规则：对它来说
@@ -419,7 +495,7 @@ async fn authenticate_with_store(
         Err(AccountError::InvalidUsername { .. }) => None,
         Err(error) => {
             tracing::error!(username = %username, error = %error, "查询账户库失败");
-            return Err(AuthFailure::AccountsUnavailable);
+            return Err(LoginFailure::Unavailable);
         },
     };
 
@@ -434,24 +510,24 @@ async fn authenticate_existing(
     users: &UserStore,
     user: crate::accounts::User,
     password: &[u8],
-) -> Result<AuthUser, AuthFailure> {
+) -> Result<AuthUser, LoginFailure> {
     let hash = match users.password_hash(&user.username).await {
         Ok(Some(hash)) => hash,
         Ok(None) => {
             // 刚按用户名查到、又读不到哈希：库被并发删除或损坏，按不可用处理。
             tracing::error!(username = %user.username, "账户库中缺少口令哈希");
-            return Err(AuthFailure::AccountsUnavailable);
+            return Err(LoginFailure::Unavailable);
         },
         Err(error) => {
             tracing::error!(username = %user.username, error = %error, "读取口令哈希失败");
-            return Err(AuthFailure::AccountsUnavailable);
+            return Err(LoginFailure::Unavailable);
         },
     };
 
     // Argon2 是同步的 CPU/内存密集操作（19 MiB），必须在阻塞线程池里跑：
     // 直接在 handler 线程上算会卡住整个 tokio worker。
     if !passwords::verify(hash, password.to_vec()).await {
-        return Err(AuthFailure::WrongPassword);
+        return Err(LoginFailure::BadCredentials { reason: "wrong_password" });
     }
     // 口令正确但状态不是 active（待审批 / 已禁用）同样拒绝；具体状态只进日志。
     if user.status != UserStatus::Active {
@@ -460,7 +536,7 @@ async fn authenticate_existing(
             status = user.status.as_str(),
             "账户状态不允许登录"
         );
-        return Err(AuthFailure::InactiveAccount);
+        return Err(LoginFailure::Inactive);
     }
     if let Err(error) = users.touch_last_login(&user.username).await {
         // 登录时间只是统计信息，写失败不该把已通过认证的请求拒掉。
@@ -475,15 +551,15 @@ async fn authenticate_legacy(
     users: &UserStore,
     username: &str,
     password: &[u8],
-) -> Result<AuthUser, AuthFailure> {
+) -> Result<AuthUser, LoginFailure> {
     let Some(config_user) = config.auth.users.get(username) else {
         // 两边都没有这个用户：付一次与真实校验等价的 Argon2 开销再拒绝，
         // 否则响应时间会泄漏「这个用户名在不在账户库里」。
         passwords::dummy_verify(password.to_vec()).await;
-        return Err(AuthFailure::UnknownUser);
+        return Err(LoginFailure::BadCredentials { reason: "unknown_user" });
     };
     if !password_matches(password, &config_user.password_sha256) {
-        return Err(AuthFailure::WrongPassword);
+        return Err(LoginFailure::BadCredentials { reason: "wrong_password" });
     }
 
     upgrade_legacy_user(users, username, password, config_user).await;
