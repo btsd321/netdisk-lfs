@@ -15,7 +15,7 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 
-pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, LsEntry, RetryPolicy};
+pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, BdpanStore, LsEntry, RetryPolicy};
 pub use config::{
     AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, Role, RuntimeEnv,
     ServerConfig, StorageConfig, UserConfig,

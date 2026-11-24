@@ -7,10 +7,12 @@
 //! 分工：
 //!
 //! - [`process`]：子进程执行、超时、信号量、重试与 [`BdpanError`]；
-//! - `parse`：剥离进度条/ANSI 噪音后的 JSON 解析，以及按错误文案给失败分类。
+//! - `parse`：剥离进度条/ANSI 噪音后的 JSON 解析，以及按错误文案给失败分类；
+//! - [`store`]：内容寻址后端 [`BdpanStore`]，把上传/下载状态机落到网盘路径上。
 
 mod parse;
 mod process;
+mod store;
 
 use std::time::Instant;
 
@@ -18,6 +20,7 @@ use tracing::Span;
 
 pub use parse::LsEntry;
 pub use process::{BdpanClient, BdpanClientConfig, BdpanError, RetryPolicy};
+pub use store::BdpanStore;
 
 /// 在 span 上记录 `duration_ms` 的守卫。
 ///
