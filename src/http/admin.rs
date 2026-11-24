@@ -848,7 +848,8 @@ fn render_page(
             .map(|user| render_row(user, filter.page, min_password_len))
             .collect::<Vec<_>>();
         body.push_str(&format!(
-            r#"<div class="table-scroll">{}</div>"#,
+            r#"<div class="table-scroll">{}</div>
+<p class="note scroll-hint">左右滑动可查看全部列与操作。</p>"#,
             table(&["用户名", "角色", "状态", "创建时间", "最后登录", "操作"], &rows)
         ));
     }
