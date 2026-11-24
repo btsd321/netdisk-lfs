@@ -18,8 +18,8 @@ pub mod store;
 mod test_support;
 
 pub use accounts::{
-    AccountError, User, UserStatus, UserStore, hash_password, validate_password, validate_username,
-    verify_password,
+    AccountError, MAX_PASSWORD_CHARS, User, UserStatus, UserStore, hash_password,
+    validate_password, validate_username, verify_password,
 };
 pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, BdpanStore, LsEntry, RetryPolicy};
 pub use cache::{Cache, CachedFile, SweepReport, transient_dir};

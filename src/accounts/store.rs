@@ -118,6 +118,9 @@ impl UserStore {
         // WAL：读写不互相阻塞；foreign_keys 目前没有外键，仍按规划打开，给后续表留好语义。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // 跨进程写竞争（例如运维手工改库、两个实例短暂重叠）时给 5s 重试窗口，
+        // 而不是让 SQLITE_BUSY 立刻变成 500；单实例下这条不会触发。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         init_schema(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path: path.to_path_buf() })
     }

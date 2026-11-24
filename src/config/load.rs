@@ -40,6 +40,16 @@ impl Config {
             None => RuntimeEnv::default(),
         };
         let data_dir = env.path(env::NETDISK_LFS_DATA_DIR);
+        // 数据根必须是绝对路径：cache 与 accounts.db 都从它推导，相对路径会让
+        // 数据库落点随进程 CWD 漂移（换目录启动就悄悄建一个空库）。
+        if let Some(dir) = &data_dir
+            && !dir.is_absolute()
+        {
+            return Err(ConfigError::invalid(format!(
+                "NETDISK_LFS_DATA_DIR 必须是绝对路径，实际为 {}",
+                dir.display()
+            )));
+        }
 
         let server = ServerConfig {
             listen: server.listen,
@@ -130,6 +140,14 @@ impl Config {
         }
         if self.cache.max_bytes == 0 {
             return Err(ConfigError::invalid("cache.max_bytes 必须大于 0"));
+        }
+        // 与 accounts::password::MAX_PASSWORD_CHARS（128）保持一致：下界为 0 会关掉
+        // 长度下限，上界超过 128 会让口令策略永远无法满足。
+        if self.accounts.min_password_len == 0 || self.accounts.min_password_len > 128 {
+            return Err(ConfigError::invalid(format!(
+                "accounts.min_password_len 必须在 1..=128 之间，实际为 {}",
+                self.accounts.min_password_len
+            )));
         }
         for (name, user) in &self.auth.users {
             if name.is_empty() {
@@ -525,6 +543,33 @@ dir = "/var/lib/netdisk-lfs/cache"
         let contents = VALID_CONFIG.replace("max_bdpan_procs = 4", "max_bdpan_procs = 0");
 
         assert!(load_error(&contents, &[]).contains("max_bdpan_procs"));
+    }
+
+    #[test]
+    fn given_relative_data_dir_when_load_then_rejected() {
+        // 相对路径会让 cache/accounts.db 落点随 CWD 漂移。
+        let message = load_error(VALID_CONFIG, &[("NETDISK_LFS_DATA_DIR", "relative/data")]);
+
+        assert!(message.contains("绝对路径"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_out_of_range_min_password_len_when_load_then_rejected() {
+        let anchor = "[accounts]\ndb = \"/var/lib/netdisk-lfs/accounts.db\"";
+        let zero = VALID_CONFIG.replace(anchor, &format!("{anchor}\nmin_password_len = 0"));
+        let too_big = VALID_CONFIG.replace(anchor, &format!("{anchor}\nmin_password_len = 129"));
+
+        let zero_error = load_error(&zero, &[]);
+        let big_error = load_error(&too_big, &[]);
+        assert!(zero_error.contains("min_password_len"), "0 应被拒绝；实际错误：{zero_error}");
+        assert!(big_error.contains("min_password_len"), ">128 应被拒绝；实际错误：{big_error}");
+    }
+
+    #[test]
+    fn given_no_accounts_section_when_load_then_min_password_len_defaults_to_12() {
+        let config = load(VALID_CONFIG, &[]).expect("合法配置");
+
+        assert_eq!(config.accounts.min_password_len, 12);
     }
 
     #[test]
