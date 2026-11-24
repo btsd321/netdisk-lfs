@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# bdpan CLI 的测试桩（tests/fixtures/bdpan）：复刻 2026-11-24 实测到的 3.8.9 语义，
+# 把「远端」映射到 $FAKE_BDPAN_ROOT 指定的本地目录，绝不可能碰到真实网盘。
+#
+# 复刻的关键行为（见 .agents/specs/storage.md）：
+#   - 远端路径必须带 /apps/bdpan/ 前缀，否则报「路径超出授权目录范围」；
+#   - 所有业务错误的退出码同样是 0，失败只体现在 stdout JSON 的 code/error 字段；
+#   - ls 目录存在输出 JSON 数组（条目 md5 故意塞非法字符，验证上层没用它校验），
+#     不存在输出 {"code":1,...}；
+#   - mkdir 幂等，可一次建多级；
+#   - upload 同名自动重命名（不覆盖），只做 metadata 校验；
+#   - mv 的目标只能是目录，目标已有同名文件时报 file already exists；
+#   - download 的进度条（带 ANSI 与 \r）与 JSON 结果混流，JSON 在最后；
+#   - quota 输出 data.total_bytes/used_bytes/free_bytes。
+#
+# 仅测试用的环境变量：
+#   FAKE_BDPAN_ROOT            必填：远端 /apps/bdpan/ 映射到的本地根目录
+#   FAKE_BDPAN_CALL_LOG        可选：追加「子命令<TAB>原始参数」行，供测试断言调用次数与标志
+#   FAKE_BDPAN_QUOTA_TOTAL     可选：配额总量字节数（默认 1 TiB）
+#   FAKE_BDPAN_QUOTA_USED      可选：配额已用字节数（默认 0）
+#   FAKE_BDPAN_FAIL_UPLOAD     非空：upload 一律返回网络类错误
+#   FAKE_BDPAN_FLAKY_UPLOAD    N>0：前 N 次 upload 返回网络类错误，之后成功（配合重试用例）
+#   FAKE_BDPAN_FAIL_DOWNLOAD   非空：download 一律返回网络类错误
+#   FAKE_BDPAN_FAIL_MV         非空：mv 一律返回网络类错误（验证上传失败后的中转清理）
+#   FAKE_BDPAN_SILENT_TRUNCATE 非空：download 写出截断文件却报成功（模拟静默截断）
+#   FAKE_BDPAN_SLEEP           每个子命令先睡 N 秒（配合超时用例）
+#   FAKE_BDPAN_CRASH           非空：以退出码 3 失败且不输出 JSON（模拟 CLI 崩溃）
+#   FAKE_BDPAN_FAIL_AUTH       非空：whoami 报登录态失效（token 过期），供 /healthz 用例
+set -uo pipefail
+
+root="${FAKE_BDPAN_ROOT:-}"
+if [[ -z "$root" ]]; then
+  printf '{"code":1,"data":null,"error":"FAKE_BDPAN_ROOT 未设置"}\n'
+  exit 0
+fi
+
+command="${1:-}"
+shift || true
+
+# 记录原始参数（含 --json / --no-check-update），调用次数断言靠它。
+if [[ -n "${FAKE_BDPAN_CALL_LOG:-}" ]]; then
+  printf '%s\t%s\n' "$command" "$*" >>"$FAKE_BDPAN_CALL_LOG"
+fi
+
+if [[ -n "${FAKE_BDPAN_CRASH:-}" ]]; then
+  printf 'fake bdpan: simulated crash\n' >&2
+  exit 3
+fi
+
+if [[ -n "${FAKE_BDPAN_SLEEP:-}" ]]; then
+  sleep "$FAKE_BDPAN_SLEEP"
+fi
+
+# 位置参数与标志分开：真实 CLI 允许标志出现在任意位置。
+positional=()
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) positional+=("$arg") ;;
+  esac
+done
+
+json_escape() {
+  local input="$1" out="" ch i
+  for ((i = 0; i < ${#input}; i++)); do
+    ch="${input:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# 业务失败：人类可读的原因进 error 字段，退出码保持 0，与真实 CLI 一致。
+fail() {
+  printf '{"code":1,"data":null,"error":"%s"}\n' "$(json_escape "$1")"
+  exit 0
+}
+
+# 远端路径 → 本地路径。用全局 RESOLVED 而不是 stdout 返回值：fail 必须退出整个脚本，
+# 放在命令替换的子 shell 里只会退出子 shell，调用方会拿到空路径继续跑。
+resolve() {
+  local remote="$1"
+  case "$remote" in
+    /apps/bdpan/*) ;;
+    *) fail "路径超出授权目录范围: $remote" ;;
+  esac
+  local rel="${remote#/apps/bdpan/}"
+  rel="${rel%/}"
+  case "/$rel/" in
+    *"/../"* | *"/./"*) fail "非法路径: $remote" ;;
+  esac
+  RESOLVED="$root/$rel"
+}
+
+file_size() {
+  wc -c <"$1" 2>/dev/null | tr -d ' '
+}
+
+# upload 的进度噪音：ANSI + \r 覆盖，模拟真实 CLI 混流输出。
+progress_upload() {
+  printf '\033[2K上传中  10%%\r' >&1
+  printf '\033[2K上传中 100%%\r\n' >&1
+  printf 'upload progress: 100%%\n' >&2
+}
+
+progress_download() {
+  printf '\033[2K下载中  10%%\r' >&1
+  printf '\033[2K下载中 100%%\r\n' >&1
+  printf 'download progress: 100%%\n' >&2
+}
+
+cmd_ls() {
+  local dir="${positional[0]:-}"
+  [[ -z "$dir" ]] && fail "缺少目录参数"
+  resolve "$dir"
+  local path="$RESOLVED"
+  [[ -d "$path" ]] || fail "目录不存在: $dir"
+  # sed -n 只取样一个过滤，md5 故意给非法字符：上层若拿它当校验依据就会在这里露馅。
+  local first=1 entry name is_dir size
+  printf '['
+  for entry in "$path"/*; do
+    [[ -e "$entry" ]] || continue
+    name="$(basename "$entry")"
+    if [[ -d "$entry" ]]; then
+      is_dir=true
+      size=0
+    else
+      is_dir=false
+      size="$(file_size "$entry")"
+    fi
+    ((first == 0)) && printf ','
+    first=0
+    printf '{"server_filename":"%s","isdir":%s,"size":%s,"fsid":%d,"md5":"r"}' \
+      "$(json_escape "$name")" "$is_dir" "$size" "$RANDOM"
+  done
+  printf ']\n'
+}
+
+cmd_mkdir() {
+  local dir="${positional[0]:-}"
+  [[ -z "$dir" ]] && fail "缺少目录参数"
+  resolve "$dir"
+  mkdir -p "$RESOLVED" || fail "创建目录失败: $dir"
+  printf '{"code":0,"data":{"status":"ok","path":"%s"}}\n' "$(json_escape "$dir")"
+}
+
+cmd_upload() {
+  local src="${positional[0]:-}" remote="${positional[1]:-}"
+  [[ -z "$src" || -z "$remote" ]] && fail "缺少参数: upload <local> <remote>"
+
+  if [[ -n "${FAKE_BDPAN_FAIL_UPLOAD:-}" ]]; then
+    progress_upload
+    fail "网络异常: 上传连接被重置"
+  fi
+
+  # 抖动注入：前 N 次失败，用来验证「退避重试后成功」。
+  if [[ -n "${FAKE_BDPAN_FLAKY_UPLOAD:-}" ]]; then
+    local counter="$root/.flaky-upload-count" seen=0
+    [[ -f "$counter" ]] && seen="$(cat "$counter")"
+    if ((seen < FAKE_BDPAN_FLAKY_UPLOAD)); then
+      printf '%s\n' "$((seen + 1))" >"$counter"
+      progress_upload
+      fail "网络异常: 上传超时"
+    fi
+  fi
+
+  [[ -f "$src" ]] || fail "文件不存在: $src"
+  resolve "$remote"
+  local dest="$RESOLVED" name conflict=false
+  name="$(basename "$dest")"
+  mkdir -p "$(dirname "$dest")" || fail "创建目录失败: $(dirname "$dest")"
+
+  if [[ -e "$dest" ]]; then
+    # 真实 CLI 同名自动重命名而不覆盖：桩必须复刻，否则封装层漏掉冲突检测也测不出来。
+    local candidate="$dest.1" index=1
+    while [[ -e "$candidate" ]]; do
+      index=$((index + 1))
+      candidate="$dest.$index"
+    done
+    dest="$candidate"
+    name="$(basename "$dest")"
+    conflict=true
+  fi
+
+  cp "$src" "$dest" || fail "上传失败: $src"
+  progress_upload
+  printf '{"code":0,"data":{"action":"created","conflict_detected":%s,"content_verified":false,"verification":"metadata","server_filename":"%s","size":%s}}\n' \
+    "$conflict" "$(json_escape "$name")" "$(file_size "$dest")"
+}
+
+cmd_mv() {
+  local src="${positional[0]:-}" dest_dir="${positional[1]:-}"
+  [[ -z "$src" || -z "$dest_dir" ]] && fail "缺少参数: mv <src-file> <dest-dir>"
+  resolve "$src"
+  local src_path="$RESOLVED"
+  resolve "$dest_dir"
+  local dir="$RESOLVED"
+  [[ -f "$src_path" ]] || fail "文件不存在: $src"
+  [[ -d "$dir" ]] || fail "目标不是目录: $dest_dir"
+  [[ -n "${FAKE_BDPAN_FAIL_MV:-}" ]] && fail "网络异常: 移动失败"
+  local name dest
+  name="$(basename "$src_path")"
+  dest="$dir/$name"
+  [[ -e "$dest" ]] && fail "file already exists: $dest"
+  mv "$src_path" "$dest" || fail "移动失败: $src"
+  printf '{"code":0,"data":{"status":"ok"}}\n'
+}
+
+cmd_rm() {
+  local remote="${positional[0]:-}"
+  [[ -z "$remote" ]] && fail "缺少参数: rm <remote>"
+  resolve "$remote"
+  local path="$RESOLVED"
+  [[ -e "$path" ]] || fail "文件不存在: $remote"
+  rm -rf "$path" || fail "删除失败: $remote"
+  printf '{"code":0,"data":{"status":"ok"}}\n'
+}
+
+cmd_download() {
+  local remote="${positional[0]:-}" local_out="${positional[1]:-}"
+  [[ -z "$remote" || -z "$local_out" ]] && fail "缺少参数: download <remote> <local>"
+  resolve "$remote"
+  local src="$RESOLVED"
+  [[ -f "$src" ]] || fail "文件不存在: $remote"
+  # 真实 CLI 不替调用方建目录：桩也不建，缺目录时上层必须自己 create_dir_all。
+  [[ -d "$(dirname "$local_out")" ]] || fail "本地目录不存在: $(dirname "$local_out")"
+
+  if [[ -n "${FAKE_BDPAN_FAIL_DOWNLOAD:-}" ]]; then
+    progress_download
+    fail "网络异常: 下载被中断"
+  fi
+
+  local expected; expected="$(file_size "$src")"
+  if [[ -n "${FAKE_BDPAN_SILENT_TRUNCATE:-}" ]]; then
+    # 静默截断：少写末尾 1 字节，但下面照样报 size=完整大小、code:0。
+    if ((expected > 1)); then
+      head -c $((expected - 1)) "$src" >"$local_out" || fail "下载失败: $remote"
+    else
+      : >"$local_out"
+    fi
+  else
+    cp "$src" "$local_out" || fail "下载失败: $remote"
+  fi
+  progress_download
+  printf '{"code":0,"data":{"status":"ok","path":"%s","size":%s}}\n' \
+    "$(json_escape "$remote")" "$expected"
+}
+
+cmd_quota() {
+  local total="${FAKE_BDPAN_QUOTA_TOTAL:-1099511627776}"
+  local used="${FAKE_BDPAN_QUOTA_USED:-0}"
+  printf '{"code":0,"data":{"total_bytes":%s,"used_bytes":%s,"free_bytes":%d}}\n' \
+    "$total" "$used" "$((total - used))"
+}
+
+cmd_whoami() {
+  # 复刻真实 CLI 的扁平输出（实测 3.8.9：没有 code/data 信封，只有这些字段）。
+  if [[ -n "${FAKE_BDPAN_FAIL_AUTH:-}" ]]; then
+    printf '{"authenticated":false,"has_valid_token":false,"username":"fake-bdpan"}\n'
+    return 0
+  fi
+  printf '{"authenticated":true,"has_valid_token":true,"username":"bdsd321_baidu","expires_at":"2026-12-24T05:09:40+08:00","is_svip":true}\n'
+}
+
+case "$command" in
+  ls) cmd_ls ;;
+  mkdir) cmd_mkdir ;;
+  upload) cmd_upload ;;
+  mv) cmd_mv ;;
+  rm) cmd_rm ;;
+  download) cmd_download ;;
+  quota) cmd_quota ;;
+  whoami) cmd_whoami ;;
+  *) fail "未知子命令: $command" ;;
+esac

@@ -5,7 +5,10 @@
 客户端是标准 `git-lfs`，不需要百度账号；服务器上的网关把 LFS 协议的读写翻译成 `bdpan` CLI 调用，
 对象最终落在网盘 `/apps/bdpan/lfs/objects/`。
 
-> 状态：**规划阶段**，代码尚未开始。设计与里程碑见 `.agents/`（本地目录，不入库）。
+> 状态：核心链路已实现（配置、`ObjectStore` 与 `bdpan` 封装、batch/PUT/GET/verify、
+> 磁盘 LRU 缓存、`/healthz` 探活与 `/metrics`、systemd 部署单元）；真实网盘端到端
+> 验证（大对象实测、token 吊销演练）仍待完成。设计规格在本地 `.agents/`（不入库），
+> 仓库约定见 [`docs/`](docs/)。
 
 ## 它解决什么
 
@@ -21,16 +24,34 @@
 
 ## 快速开始
 
-待实现。目标形态：
-
 ```bash
-# 服务器
+# 服务器（systemd unit 会以普通用户运行它，只监听 127.0.0.1）
 netdisk-lfs --config /etc/netdisk-lfs/config.toml
 
 # 客户端仓库
 git config -f .lfsconfig lfs.url https://lfs.example.com/lfs/
 git lfs push --all origin main
 ```
+
+## 部署
+
+服务器安装、`bdpan` 首次登录、systemd、Caddy 反代、缓存运维与排障见
+[docs/deploy.md](docs/deploy.md)。
+
+- systemd unit：[deploy/netdisk-lfs.service](deploy/netdisk-lfs.service)
+  （system unit、`Restart=always`、只监听回环，对外一律经反向代理）
+- 配置样例：[config.toml.example](config.toml.example)
+  （复制到 `/etc/netdisk-lfs/config.toml`，权限 `600`）
+- 一键脚本：[scripts/deploy.sh](scripts/deploy.sh) / [scripts/uninstall.sh](scripts/uninstall.sh)
+  （默认装到 `/opt/netdisk-lfs`；卸载默认保留配置与数据）
+- 观测端点：`GET /healthz`（无认证；`bdpan` 探活降级时回 **503**）、
+  `GET /metrics`（Prometheus 文本，仅缓存维度）
+
+## 开发文档
+
+- [docs/git-workflow.md](docs/git-workflow.md)：分支模型、提交规范、worktree 协作与发布流程
+- [docs/rust-style.md](docs/rust-style.md)：Rust 编码规范、lint 配置与门禁
+- [docs/deploy.md](docs/deploy.md)：部署与运维（systemd、反代、缓存、token 排障、升级）
 
 ## 参考项目
 

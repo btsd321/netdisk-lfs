@@ -6,18 +6,23 @@
 
 一个自建的 Git LFS 服务端（Rust），对象存储后端是百度网盘，经由服务器上的 `bdpan` CLI 读写。
 
+## 工作流
+
+分支、提交与合并遵循 [docs/git-workflow.md](docs/git-workflow.md)：特性分支从 `develop` 切出、以 `--no-ff` 合回；提交用 Conventional Commits 中文描述并带 `-s` 签署；特性分支不 push 到远程。
+
 ## 硬约束（改动前必读）
 
 - **存储通道唯一**：对象只能通过 `bdpan` CLI 子进程读写，作用域固定为网盘 `/apps/bdpan/`。不要试图绕过 CLI 直连开放平台 API，除非同时提交新的 ADR。
 - **协议以官方规范为准**：Git LFS batch API 见 `.agents/specs/api.md`，任何端点行为变更先改文档再改代码。
 - **内容寻址不可妥协**：对象路径由 oid（sha256）决定，上传必须校验哈希后再落最终路径，禁止「先写最终路径再校验」。
-- **单对象上限**：默认 4 GiB，超限直接拒绝（返回 422），不做内部分片映射。
+- **单对象上限可配**：`storage.max_object_bytes`，默认 `0` = 不限制（实际大小受网盘单文件限制与磁盘余量约束）；非 0 时超限直接拒绝（422），不做内部分片映射。传输超时按「`bdpan_timeout_secs`（默认 300s 启动宽限）+ 文件大小 / `bdpan_min_throughput_bytes_per_sec`（默认 100 KiB/s）」推导——平均速度低于 100 KiB/s 未传完才算卡死，0 表示关闭对应项。
 
 ## 目录
 
 ```text
 src/            实现
 tests/          集成测试（含 fake bdpan）
+docs/           入库文档：Git 工作流、Rust 规范
 .agents/        本地规划与调研（**不入 git**，见 .gitignore）
 ```
 
@@ -26,13 +31,13 @@ tests/          集成测试（含 fake bdpan）
 ```bash
 cargo build
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
 ## 编码约定
 
-完整规范见 `.agents/specs/rust-style.md`（本地文档，不入库）。以下为必须遵守的摘要：
+完整规范见 [docs/rust-style.md](docs/rust-style.md)（入库）。以下为必须遵守的摘要：
 
 - 生产路径不使用 `unwrap()` / `expect()`（启动期配置校验除外），错误用 `thiserror` 定义域内错误类型。
 - lint 统一配置在 `Cargo.toml` 的 `[lints]`，禁止在代码里散落 `#[allow]`。
