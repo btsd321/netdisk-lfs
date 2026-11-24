@@ -317,6 +317,28 @@ async fn given_closed_policy_when_register_then_403_and_no_account() {
 }
 
 #[tokio::test]
+async fn given_config_reserved_username_when_register_then_conflict() {
+    // `[auth.users]` 里的名字不能自助注册：DB 优先会让原 config 管理员失效。
+    let app = TestApp::with(|config| {
+        config.accounts.registration = RegistrationPolicy::Open;
+        add_config_user(config, "alice", PASSWORD, Role::Admin);
+    });
+    let body = json!({ "username": "alice", "password": PASSWORD }).to_string();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/account/register")
+        .header(header::HOST, TEST_HOST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("构造请求");
+
+    let (status, _, parsed) = app.send_json(request).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(parsed["message"].as_str().is_some_and(|m| m.contains("保留")));
+}
+
+#[tokio::test]
 async fn given_duplicate_username_when_register_then_409() {
     let app = TestApp::with(|config| config.accounts.registration = RegistrationPolicy::Open);
     let payload = json!({ "username": "dave", "password": PASSWORD });

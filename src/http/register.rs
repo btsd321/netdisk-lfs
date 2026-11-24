@@ -199,6 +199,25 @@ async fn register(
         return Err(ApiError::BadRequest(error.to_string()));
     }
 
+    // 自助注册不能占用 `[auth.users]` 里的用户名：DB 优先，一旦写入同名的
+    // Pending/Active 记录，原 config 账户（常见是引导管理员）就再也登不上，
+    // 变成可被利用的锁定路径。管理员在 `/admin/users` 创建同名账户不受此限
+    // （那是显式的迁移动作）。
+    if state
+        .config()
+        .auth
+        .users
+        .keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&payload.username))
+    {
+        tracing::warn!(
+            username = %payload.username,
+            reason = "reserved_username",
+            "注册被拒：用户名被 [auth.users] 保留"
+        );
+        return Err(ApiError::Conflict("用户名被保留，请换一个".to_owned()));
+    }
+
     let (status, policy) = match accounts.registration {
         RegistrationPolicy::Open => (UserStatus::Active, "open"),
         RegistrationPolicy::Approval => (UserStatus::Pending, "approval"),
