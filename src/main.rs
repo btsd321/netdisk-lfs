@@ -16,8 +16,8 @@ use std::sync::Arc;
 use clap::Parser;
 use netdisk_lfs::http::upload_dir;
 use netdisk_lfs::{
-    AppState, BdpanProbe, BdpanStore, Cache, Config, ConfigError, EnvSource, ObjectStore,
-    init_logging, router, transient_dir,
+    AccountError, AppState, BdpanProbe, BdpanStore, Cache, Config, ConfigError, EnvSource,
+    ObjectStore, UserStore, init_logging, router, transient_dir,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -30,7 +30,7 @@ const DOTENV_FILE: &str = ".env";
 fn main() -> ExitCode {
     // 锁守卫必须活到进程退出：`_lock` 随 `serve` 返回才被丢弃，
     // 期间任何第二个实例都会在启动阶段被拒绝。
-    match bootstrap().and_then(|(config, _lock)| serve(config)) {
+    match bootstrap().and_then(serve) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 日志可能尚未初始化，直接写 stderr，保证启动失败一定有输出。
@@ -47,8 +47,18 @@ fn main() -> ExitCode {
     }
 }
 
-/// 同步启动阶段：读 `.env`、解析参数与配置、初始化日志、抢单实例锁。
-fn bootstrap() -> Result<(Config, Vec<SingletonLock>), StartupError> {
+/// 启动阶段拿到的、需要在异步服务里复用的句柄。
+struct Startup {
+    /// 已校验的配置。
+    config: Config,
+    /// 账户库；`open` 只在这里（阻塞阶段）调用一次。
+    accounts: UserStore,
+    /// 单实例锁；随进程存活，Drop 时释放。
+    _lock: Vec<SingletonLock>,
+}
+
+/// 同步启动阶段：读 `.env`、解析参数与配置、初始化日志、抢单实例锁、打开账户库。
+fn bootstrap() -> Result<Startup, StartupError> {
     let cli = Cli::parse();
     let env = EnvSource::load(Path::new(DOTENV_FILE))?;
     let config_path = cli.config_path(&env);
@@ -57,6 +67,10 @@ fn bootstrap() -> Result<(Config, Vec<SingletonLock>), StartupError> {
 
     // 单实例：缓存目录与网盘中转都假定只有一个进程，第二个实例必须在绑定端口前退出。
     let lock = acquire_singleton(&config)?;
+
+    // 账户库：`UserStore::open` 是同步的（建目录、开 WAL、建表），只应在启动期调用，
+    // 所以放在 tokio runtime 之前的阻塞阶段；失败即退出，绝不带病运行。
+    let accounts = UserStore::open(&config.accounts.db)?;
 
     let data_dir = config
         .data_dir
@@ -76,26 +90,30 @@ fn bootstrap() -> Result<(Config, Vec<SingletonLock>), StartupError> {
         cache_max_bytes = config.cache.max_bytes,
         data_dir = %data_dir,
         auth_users = config.auth.users.len(),
+        accounts_db = %accounts.path().display(),
+        registration = %config.accounts.registration,
+        default_role = %config.accounts.default_role,
         "配置加载完成"
     );
     // 逐个打印用户与角色，便于核对权限配置；口令哈希不入日志。
     for (name, user) in &config.auth.users {
         tracing::debug!(user = %name, role = %user.role, "加载 LFS 用户凭据");
     }
-    Ok((config, lock))
+    Ok(Startup { config, accounts, _lock: lock })
 }
 
 /// 建立 tokio 多线程 runtime 并运行服务。
-fn serve(config: Config) -> Result<(), StartupError> {
+fn serve(startup: Startup) -> Result<(), StartupError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("netdisk-lfs")
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    runtime.block_on(run(config))
+    runtime.block_on(run(startup))
 }
 
-async fn run(config: Config) -> Result<(), StartupError> {
+async fn run(startup: Startup) -> Result<(), StartupError> {
+    let Startup { config, accounts, _lock } = startup;
     let addr = config.server.listen;
 
     // 构造后端不触发任何子进程：`bdpan` 只在第一次真实读写时才被调用，
@@ -130,15 +148,17 @@ async fn run(config: Config) -> Result<(), StartupError> {
         "bdpan 探活已启用：/healthz 会按 TTL 复用 whoami 结论"
     );
 
-    let state =
-        AppState::with_cache(store, Arc::new(config), cache).with_bdpan_probe(Arc::new(probe));
+    let state = AppState::with_cache(store, Arc::new(config), cache)
+        .with_account_store(Arc::new(accounts))
+        .with_bdpan_probe(Arc::new(probe));
 
     let listener =
         TcpListener::bind(addr).await.map_err(|source| StartupError::Bind { addr, source })?;
     let bound = listener.local_addr().unwrap_or(addr);
     info!(address = %bound, "开始监听");
 
-    axum::serve(listener, router(state))
+    // 带 ConnectInfo：注册限速要按来源地址计数，不信任 X-Forwarded-For 时只能靠它。
+    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(StartupError::Serve)?;
@@ -271,6 +291,8 @@ fn acquire_lock(dir: &Path, name: &str) -> Result<SingletonLock, StartupError> {
 enum StartupError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Accounts(#[from] AccountError),
     #[error("初始化 tracing 日志失败")]
     Logging(#[from] tracing_subscriber::util::TryInitError),
     #[error("构建 tokio 运行时失败")]

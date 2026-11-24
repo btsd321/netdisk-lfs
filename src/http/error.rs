@@ -2,8 +2,8 @@
 //!
 //! 契约见 `specs/api.md`「公共约定」「状态码约定」：错误体恒为
 //! `{"message":"...","request_id":"..."}`，`Content-Type` 为
-//! `application/vnd.git-lfs+json`；401 额外带
-//! `LFS-Authenticate: Basic realm="netdisk-lfs"`。request id 与响应头保持同值，
+//! `application/vnd.git-lfs+json`；401 额外带 `LFS-Authenticate` 与标准
+//! `WWW-Authenticate`（浏览器靠后者弹 Basic 登录框）。request id 与响应头保持同值，
 //! 便于客户端报障时直接对日志。
 
 use axum::body::Body;
@@ -16,8 +16,10 @@ use thiserror::Error;
 use super::{LFS_MEDIA_TYPE, REQUEST_ID_HEADER, RequestId};
 use crate::store::StoreError;
 
-/// 401 的认证挑战头；头名与取值由 `specs/api.md` 固定。
+/// 401 的认证挑战头；头名与取值由 `specs/api.md` 固定（git-lfs 客户端只认它）。
 const AUTHENTICATE_HEADER: &str = "lfs-authenticate";
+/// 标准认证挑战头：浏览器只认 `WWW-Authenticate` 才会弹 Basic 登录框，
+/// `/admin` 这类网页端点依赖它；与 `lfs-authenticate` 同时下发，互不冲突。
 const AUTHENTICATE_CHALLENGE: &str = "Basic realm=\"netdisk-lfs\"";
 
 /// LFS 错误体。
@@ -46,6 +48,15 @@ pub enum ApiError {
     /// 404：对象不存在。
     #[error("{0}")]
     NotFound(String),
+    /// 409：与现有状态冲突（用户名已被占用、删除最后一个管理员等）。
+    #[error("{0}")]
+    Conflict(String),
+    /// 415：请求体的媒体类型不受支持（管理端点只接受 JSON 或表单）。
+    ///
+    /// 单独一个状态码而不是 400：客户端要能区分「格式对但类型不对」，
+    /// 这也正是挡住 `text/plain` 绕 CORS 预检的关卡。
+    #[error("{0}")]
+    UnsupportedMediaType(String),
     /// 416：`Range` 语法合法但起点越界（RFC 9110 §15.5.17）。
     ///
     /// `api.md` 的状态码表没有 416（它只约束「单区间 206 / 多区间 200」），但把越界
@@ -62,6 +73,14 @@ pub enum ApiError {
     /// 502：`bdpan` 调用失败。
     #[error("{0}")]
     BadGateway(String),
+    /// 429：登录失败或注册请求过于频繁（进程内限速）。
+    #[error("{message}")]
+    TooManyRequests {
+        /// 面向客户端的说明。
+        message: String,
+        /// 建议的重试间隔（秒），写进 `Retry-After` 响应头。
+        retry_after_secs: u64,
+    },
     /// 503：网盘不可用或 token 失效。
     #[error("{0}")]
     Unavailable(String),
@@ -78,8 +97,11 @@ impl ApiError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -93,10 +115,13 @@ impl ApiError {
             | Self::Unauthorized(message)
             | Self::Forbidden(message)
             | Self::NotFound(message)
+            | Self::Conflict(message)
+            | Self::UnsupportedMediaType(message)
             | Self::Unprocessable(message)
             | Self::BadGateway(message)
             | Self::Unavailable(message)
             | Self::Internal(message) => message,
+            Self::TooManyRequests { message, .. } => message,
             // 具体字节数只在日志/Display 里给出，回给客户端的 message 保持简短。
             Self::RangeNotSatisfiable { .. } => "Range 越界：请求起点超出对象大小",
         }
@@ -132,6 +157,16 @@ impl ApiError {
             Self::Unauthorized(_) => {
                 headers
                     .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+                headers.insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(AUTHENTICATE_CHALLENGE),
+                );
+            },
+            Self::TooManyRequests { retry_after_secs, .. } => {
+                // RFC 9110 §10.2.3：429 应告诉客户端多久后可以重试。
+                if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    headers.insert(header::RETRY_AFTER, value);
+                }
             },
             Self::RangeNotSatisfiable { total } => {
                 // RFC 9110：416 必须告诉客户端「当前表示有多大」，客户端据此重算区间。
@@ -151,6 +186,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         self.into_response_with(&RequestId::generate())
     }
+}
+
+/// 给响应补上 401 的认证挑战头。
+///
+/// 账户库故障（503）也要带它：客户端需要知道该用哪套凭据重试，而不是误以为
+/// 这个端点不需要认证。
+pub(crate) fn with_auth_challenge(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+    headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+    response
 }
 
 /// 存储层错误到 HTTP 状态码的映射（api.md「状态码约定」）。

@@ -1,0 +1,1306 @@
+//! 管理员账户管理端点的集成测试：JSON API、HTML 管理页与保护规则。
+//!
+//! 全部经 `tower::ServiceExt::oneshot` 直接打 `router(state)`，不绑定端口；账户库
+//! 落在每个用例自己的临时目录，对象存储用 [`FakeStore`]，绝不访问网盘、不起真实
+//! `bdpan`。
+//!
+//! Argon2 在 debug 构建里很慢（约几十到几百毫秒），因此：
+//!
+//! - 同一个测试二进制里同一条口令的 PHC 哈希只算一次（[`shared_hash`]）；
+//! - 只需要「库里有这一行」的用例（分页、HTML 表格、表单操作）直接写 SQL 造数据，
+//!   不付哈希成本；只有真的要登录的用例才建带真实哈希的账户。
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use http_body_util::BodyExt;
+use netdisk_lfs::{
+    AccountError, AccountsConfig, AppState, AuthConfig, CacheConfig, Config, FakeStore,
+    ObjectStore, Role, RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, UserConfig,
+    UserStatus, UserStore, hash_password, router,
+};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+const TEST_HOST: &str = "lfs.test";
+/// 默认口令：21 个字符，满足 12 位下限；也是 [`shared_hash`] 缓存的那一条。
+const PASSWORD: &str = "correct horse battery";
+/// 重置口令用例用的新口令（与默认口令不同，用来证明旧口令失效）。
+const NEW_PASSWORD: &str = "another correct horse";
+/// 第三个口令：管理员重置自己口令时用。
+const OTHER_PASSWORD: &str = "yet another passphrase";
+const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
+const FORM: &str = "application/x-www-form-urlencoded";
+/// 只用于「直接写库造行」的占位 PHC 串：不会被任何用例拿去校验。
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// 每个用例一个临时目录；Drop 时连同 SQLite 的 `-wal` / `-shm` 一起删除。
+struct Workspace {
+    path: PathBuf,
+}
+
+impl Workspace {
+    fn new() -> Self {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("netdisk-lfs-accounts-admin-{}-{seq}", std::process::id()));
+        std::fs::create_dir(&path).expect("创建临时目录");
+        Self { path }
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 测试应用：router + 与 router 共享的账户库句柄 + 账户库路径（用来直接造行）。
+struct TestApp {
+    router: Router,
+    /// `None` 表示没有接入账户库（验证 503 行为）。
+    store: Option<Arc<UserStore>>,
+    db: PathBuf,
+    /// 临时目录必须比账户库活得久。
+    _workspace: Workspace,
+}
+
+impl TestApp {
+    /// 默认配置（approval 策略、无 config 用户、默认限速），带账户库。
+    fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    /// 在默认配置上做修改；`tweak` 在打开账户库之后、装配 router 之前执行。
+    fn with(tweak: impl FnOnce(&mut Config)) -> Self {
+        let workspace = Workspace::new();
+        let db = workspace.path.join("accounts.db");
+        let store = Arc::new(UserStore::open(&db).expect("账户库应能打开"));
+        let mut config = base_config(db.clone());
+        tweak(&mut config);
+        let backend: Arc<dyn ObjectStore> = Arc::new(FakeStore::new());
+        let state = AppState::with_accounts(backend, Arc::new(config), Arc::clone(&store));
+        Self { router: router(state), store: Some(store), db, _workspace: workspace }
+    }
+
+    /// 没有接入账户库的实例：配置里有一个**管理员**用户，用来验证「认证与角色都通过、
+    /// 但端点仍 503」。
+    fn without_accounts() -> Self {
+        let workspace = Workspace::new();
+        let db = workspace.path.join("accounts.db");
+        let mut config = base_config(db.clone());
+        add_config_user(&mut config, "cfgadmin", PASSWORD, Role::Admin);
+        let backend: Arc<dyn ObjectStore> = Arc::new(FakeStore::new());
+        let state = AppState::new(backend, Arc::new(config));
+        Self { router: router(state), store: None, db, _workspace: workspace }
+    }
+
+    fn store(&self) -> &Arc<UserStore> {
+        self.store.as_ref().expect("本用例应接入账户库")
+    }
+
+    /// 直接在库里建一个账户（哈希真实口令，便于随后用它登录）。
+    async fn create_user(&self, name: &str, password: &str, role: Role, status: UserStatus) {
+        self.store()
+            .create(name, &shared_hash(password), role, status)
+            .await
+            .unwrap_or_else(|error| panic!("创建 {name} 失败：{error}"));
+    }
+
+    /// 直接写库造一行：不走 Argon2，用于分页数量、HTML 表格与「恶意用户名」等场景。
+    fn seed(&self, username: &str, role: &str, status: &str) {
+        let conn = rusqlite::Connection::open(&self.db).expect("直连账户库");
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, status, created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, NULL)",
+            rusqlite::params![username, DUMMY_HASH, role, status],
+        )
+        .unwrap_or_else(|error| panic!("插入种子账户 {username} 失败：{error}"));
+    }
+
+    /// 批量造 `count` 个 readwrite/active 账户（`seed000`、`seed001`…）。
+    fn seed_many(&self, count: usize) {
+        let conn = rusqlite::Connection::open(&self.db).expect("直连账户库");
+        for index in 0..count {
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, status, created_at, updated_at, last_login_at)
+                 VALUES (?1, ?2, 'readwrite', 'active', 0, 0, NULL)",
+                rusqlite::params![format!("seed{index:03}"), DUMMY_HASH],
+            )
+            .expect("批量插入种子账户");
+        }
+    }
+
+    async fn send(&self, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let response = self.router.clone().oneshot(request).await.expect("router 应处理请求");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.expect("读取响应体").to_bytes().to_vec();
+        (status, headers, body)
+    }
+
+    async fn send_json(&self, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+        let (status, headers, body) = self.send(request).await;
+        let value = serde_json::from_slice(&body)
+            .unwrap_or_else(|error| panic!("响应体应是 JSON（{error}）：{body:?}"));
+        (status, headers, value)
+    }
+}
+
+/// 同一条口令在整个测试二进制里只做一次 Argon2 哈希。
+fn shared_hash(password: &str) -> String {
+    static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+    if password == PASSWORD {
+        return PASSWORD_HASH.get_or_init(|| hash_password(PASSWORD).expect("哈希应成功")).clone();
+    }
+    hash_password(password).expect("哈希应成功")
+}
+
+fn base_config(db: PathBuf) -> Config {
+    Config {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".parse().expect("合法监听地址"),
+            public_base: String::new(),
+        },
+        storage: StorageConfig {
+            objects_root: "/apps/bdpan/lfs".to_owned(),
+            tmp_root: "/apps/bdpan/lfs/tmp".to_owned(),
+            bdpan_bin: "/bin/true".into(),
+            max_object_bytes: 0,
+            max_bdpan_procs: 1,
+            bdpan_timeout_secs: 300,
+            bdpan_min_throughput_bytes_per_sec: 102_400,
+        },
+        cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
+        accounts: AccountsConfig { db, ..AccountsConfig::default() },
+        auth: AuthConfig { users: std::collections::BTreeMap::new() },
+        runtime_env: RuntimeEnv::Dev,
+        data_dir: None,
+    }
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    let mut writer = Sha256Writer::new();
+    writer.update(input);
+    writer.finish()
+}
+
+fn add_config_user(config: &mut Config, name: &str, password: &str, role: Role) {
+    config.auth.users.insert(
+        name.to_owned(),
+        UserConfig { password_sha256: sha256_hex(password.as_bytes()), role },
+    );
+}
+
+fn basic_header(username: &str, password: &str) -> String {
+    format!("Basic {}", BASE64.encode(format!("{username}:{password}")))
+}
+
+fn request(
+    method: Method,
+    uri: &str,
+    auth: Option<&str>,
+    accept: Option<&str>,
+    content_type: Option<&str>,
+    body: String,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri).header(header::HOST, TEST_HOST);
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    if let Some(accept) = accept {
+        builder = builder.header(header::ACCEPT, accept);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from(body)).expect("构造请求")
+}
+
+/// JSON API 请求（可选请求体）。
+fn api(
+    method: Method,
+    uri: &str,
+    username: &str,
+    password: &str,
+    body: Option<&Value>,
+) -> Request<Body> {
+    let (content_type, body) = match body {
+        Some(value) => (Some("application/json"), value.to_string()),
+        None => (None, String::new()),
+    };
+    request(method, uri, Some(&basic_header(username, password)), None, content_type, body)
+}
+
+/// 带任意附加头的请求：跨站/同站判定与媒体类型用例用。
+fn request_extra(
+    method: Method,
+    uri: &str,
+    username: &str,
+    password: &str,
+    extra: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, TEST_HOST)
+        .header(header::AUTHORIZATION, basic_header(username, password));
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from(body.to_owned())).expect("构造请求")
+}
+
+/// 管理页的表单 POST（浏览器会带 `Accept: text/html`）。
+fn form_post(uri: &str, username: &str, password: &str, body: &str) -> Request<Body> {
+    request(
+        Method::POST,
+        uri,
+        Some(&basic_header(username, password)),
+        Some("text/html"),
+        Some(FORM),
+        body.to_owned(),
+    )
+}
+
+/// 浏览器打开管理页的 GET。
+fn page_get(uri: &str, username: &str, password: &str) -> Request<Body> {
+    request(
+        Method::GET,
+        uri,
+        Some(&basic_header(username, password)),
+        Some("text/html,application/xhtml+xml"),
+        None,
+        String::new(),
+    )
+}
+
+fn content_type(headers: &HeaderMap) -> &str {
+    headers.get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("")
+}
+
+fn location(headers: &HeaderMap) -> &str {
+    headers.get(header::LOCATION).and_then(|value| value.to_str().ok()).unwrap_or("")
+}
+
+fn body_text(body: Vec<u8>) -> String {
+    String::from_utf8(body).expect("HTML 响应应是 UTF-8")
+}
+
+/// 断言错误体符合既有契约：`{message, request_id}`。
+fn assert_error_contract(headers: &HeaderMap, body: &Value) {
+    assert_eq!(content_type(headers), LFS_MEDIA_TYPE);
+    assert!(
+        body["message"].as_str().is_some_and(|message| !message.is_empty()),
+        "错误体必须带非空 message：{body}"
+    );
+    assert!(body["request_id"].as_str().is_some_and(|id| !id.is_empty()));
+}
+
+/// 断言 HTML 错误页：状态码一致、媒体类型是 HTML、带 request id 与回管理页的链接。
+fn assert_html_error(status: StatusCode, headers: &HeaderMap, body: &str) {
+    assert!(content_type(headers).starts_with("text/html"), "实际：{}", content_type(headers));
+    assert!(body.contains("<!doctype html>"), "应是完整页面：{body}");
+    assert!(body.contains("请求 id："), "错误页应带 request id：{body}");
+    assert!(body.contains(r#"href="/admin""#), "错误页应能回到管理页：{body}");
+    assert!(!body.contains("<script"), "管理页不得含脚本：{body}");
+    assert!(status.is_client_error(), "错误页状态码应是 4xx，实际 {status}");
+}
+
+// ---------------------------------------------------------------------------
+// 权限与账户库缺失
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_non_admin_when_admin_endpoints_then_403_json_or_html_page() {
+    let app = TestApp::new();
+    app.create_user("bob", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users", "bob", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("管理员")),
+        "应说明需要管理员权限：{body}"
+    );
+
+    // 浏览器（Accept: text/html）拿到 403 页而不是 JSON。
+    let (status, headers, body) = app.send(page_get("/admin", "bob", PASSWORD)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let body = body_text(body);
+    assert!(content_type(&headers).starts_with("text/html"), "实际：{}", content_type(&headers));
+    assert!(body.contains("禁止访问"), "应是 403 页：{body}");
+    assert!(!body.contains("<script"), "页面不得含脚本：{body}");
+
+    // 未认证仍然是 401：认证先于角色判定。
+    let anonymous = request(Method::GET, "/admin/users", None, None, None, String::new());
+    let (status, _, _) = app.send_json(anonymous).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_cross_site_write_when_admin_endpoint_then_403() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+    let payload = json!({ "username": "someone", "password": PASSWORD, "role": "readwrite" });
+
+    // 恶意页面提交的表单会带跨站 Origin。
+    let (status, headers, body) = app
+        .send_json(request_extra(
+            Method::POST,
+            "/admin/users",
+            "root",
+            PASSWORD,
+            &[("origin", "https://evil.example")],
+            Some("application/json"),
+            &payload.to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("跨站")),
+        "应明确拒绝跨站写请求：{body}"
+    );
+
+    // 现代浏览器还会带 Sec-Fetch-Site；cross-site 同样拒绝。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "cross-site")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(app.store().get("victim").await.expect("查询").is_some(), "跨站请求不得产生副作用");
+
+    // 同站（管理页自己的表单）放行。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "same-origin")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // 读请求不受同站校验限制（跨站也读不到响应体，没有 CORS 头）。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::GET,
+            "/admin",
+            "root",
+            PASSWORD,
+            &[("sec-fetch-site", "cross-site")],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn given_same_host_origin_when_admin_write_then_allowed() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+
+    // Origin 与 Host 同主机名即可：scheme 与端口不参与比较（反代可能换端口/加 TLS）。
+    let (status, _, _) = app
+        .send(request_extra(
+            Method::DELETE,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[("origin", "https://lfs.test:8443")],
+            None,
+            "",
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "同主机名的 Origin 不应被拒");
+    assert_eq!(app.store().get("victim").await.expect("查询"), None);
+}
+
+#[tokio::test]
+async fn given_wrong_content_type_when_admin_write_then_415() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+
+    // text/plain 的 JSON 体不触发 CORS 预检，必须在媒体类型上拒掉。
+    let payload = json!({ "username": "someone", "password": PASSWORD, "role": "readwrite" });
+    let (status, headers, body) = app
+        .send_json(request_extra(
+            Method::POST,
+            "/admin/users",
+            "root",
+            PASSWORD,
+            &[],
+            Some("text/plain"),
+            &payload.to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("application/json")),
+        "应说明期望的媒体类型：{body}"
+    );
+
+    // 缺 Content-Type 的 JSON 写请求同样拒绝。
+    let (status, _, _) = app
+        .send_json(request_extra(
+            Method::PATCH,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[],
+            None,
+            "",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // 表单端点收到 JSON 也是 415（错误页按 Accept 分流）。
+    let (status, headers, body) = app
+        .send(request_extra(
+            Method::POST,
+            "/admin/users/victim/delete",
+            "root",
+            PASSWORD,
+            &[("accept", "text/html")],
+            Some("application/json"),
+            r#"{"confirm":"yes"}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_html_error(status, &headers, &body_text(body));
+    assert!(app.store().get("victim").await.expect("查询").is_some(), "被拒请求不得删账户");
+
+    // 带 charset 的 JSON 仍接受（媒体类型部分一致即可）。
+    let (status, _, body) = app
+        .send_json(request_extra(
+            Method::PATCH,
+            "/admin/users/victim",
+            "root",
+            PASSWORD,
+            &[],
+            Some("application/json; charset=utf-8"),
+            &json!({ "role": "readonly" }).to_string(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "readonly");
+}
+
+#[tokio::test]
+async fn given_unauthenticated_when_admin_endpoints_then_login_redirect_or_challenge() {
+    let app = TestApp::new();
+
+    // 浏览器（`Accept: text/html`）访问页面：登录页上线后 303 回登录页并带上原地址，
+    // 不再依赖 Basic 弹框——弹框既不能退出，也给不了普通用户落地页。
+    let (status, headers, _) = app
+        .send(request(Method::GET, "/admin", None, Some("text/html"), None, String::new()))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/?next=%2Fadmin");
+
+    // 不带 `Accept: text/html` 的客户端（脚本、git-lfs）仍是 401，且两个挑战头都在：
+    // `WWW-Authenticate` 是标准契约，`lfs-authenticate` 是 git-lfs 客户端的契约。
+    let (status, headers, _) =
+        app.send(request(Method::GET, "/admin", None, None, None, String::new())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"netdisk-lfs\""),
+        "401 必须带标准认证挑战头"
+    );
+    assert_eq!(
+        headers.get("lfs-authenticate").and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"netdisk-lfs\""),
+        "git-lfs 客户端仍依赖 lfs-authenticate"
+    );
+
+    // JSON 端点同样两个头都带。
+    let (status, headers, _) =
+        app.send_json(api(Method::GET, "/admin/users", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.get(header::WWW_AUTHENTICATE).is_some());
+    assert!(headers.get("lfs-authenticate").is_some());
+}
+
+#[tokio::test]
+async fn given_no_account_store_when_admin_endpoints_then_503() {
+    let app = TestApp::without_accounts();
+
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users", "cfgadmin", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_contract(&headers, &body);
+
+    let (status, headers, body) = app.send(page_get("/admin", "cfgadmin", PASSWORD)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(content_type(&headers).starts_with("text/html"));
+    let body = body_text(body);
+    assert!(body.contains("账户库未启用"), "应说明原因，而不是空表格");
+    // 「没配账户库」是部署问题，不能写成「请稍后重试」——那样运维会一直等下去。
+    assert!(body.contains("管理页未启用"), "未接入账户库要给出对应的标题：{body}");
+    assert!(!body.contains("暂时不可用"), "未接入不是临时故障：{body}");
+}
+
+#[tokio::test]
+async fn given_corrupt_row_when_admin_reads_then_503_says_temporarily_unavailable() {
+    // 直接写一行 role 非法的记录：账户库「已接入但读不出来」，不是「没配账户库」。
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("broken", "wizard", "active");
+
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_contract(&headers, &body);
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("暂时不可用"), "应提示可重试：{body}");
+    assert!(!message.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
+
+    let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(body);
+    assert!(body.contains("管理页暂时不可用"), "故障页要说「暂时」，并提示可重试：{body}");
+    assert!(body.contains("请稍后重试"));
+    assert!(!body.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
+}
+
+// ---------------------------------------------------------------------------
+// 列表
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_accounts_when_list_then_total_status_filter_and_paging() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("alice", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+    app.create_user("bob", PASSWORD, Role::Readwrite, UserStatus::Pending).await;
+    app.create_user("carol", PASSWORD, Role::Readonly, UserStatus::Disabled).await;
+
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type(&headers), "application/json");
+    assert_eq!(body["total"], 4);
+    let users = body["users"].as_array().expect("users 应是数组");
+    assert_eq!(users.len(), 4);
+    assert_eq!(users[0]["username"], "root");
+    assert_eq!(users[0]["role"], "admin");
+    assert_eq!(users[0]["status"], "active");
+    assert!(users[0]["created_at"].as_i64().is_some_and(|created| created > 0));
+    assert!(users[0]["last_login_at"].as_i64().is_some_and(|login| login > 0));
+    assert!(users[0].get("password_hash").is_none(), "不回显口令哈希");
+    assert!(users[0].get("password").is_none(), "不回显口令");
+
+    let (status, _, filtered) = app
+        .send_json(api(Method::GET, "/admin/users?status=pending", "root", PASSWORD, None))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(filtered["total"], 1, "total 是过滤后的总数");
+    assert_eq!(filtered["users"][0]["username"], "bob");
+
+    // 分页：total 与当页条数解耦；offset 按账户库 id 顺序跳过。
+    let (status, _, paged) = app
+        .send_json(api(Method::GET, "/admin/users?limit=1&offset=1", "root", PASSWORD, None))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(paged["total"], 4);
+    assert_eq!(paged["users"].as_array().map(Vec::len), Some(1));
+    assert_eq!(paged["users"][0]["username"], "alice");
+
+    // 非法过滤/分页参数是 400，不是「静默忽略」。
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users?status=bogus", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error_contract(&headers, &body);
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/admin/users?limit=abc", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_many_accounts_when_list_then_limit_capped_and_default_page_size() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed_many(104);
+
+    // 单页上限 100：请求再大也只回 100 条，total 仍是全量。
+    let (status, _, body) =
+        app.send_json(api(Method::GET, "/admin/users?limit=1000", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 105);
+    assert_eq!(body["users"].as_array().map(Vec::len), Some(100), "limit 上限应是 100");
+
+    // 不传 limit 与 limit=0 都按 50 处理。
+    for uri in ["/admin/users", "/admin/users?limit=0"] {
+        let (status, _, body) = app.send_json(api(Method::GET, uri, "root", PASSWORD, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 105);
+        assert_eq!(body["users"].as_array().map(Vec::len), Some(50), "{uri} 应默认 50 条");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 创建
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_admin_create_when_valid_then_201_and_can_login() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    let payload = json!({ "username": "newadmin", "password": PASSWORD, "role": "admin" });
+    let (status, headers, body) =
+        app.send_json(api(Method::POST, "/admin/users", "root", PASSWORD, Some(&payload))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(content_type(&headers), "application/json");
+    assert_eq!(body["username"], "newadmin");
+    assert_eq!(body["role"], "admin", "管理员可以创建管理员");
+    assert_eq!(body["status"], "active", "status 缺省是 active");
+    assert!(body["created_at"].as_i64().is_some_and(|created| created > 0));
+    assert_eq!(body["last_login_at"], Value::Null);
+
+    // 新管理员立刻可用：能过认证、能进管理端点。
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/admin/users", "newadmin", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 重名 409。
+    let (status, headers, body) =
+        app.send_json(api(Method::POST, "/admin/users", "root", PASSWORD, Some(&payload))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error_contract(&headers, &body);
+
+    // 弱口令 400（在哈希之前就拒）。
+    let weak = json!({ "username": "weakling", "password": "short", "role": "readwrite" });
+    let (status, headers, body) =
+        app.send_json(api(Method::POST, "/admin/users", "root", PASSWORD, Some(&weak))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error_contract(&headers, &body);
+
+    // 非法角色 / 非法用户名 / 非法状态都是 400。
+    for payload in [
+        json!({ "username": "someone", "password": PASSWORD, "role": "superuser" }),
+        json!({ "username": "a:b", "password": PASSWORD, "role": "readwrite" }),
+        json!({ "username": "someone", "password": PASSWORD, "role": "readwrite", "status": "gone" }),
+        json!({ "username": "someone", "password": PASSWORD, "role": "readwrite", "extra": 1 }),
+    ] {
+        let (status, headers, body) = app
+            .send_json(api(Method::POST, "/admin/users", "root", PASSWORD, Some(&payload)))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "载荷 {payload} 应被拒");
+        assert_error_contract(&headers, &body);
+    }
+    assert_eq!(app.store().get("weakling").await.expect("查询"), None, "被拒的请求不得建账户");
+}
+
+// ---------------------------------------------------------------------------
+// 修改
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_pending_account_when_patched_active_then_login_works() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    let created = json!({ "username": "pat", "password": PASSWORD, "role": "readwrite", "status": "pending" });
+    let (status, _, _) =
+        app.send_json(api(Method::POST, "/admin/users", "root", PASSWORD, Some(&created))).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "pat", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "待审批账户不能登录");
+
+    let (status, _, body) = app
+        .send_json(api(
+            Method::PATCH,
+            "/admin/users/pat",
+            "root",
+            PASSWORD,
+            Some(&json!({ "status": "active" })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "active");
+
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "pat", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK, "审批通过后即可登录");
+}
+
+#[tokio::test]
+async fn given_only_admin_when_patch_self_then_409() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 改自己先被拒（最后一个管理员的事务保护在 store 层单独覆盖）。
+    for payload in [json!({ "role": "readwrite" }), json!({ "status": "disabled" })] {
+        let (status, headers, body) = app
+            .send_json(api(Method::PATCH, "/admin/users/root", "root", PASSWORD, Some(&payload)))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "载荷 {payload} 必须被拒");
+        assert_error_contract(&headers, &body);
+        assert!(
+            body["message"].as_str().is_some_and(|message| message.contains("自己")),
+            "应说明不能改自己：{body}"
+        );
+    }
+    // 状态与角色都没变：拒绝不产生副作用。
+    let stored = app.store().get("root").await.expect("查询").expect("账户存在");
+    assert_eq!(stored.role, Role::Admin);
+    assert_eq!(stored.status, UserStatus::Active);
+
+    // 空补丁与不存在的用户。
+    let (status, _, _) = app
+        .send_json(api(Method::PATCH, "/admin/users/root", "root", PASSWORD, Some(&json!({}))))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = app
+        .send_json(api(
+            Method::PATCH,
+            "/admin/users/nobody",
+            "root",
+            PASSWORD,
+            Some(&json!({ "status": "active" })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_role_and_status_together_when_patch_then_both_applied_in_one_update() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("dual", "readwrite", "active");
+
+    let (status, _, body) = app
+        .send_json(api(
+            Method::PATCH,
+            "/admin/users/dual",
+            "root",
+            PASSWORD,
+            Some(&json!({ "role": "readonly", "status": "disabled" })),
+        ))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "readonly");
+    assert_eq!(body["status"], "disabled", "role 与 status 应在同一次写入里生效");
+    let stored = app.store().get("dual").await.expect("查询").expect("账户存在");
+    assert_eq!(stored.role, Role::Readonly);
+    assert_eq!(stored.status, UserStatus::Disabled);
+}
+
+#[tokio::test]
+async fn given_guarded_profile_update_when_last_admin_then_last_admin_error() {
+    let app = TestApp::new();
+    app.create_user("solo", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 数据库里只剩一个 active 管理员、配置也没有兜底：必须拒绝。
+    let error = app
+        .store()
+        .update_profile_guarded("solo", Some(Role::Readwrite), None, 0)
+        .await
+        .expect_err("最后一个管理员不能降级");
+    assert!(matches!(error, AccountError::LastAdmin { .. }), "实际错误：{error}");
+
+    // 配置里有**不同名**的管理员时，数据库之外还有兜底，允许降级。
+    let updated = app
+        .store()
+        .update_profile_guarded("solo", Some(Role::Readwrite), None, 1)
+        .await
+        .expect("有配置兜底管理员时应允许");
+    assert_eq!(updated.role, Role::Readwrite);
+    assert_eq!(updated.status, UserStatus::Active, "同一次 UPDATE 不应改动状态");
+}
+
+#[tokio::test]
+async fn given_guarded_delete_when_last_admin_then_last_admin_error() {
+    let app = TestApp::new();
+    app.create_user("solo", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    let error = app.store().delete_guarded("solo", 0).await.expect_err("最后一个管理员不能删除");
+    assert!(matches!(error, AccountError::LastAdmin { .. }), "实际错误：{error}");
+    assert!(app.store().get("solo").await.expect("查询").is_some(), "被拒时不得删行");
+
+    app.store().delete_guarded("solo", 1).await.expect("有配置兜底管理员时应允许");
+    assert_eq!(app.store().get("solo").await.expect("查询"), None);
+}
+
+#[tokio::test]
+async fn given_two_admins_when_concurrent_guarded_updates_then_only_one_succeeds() {
+    let app = TestApp::new();
+    app.create_user("alice", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("bob", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 并发互降：都从「还有两个管理员」出发，但事务要求第二次看到的是已提交的状态。
+    let first = tokio::spawn({
+        let store = Arc::clone(app.store());
+        async move { store.update_profile_guarded("bob", Some(Role::Readwrite), None, 0).await }
+    });
+    let second = tokio::spawn({
+        let store = Arc::clone(app.store());
+        async move { store.update_profile_guarded("alice", Some(Role::Readwrite), None, 0).await }
+    });
+    let (first, second) = tokio::join!(first, second);
+    let results = [first.expect("任务不应 panic"), second.expect("任务不应 panic")];
+
+    let succeeded = results.iter().filter(|result| result.is_ok()).count();
+    let rejected = results
+        .iter()
+        .filter(|result| matches!(result, Err(AccountError::LastAdmin { .. })))
+        .count();
+    assert_eq!(succeeded, 1, "只能有一个降级成功：{results:?}");
+    assert_eq!(rejected, 1, "另一个必须被「最后一个管理员」拒绝：{results:?}");
+    assert_eq!(app.store().count_active_admins().await.expect("统计"), 1, "至少留一个管理员");
+}
+
+#[tokio::test]
+async fn given_two_admins_when_patch_self_then_409_but_other_admin_demotable() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("helper", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 改自己：即使还有别的管理员也不允许。
+    for payload in [json!({ "role": "readwrite" }), json!({ "status": "disabled" })] {
+        let (status, headers, body) = app
+            .send_json(api(Method::PATCH, "/admin/users/root", "root", PASSWORD, Some(&payload)))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "载荷 {payload} 必须被拒");
+        assert_error_contract(&headers, &body);
+        assert!(
+            body["message"].as_str().is_some_and(|message| message.contains("自己")),
+            "应说明不能改自己：{body}"
+        );
+    }
+
+    // 降级另一个管理员：允许（还剩 root 一个管理员）。
+    let (status, _, body) = app
+        .send_json(api(
+            Method::PATCH,
+            "/admin/users/helper",
+            "root",
+            PASSWORD,
+            Some(&json!({ "role": "readwrite" })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "readwrite");
+
+    // 降级立即生效：helper 不再能进管理端点。
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/admin/users", "helper", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn given_two_admins_when_concurrent_patch_demotions_then_one_admin_kept() {
+    let app = TestApp::new();
+    app.create_user("alice", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("bob", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    // 两人同时把对方降级：认证可能都发生在任何一次写入之前，所以第二个请求既可能
+    // 撞上「最后一个管理员」409，也可能因为已被降级而在认证/授权处 403。
+    let demote = |actor: &'static str, target: &'static str| {
+        let router = app.router.clone();
+        async move {
+            let request = api(
+                Method::PATCH,
+                &format!("/admin/users/{target}"),
+                actor,
+                PASSWORD,
+                Some(&json!({ "role": "readwrite" })),
+            );
+            router.oneshot(request).await.expect("router 应处理请求").status()
+        }
+    };
+    let (first, second) = tokio::join!(demote("alice", "bob"), demote("bob", "alice"));
+
+    let succeeded = [first, second].iter().filter(|status| **status == StatusCode::OK).count();
+    assert_eq!(succeeded, 1, "并发互降只能成功一个：{first} / {second}");
+    assert!(
+        matches!([first, second], [a, b] if a == StatusCode::CONFLICT || b == StatusCode::CONFLICT
+            || a == StatusCode::FORBIDDEN || b == StatusCode::FORBIDDEN),
+        "失败的一方应是 409 或 403：{first} / {second}"
+    );
+    assert!(
+        app.store().count_active_admins().await.expect("统计") >= 1,
+        "任何时刻都必须至少剩一个 active 管理员"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 删除
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_only_admin_when_delete_self_then_409() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    let (status, headers, body) =
+        app.send_json(api(Method::DELETE, "/admin/users/root", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("自己")),
+        "删除自己要先被拒（最后一个管理员的保护在下面单独覆盖）：{body}"
+    );
+    assert!(app.store().get("root").await.expect("查询").is_some(), "账户仍应在库中");
+}
+
+#[tokio::test]
+async fn given_two_admins_when_delete_self_then_409() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("helper", PASSWORD, Role::Admin, UserStatus::Active).await;
+
+    let (status, headers, body) =
+        app.send_json(api(Method::DELETE, "/admin/users/root", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("自己")),
+        "应说明不能删自己：{body}"
+    );
+}
+
+#[tokio::test]
+async fn given_target_account_when_deleted_then_204_and_login_rejected() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("dora", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+    assert_eq!(
+        app.send_json(api(Method::GET, "/account/me", "dora", PASSWORD, None)).await.0,
+        StatusCode::OK,
+        "删除前应能登录"
+    );
+
+    let (status, headers, body) =
+        app.send(api(Method::DELETE, "/admin/users/dora", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty(), "204 不应带响应体");
+    assert!(headers.get(header::CONTENT_TYPE).is_none(), "204 不带 Content-Type");
+
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "dora", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "删除后凭据立即失效");
+
+    let (status, _, _) =
+        app.send_json(api(Method::DELETE, "/admin/users/dora", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "重复删除是 404");
+}
+
+#[tokio::test]
+async fn given_config_same_name_when_delete_then_409() {
+    // 配置里有 legacy 的旧 sha256 口令；库里也有同名账户。
+    let app = TestApp::with(|config| add_config_user(config, "legacy", PASSWORD, Role::Readwrite));
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("legacy", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+
+    let (status, headers, body) =
+        app.send_json(api(Method::DELETE, "/admin/users/legacy", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error_contract(&headers, &body);
+    assert!(
+        body["message"].as_str().is_some_and(|message| message.contains("[auth.users]")),
+        "应提示先移除配置条目：{body}"
+    );
+    assert!(app.store().get("legacy").await.expect("查询").is_some(), "被拒时不得删行");
+}
+
+// ---------------------------------------------------------------------------
+// 重置口令
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_account_when_admin_resets_password_then_old_rejected_new_works() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.create_user("erin", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+
+    let payload = json!({ "password": NEW_PASSWORD });
+    let (status, headers, body) = app
+        .send(api(Method::POST, "/admin/users/erin/password", "root", PASSWORD, Some(&payload)))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty(), "204 不应带响应体");
+    assert!(headers.get(header::CONTENT_TYPE).is_none());
+
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "erin", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "旧口令必须失效");
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "erin", NEW_PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK, "新口令应可登录");
+
+    // 弱口令 400，且不改动现有哈希。
+    let before = app.store().password_hash("erin").await.expect("读哈希").expect("有哈希");
+    let (status, _, _) = app
+        .send_json(api(
+            Method::POST,
+            "/admin/users/erin/password",
+            "root",
+            PASSWORD,
+            Some(&json!({ "password": "short" })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let after = app.store().password_hash("erin").await.expect("读哈希").expect("有哈希");
+    assert_eq!(before, after, "被拒的重置不得改动哈希");
+
+    // 管理员可以重置自己的口令。
+    let (status, _, _) = app
+        .send(api(
+            Method::POST,
+            "/admin/users/root/password",
+            "root",
+            PASSWORD,
+            Some(&json!({ "password": OTHER_PASSWORD })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) =
+        app.send_json(api(Method::GET, "/account/me", "root", OTHER_PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::OK, "重置自己的口令后应能用新口令登录");
+}
+
+// ---------------------------------------------------------------------------
+// HTML 管理页
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_admin_page_when_get_then_table_with_escaped_username() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("pending-pal", "readwrite", "pending");
+    // 绕过 API 校验直接写库：模拟「有人手工改库」把恶意字符串塞进用户名。
+    // 页面必须照样转义——这正是 escape_html 存在的理由。
+    app.seed("<script>alert(1)</script>", "readwrite", "disabled");
+
+    let (status, headers, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type(&headers).starts_with("text/html"));
+    let body = body_text(body);
+    assert!(body.contains("账户管理"));
+    assert!(body.contains("<table>"));
+    assert!(body.contains("pending-pal"));
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "用户名必须转义：{body}");
+    assert!(!body.contains("<script"), "页面不得出现脚本标签：{body}");
+
+    // 每行都有状态按钮、角色下拉、口令输入与带确认框的删除表单。
+    assert!(body.contains(r#"action="/admin/users/pending-pal/approve""#));
+    assert!(body.contains(r#"action="/admin/users/root/disable""#));
+    assert!(body.contains(r#"name="role""#), "角色下拉要在操作格里：{body}");
+    assert!(body.contains(r#"name="password""#));
+    assert!(body.contains(r#"action="/admin/users/root/delete""#));
+    assert!(body.contains(r#"name="confirm""#));
+
+    // 统计条：总数与三种状态各一个数字（root=active、pending-pal=pending、
+    // 手工写入的账户=disabled）。
+    assert!(body.contains(r#"aria-label="账户统计""#), "应有统计条：{body}");
+    for (count, label) in [("3", "总数"), ("1", "待审批"), ("1", "已启用"), ("1", "已禁用")]
+    {
+        assert!(
+            body.contains(&format!(r#"<span class="stat-n">{count}</span>"#)),
+            "统计条应给出 {label}={count}：{body}"
+        );
+        assert!(body.contains(&format!(r#"<span class="stat-k">{label}</span>"#)));
+    }
+    // 状态筛选页签：当前项用 aria-current 标出，链接保留 ?status=。
+    assert!(body.contains(r#"aria-label="按状态筛选""#), "应有筛选页签：{body}");
+    assert!(body.contains(r#"<a href="/admin" aria-current="page">全部</a>"#));
+
+    // 状态过滤：只显示待审批。
+    let (status, _, filtered) = app.send(page_get("/admin?status=pending", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let filtered = body_text(filtered);
+    assert!(filtered.contains("pending-pal"));
+    // 页头的账号 chip 会显示当前管理员自己的用户名，所以「没有 root 这一行」要按行内
+    // 操作表单的地址判断，不能按纯文本 `>root<` 判断。
+    assert!(!filtered.contains("/admin/users/root/"), "过滤后不应出现 active 账户：{filtered}");
+
+    // 无法识别的过滤值：忽略并转义回显，不 500。
+    let (status, _, unknown) =
+        app.send(page_get("/admin?status=%3Cscript%3E", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let unknown = body_text(unknown);
+    assert!(unknown.contains("无法识别的状态过滤"), "应提示过滤值无效：{unknown}");
+    assert!(unknown.contains("&lt;script&gt;"), "回显必须转义：{unknown}");
+}
+
+#[tokio::test]
+async fn given_many_accounts_when_admin_page_then_second_page_reachable() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed_many(105);
+
+    // 第一页：100 行（root + seed000..seed098），有「下一页」、没有「上一页」。
+    let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains("seed098"));
+    assert!(!body.contains("seed099"), "第 101 行不属于第一页：{body}");
+    assert!(body.contains(r#"href="/admin?offset=100""#), "应有下一页链接：{body}");
+    assert!(!body.contains("上一页"), "第一页不应有上一页：{body}");
+
+    // 第二页：剩下 6 行（seed099..seed104），有「上一页」、没有「下一页」。
+    let (status, _, body) = app.send(page_get("/admin?offset=100", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains("seed099"), "第二页应包含第 101 行：{body}");
+    assert!(body.contains("seed104"), "第二页应包含最后一行：{body}");
+    assert!(!body.contains("seed000"), "第一行不应出现在第二页：{body}");
+    assert!(body.contains("← 上一页"), "第二页应有上一页：{body}");
+    assert!(!body.contains("下一页"), "第二页已是最后一页：{body}");
+    // 翻页链接与表单都要带上当前偏移，操作完回到同一页。
+    assert!(body.contains(r#"name="offset" value="100""#), "表单应回传页码：{body}");
+
+    // 带状态过滤时，翻页链接保留 status。
+    let (status, _, body) = app.send(page_get("/admin?status=active", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body_text(body).contains(r#"href="/admin?status=active&offset=100""#));
+
+    let (status, _, body) =
+        app.send(page_get("/admin?status=active&offset=100", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains(r#"href="/admin?status=active""#), "上一页应保留过滤：{body}");
+    assert!(body.contains(r#"name="status" value="active""#), "表单应回传过滤：{body}");
+
+    // 表单提交后的 303 也回到同一页。
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/seed000/disable", "root", PASSWORD, "offset=100")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin?offset=100");
+
+    // 非法 offset 是 400 错误页，而不是静默回到第一页。
+    let (status, headers, body) = app.send(page_get("/admin?offset=abc", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_html_error(status, &headers, &body_text(body));
+}
+
+#[tokio::test]
+async fn given_admin_page_when_form_approve_role_and_missing_user_then_303_or_404() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("pat", "readwrite", "pending");
+
+    // 批准：带上页面里的隐藏过滤字段，成功后回到同一个过滤视图。
+    let (status, headers, body) =
+        app.send(form_post("/admin/users/pat/approve", "root", PASSWORD, "status=pending")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin?status=pending");
+    assert!(body.is_empty(), "303 不带响应体");
+    let stored = app.store().get("pat").await.expect("查询").expect("账户存在");
+    assert_eq!(stored.status, UserStatus::Active, "批准后状态应是 active");
+
+    // 角色切换表单。
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/pat/role", "root", PASSWORD, "role=readonly")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin");
+    assert_eq!(app.store().get("pat").await.expect("查询").expect("账户存在").role, Role::Readonly);
+
+    // 未知用户：404 页而不是 500。
+    let (status, headers, body) =
+        app.send(form_post("/admin/users/nobody/approve", "root", PASSWORD, "")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_html_error(status, &headers, &body_text(body));
+
+    // 非法角色：400 页。
+    let (status, headers, body) =
+        app.send(form_post("/admin/users/pat/role", "root", PASSWORD, "role=superuser")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_html_error(status, &headers, &body_text(body));
+}
+
+#[tokio::test]
+async fn given_admin_page_when_disable_and_enable_forms_then_303_and_state_flips() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("flip", "readwrite", "active");
+
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/flip/disable", "root", PASSWORD, "")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin");
+    assert_eq!(
+        app.store().get("flip").await.expect("查询").expect("账户存在").status,
+        UserStatus::Disabled
+    );
+
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/flip/enable", "root", PASSWORD, "status=disabled")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin?status=disabled");
+    assert_eq!(
+        app.store().get("flip").await.expect("查询").expect("账户存在").status,
+        UserStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn given_admin_page_when_password_and_delete_forms_then_303_and_effect() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("victim", "readwrite", "active");
+
+    // 重置口令表单：哈希被换掉（不在这里做登录，省一次 Argon2 校验）。
+    let before = app.store().password_hash("victim").await.expect("读哈希").expect("有哈希");
+    let body = format!("password={NEW_PASSWORD}");
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/victim/password-form", "root", PASSWORD, &body)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin");
+    let after = app.store().password_hash("victim").await.expect("读哈希").expect("有哈希");
+    assert_ne!(before, after, "重置后哈希应变化");
+
+    // 删除表单：没有勾选确认框时 400，勾选后 303 且行真的没了。
+    let (status, headers, error_body) =
+        app.send(form_post("/admin/users/victim/delete", "root", PASSWORD, "status=active")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_html_error(status, &headers, &body_text(error_body));
+    assert!(app.store().get("victim").await.expect("查询").is_some(), "未确认时不得删除");
+
+    let (status, headers, _) = app
+        .send(form_post(
+            "/admin/users/victim/delete",
+            "root",
+            PASSWORD,
+            "status=active&confirm=yes",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin?status=active");
+    assert_eq!(app.store().get("victim").await.expect("查询"), None, "确认后应删除");
+}

@@ -34,6 +34,7 @@ git-lfs 客户端 ──HTTPS + Basic Auth──▶ Caddy（TLS 终止，可选�
 | `/etc/systemd/system/netdisk-lfs.service` | 仓库 `deploy/netdisk-lfs.service` | `644 root:root` |
 | `/etc/netdisk-lfs/config.toml` | 仓库 `config.toml.example` 复制后修改 | `600 lixinlong:lixinlong` |
 | `/var/lib/netdisk-lfs/` | unit 的 `StateDirectory=` 自动创建 | `750 lixinlong:lixinlong` |
+| `/var/lib/netdisk-lfs/accounts.db` | 首次启动（或首个 config 用户登录）时自动创建，SQLite 账户库 | `640 lixinlong:lixinlong` |
 | `/home/lixinlong/.config/bdpan/` | `bdpan login` 自动写入 | `700 lixinlong:lixinlong` |
 
 ## 1. 前置条件
@@ -93,7 +94,8 @@ sudoedit /etc/netdisk-lfs/config.toml
    printf '%s' '<口令>' | sha256sum      # 取输出的第一个字段（64 个十六进制字符）
    ```
 
-   `role` 只能是 `readwrite`（可上传可下载）或 `readonly`（只能下载）。
+   `role` 只能是 `readwrite`（可上传可下载）、`readonly`（只能下载）或 `admin`
+   （读写 + `/admin` 账户管理，见第 13 节）。
    不要把口令本身写进配置文件或提交信息。
 
 2. `[storage] bdpan_bin` 指向真实的 CLI 绝对路径（默认已写好
@@ -352,8 +354,9 @@ curl -s  http://127.0.0.1:9001/metrics | grep -c '^netdisk_lfs_'
   `/var/lib/netdisk-lfs/cache` 就不会变长。
 - 改了 unit 文件要 `sudo systemctl daemon-reload`；只改 `config.toml` 要
   `sudo systemctl restart netdisk-lfs`。
-- 回滚：把 `netdisk-lfs.bak` 换回去再 `restart`，配置向后兼容（新字段有默认值；
-  本仓库目前没有破坏性配置变更）。
+- 回滚：把 `netdisk-lfs.bak` 换回去再 `restart`。数据目录不用动（账户库只有新版本会读），
+  但**旧二进制不认识 `[accounts]` 段**：配置是 `deny_unknown_fields`，回滚前先注释掉该段，
+  否则启动即报配置错误。
 
 ## 10. 已知边界
 
@@ -363,8 +366,9 @@ curl -s  http://127.0.0.1:9001/metrics | grep -c '^netdisk_lfs_'
 | token 30 天 | access_token 官方有效期 30 天、刷新后仍 30 天；长期凭据是 refresh_token（官方文档标称 **10 年**）。`bdpan` 内置刷新流程（`grant_type=refresh_token`），前提是 `~/.config/bdpan` 可写；只有 refresh_token 失效/被撤销或用户解除授权才需人工 `login` |
 | 单对象大小 | `storage.max_object_bytes` 默认 **0 = 不限制**（实测 4.5 GiB 往返 sha256 一致）；实际大小受网盘单文件限制、本地磁盘余量与 `bdpan_timeout_secs` 约束。非 0 时超限回 422，不做分片 |
 | 无 LFS 锁 | `git lfs lock` 系列端点未实现 |
+| 删账户不删对象 | 对象全局共享、内容寻址：注销/删除账户只删账户行与凭据，**不删任何 LFS 对象**，也没有「某人的对象」视图（见 [accounts.md](accounts.md)） |
 | 大对象超时 | 传输超时 = `bdpan_timeout_secs`（启动宽限，默认 300s）+ 文件大小 / `bdpan_min_throughput_bytes_per_sec`（默认 100 KiB/s）。即平均速度低于 100 KiB/s 未传完才判卡死：4.5 GiB 约给 13 小时、50 GiB 约给 6 天，正常传输（实测上行 ~5 MiB/s）不会误杀。两项均可配，0 表示关闭该因子。上传期间进程被杀由 `kill_on_drop` 结束 CLI，残留由启动扫描清理 |
-| 无配额/限速 | 不按用户限额，也没有请求速率限制 |
+| 无配额/限速 | 不按账户限额，LFS 传输也没有速率限制；账户侧只有注册（来源地址/小时）与登录失败（用户名/5 分钟）限速，见 [accounts.md](accounts.md) |
 | 指标有限 | `/metrics` 只有缓存维度；HTTP 延迟/状态码计数尚未导出 |
 | 无配置自检 | 没有 `--check-config`，配置错误靠启动失败暴露 |
 | 故障发现延迟 | 探活结论缓存 30s，最长 30s 后才发现 token 失效（换来的是不为每个探针起子进程） |
@@ -432,3 +436,117 @@ sudo scripts/uninstall.sh --yes --purge
 
 脚本不做、需要你手动完成的两件事：替换配置里的占位口令哈希、以运行用户执行 `bdpan login`
 （见第 2 节）。命令细节用 `scripts/deploy.sh --help` / `scripts/uninstall.sh --help` 查看。
+
+## 13. 账户与权限
+
+分级账户已合入：账户落在 `DATA_DIR/accounts.db`（SQLite，WAL），口令用 Argon2id；
+`config.toml` 的 `[auth.users]` 只保留**引导管理员与应急入口**。角色、注册审批、管理员
+API 的完整说明见 [accounts.md](accounts.md)，本节只列部署相关动作。
+
+| 角色 | 下载 | 上传 | 管理账户 |
+|---|---|---|---|
+| `readonly` | ✅ | ❌ 403 | ❌ |
+| `readwrite`（新账户默认） | ✅ | ✅ | ❌ |
+| `admin` | ✅ | ✅ | ✅ |
+
+账户状态三种：`active`（可登录）、`pending`（待审批，注册策略 `approval` 的产物）、
+`disabled`（已禁用，记录保留）。非 `active` 账户登录一律 401，与口令错误不可区分。
+
+### 13.1 首次启用
+
+1. 配置段用默认值即可（见 `config.toml.example` 的 `[accounts]`）：
+
+   ```toml
+   [accounts]
+   db = "/var/lib/netdisk-lfs/accounts.db"
+   registration = "approval"      # 默认：注册需审批
+   default_role = "readwrite"     # 新账户默认读写
+   trust_proxy = false            # 直连/SSH 隧道保持 false；在 Caddy 后面可开
+   ```
+
+2. 给运维账户引导管理员权限（`role` 新增 `admin`；没有 admin 时 `/admin/*` 403，
+   服务仍可正常读写）：
+
+   ```toml
+   [auth.users]
+   maintainer = { password_sha256 = "<sha256>", role = "admin" }
+   ```
+
+3. 重启并登录一次（首次登录会把该账户升级为库里的 Argon2id 账户）：
+
+   ```bash
+   sudo systemctl restart netdisk-lfs
+   curl -fsS -u 'maintainer:<口令>' https://lfs.example.com/account/me
+   ```
+
+4. 打开 `https://lfs.example.com/admin` 确认能看到账户列表；再把注册页
+   `https://lfs.example.com/account/register` 发给需要开户的人。
+
+### 13.2 账户库备份（必做）
+
+与第 7 节的缓存**相反**：缓存随时可删，`accounts.db` 删了就没人能登录。把它加进现有
+备份任务（`.backup` 是 SQLite 一致性快照，服务在跑也能用）：
+
+```bash
+sudo install -d -m 700 /var/backups/netdisk-lfs
+sudo sqlite3 /var/lib/netdisk-lfs/accounts.db \
+  ".backup '/var/backups/netdisk-lfs/accounts-$(date +%F).db'"
+```
+
+- 文件权限是 `0640`（unit 的 `UMask=0027`），里面有口令哈希，备份目录同样要收紧。
+- 恢复步骤（停服务 → 替换库 → 启动）与「丢失管理员」的应急方案见
+  [accounts.md](accounts.md) 第 8 节。
+- `scripts/uninstall.sh --purge` 会删除整个数据目录（含账户库），卸载前先备份。
+
+### 13.3 反向代理与限速
+
+- 注册限速按来源地址统计，登录失败按用户名统计；超限都是 **429**，登录失败超限后即使
+  口令正确也拒，排障先看 `journalctl` 的 `reason=too_many_requests`。
+- `trust_proxy = true` 时来源地址取 `X-Forwarded-For` 的**最后一段**。Caddy
+  `reverse_proxy` 默认会追加该头，同机部署可以打开；服务直连公网或走 SSH 隧道时保持
+  `false`，否则客户端能伪造来源绕过注册限速。
+- 注册页与 `/admin` 都是普通 HTTP 端点，经同一个 Caddy 站点即可，不要额外叠 Basic Auth
+  （见 5.3）。
+
+### 13.3.1 浏览器登录对反代的要求
+
+登录页与 `/account` 依赖会话 Cookie。要让 Cookie 正确带 `Secure`，反代必须：
+
+- 透传原始 `Host`（Caddy 默认满足；不要改写成上游地址）；
+- 设置 `X-Forwarded-Proto: https`；
+- 服务端 `[accounts] trust_proxy = true`，或 `[server] public_base = "https://<你的域名>"`。
+
+不满足时登录仍可用，但 Cookie 不带 `Secure`，且注册/登录限速会退化成共享桶（按反代地址计数）。会话在内存里，**重启 `netdisk-lfs` 会让所有浏览器掉线**，需要重新登录。
+
+### 13.4 升级与回滚
+
+- 从「纯 config 账户」升级：现有用户继续可用，首次登录自动升级为 Argon2id；建议把
+  `maintainer` 改成 `admin` 并重启。完整步骤见 [accounts.md](accounts.md) 第 11 节。
+- 回滚到不认识 `[accounts]` 的旧二进制前，先注释掉该段（配置是 `deny_unknown_fields`，
+  否则启动失败）；`accounts.db` 可以留在原地，旧版本不读它。
+
+### 13.5 浏览器登录排障
+
+| 现象 | 原因与处理 |
+|---|---|
+| 打开域名还是 404 | 旧版本没有 `/` 登录页；确认部署的是含登录页的版本（`GET /` 应 200） |
+| 以前 `/admin` 弹 Basic 框，现在直接是登录页 | 这是新行为：浏览器走表单登录；curl/脚本仍可用 Basic |
+| 登录成功但下一个请求又回登录页 | 反代没传 `Host`/`X-Forwarded-Proto`，或 `trust_proxy` 未开导致 Cookie 属性不一致；检查 Caddy 配置与 `[accounts]` |
+| 登录后 Cookie 丢失 | HTTPS 站点下反代未设 `X-Forwarded-Proto` 且未配 `public_base`，`Secure` 判定不一致；二者至少配一个 |
+| 退出后仍保持登录 | 用的是 Basic 认证（浏览器缓存的凭据无法由服务端注销），关闭浏览器或清除站点凭据；会话登录的退出按钮才有效 |
+| 重启服务后要重新登录 | 会话在内存，属预期行为 |
+| 登录 POST 返回 403 | 跨站来源被拒（登录 CSRF 防护）；浏览器正常表单不会触发，脚本请勿伪造 `Origin` |
+| 登录 POST 返回 415 | `/login` 只接受 `application/x-www-form-urlencoded` 表单 |
+
+### 13.6 账户相关排障
+
+| 现象 | 原因与处理 |
+|---|---|
+| 账户端点回 503「账户库暂时不可用」 | 库在运行期打不开或查询失败（磁盘满、库文件被删、权限不对）。看 `journalctl` 里带「账户库」的 error；启动期开库失败会直接启动失败，不会带病运行 |
+| 注册成功但登录 401 | `approval` 策略下账户还是 `pending`，到 `/admin` 批准；`closed` 下不会有新账户 |
+| 登录 429 | 该用户名 5 分钟内失败次数超 `login_failures_per_5min`；等窗口滑出，或管理员确认没有爆破 |
+| `/admin` 403 | 当前账户不是 `admin`：改 `[auth.users]` 的 `role` 后重启；检查是否已有其他 admin 生效；若只在**写操作**上 403，检查反代是否保留了原始 `Host`（CSRF 同站校验依赖它） |
+| 管理端写请求 415 | JSON 请求要带 `Content-Type: application/json`；表单端点只收 urlencoded |
+| 浏览器打开 `/admin` 不弹登录框 | 新版本 401 已带 `WWW-Authenticate`；仍不弹则清除该站点已保存的错误凭据后重试 |
+| 引导管理员突然登不上 | 新版本已拒绝用 `[auth.users]` 保留名自助注册（409）；若库里已有历史同名记录（旧版本遗留），用另一个未入库的 config admin 登录删掉它，或按 accounts.md 8.4 改库 |
+| 改了 config 口令却登不上 | 该账户已入库，库优先；用旧口令或管理员重置（见 accounts.md 7.2） |

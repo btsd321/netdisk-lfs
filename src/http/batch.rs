@@ -137,7 +137,7 @@ async fn negotiate(
 
     let operation = Operation::parse(&request.operation)?;
     // 角色检查放在对象校验之前：只读账号的 upload 请求不必再消耗网盘探测。
-    if operation == Operation::Upload && role == Role::Readonly {
+    if operation == Operation::Upload && !role.can_write() {
         return Err(ApiError::Forbidden("只读账号不允许 upload 操作".to_owned()));
     }
 

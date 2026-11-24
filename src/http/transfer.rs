@@ -125,7 +125,7 @@ async fn receive(
     guard.span().record("oid", oid.as_str());
 
     // 角色检查放在读取 body 之前：只读账号的请求不该先落几个 GiB 的缓冲再被拒绝。
-    if role != Role::Readwrite {
+    if !role.can_write() {
         return Err(ApiError::Forbidden("只读账号不允许上传对象".to_owned()));
     }
 

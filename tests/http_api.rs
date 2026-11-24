@@ -14,8 +14,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http_body_util::BodyExt;
 use netdisk_lfs::{
-    AppState, AuthConfig, CacheConfig, Config, FakeStore, ObjectStore, Oid, Role, RuntimeEnv,
-    ServerConfig, Sha256Writer, StorageConfig, UserConfig, router,
+    AccountsConfig, AppState, AuthConfig, CacheConfig, Config, FakeStore, ObjectStore, Oid, Role,
+    RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, UserConfig, router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -107,6 +107,10 @@ fn config_with_users(users: &[(&str, Role)]) -> Config {
             bdpan_min_throughput_bytes_per_sec: 102_400,
         },
         cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
+        accounts: AccountsConfig {
+            db: std::env::temp_dir().join("netdisk-lfs-http-api-tests-accounts.db"),
+            ..AccountsConfig::default()
+        },
         auth: AuthConfig { users: auth_users },
         runtime_env: RuntimeEnv::Dev,
         data_dir: None,

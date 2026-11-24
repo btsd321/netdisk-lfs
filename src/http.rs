@@ -4,8 +4,11 @@
 //! 探针，后者只在本机被抓取）；`/lfs` 子路由统一挂 Basic 认证，batch 与 PUT/GET/verify
 //! 都长在这条子路由下，新增端点自动继承认证。
 //!
-//! 分工：`auth` 负责认证与角色，`error` 负责统一错误体与状态码映射，`batch` 负责
-//! 批量协商，`health` 负责 `bdpan` 探活与降级判定，`metrics` 负责 Prometheus 文本。
+//! 分工：`auth` 负责认证与角色，`login` 负责浏览器登录页/登录/退出，`account` 与
+//! `admin` 负责自身账户页与管理员账户管理（JSON API + HTML 页），`layout` 负责页面
+//! 外壳与唯一一份内联样式，`html` 负责转义/表单解析/响应构造，`error` 负责统一
+//! 错误体与状态码映射，`batch` 负责批量协商，`health` 负责 `bdpan` 探活与降级
+//! 判定，`metrics` 负责 Prometheus 文本。
 //! 本文件只做装配与请求级横切（span、request id）。
 
 use std::fmt;
@@ -21,29 +24,89 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
+use crate::accounts::UserStore;
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{Config, Role};
 use crate::store::{ObjectStore, Oid};
 
+mod account;
+mod admin;
 mod auth;
 mod batch;
+mod csrf;
 mod error;
 mod health;
+mod html;
+mod layout;
+mod limits;
+mod login;
 mod metrics;
+mod passwords;
+mod register;
+mod session;
 mod transfer;
+
+use limits::{LOGIN_WINDOW, REGISTRATION_WINDOW, SlidingWindowLimiter};
 
 pub use error::ApiError;
 pub use health::{BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL};
+// 会话基础设施：登录端点（L2）与会话认证共用同一套 id/Cookie/HTTPS 判定，避免各写
+// 一份导致「登录时带 Secure、清除时不带」这类不一致。
+pub use session::{
+    SESSION_COOKIE_NAME, Session, SessionCookieState, SessionId, SessionStore,
+    clear_session_cookie, has_session_cookie, parse_session_cookie, request_is_https,
+    secure_clear_cookie, secure_cookie, session_cookie,
+};
 // 上传缓冲目录由 `transfer` 唯一实现（含 `data_dir` 缺省时的回退）；`main` 的启动
 // 清理要清同一批目录，所以从这里导出，避免两处各推导一遍导致清理漏目录。
 pub use transfer::upload_dir;
 
 /// LFS 协议媒体类型；请求与响应都用它（客户端可能附加 `; charset=utf-8`）。
 pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
+
+/// 账户库未接入（`accounts: None`）时 `/account/*` 的 503 文案。
+pub(crate) const ACCOUNTS_NOT_CONFIGURED_MESSAGE: &str =
+    "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
+
+/// `[auth.users]` 里与 `name` 同名的条目（大小写不敏感），返回配置里的写法。
+///
+/// 账户库优先之后，config 里的同名条目就是「同一个人的另一个入口」：自助注册要拒
+/// 它（否则能把引导管理员顶掉），管理端删除要先移走它（否则删库行会让旧口令复活）。
+pub(crate) fn config_username<'a>(config: &'a Config, name: &str) -> Option<&'a str> {
+    config
+        .auth
+        .users
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .map(String::as_str)
+}
+
+/// 配置文件里**除 `name` 本人之外**的 active 管理员数量。
+///
+/// `[auth.users]` 在启动后不可变，这个数字可以在事务外算好再传给账户库：账户库的
+/// 「最后一个管理员」判定把它当作数据库之外的兜底管理员，避免把「config 里还有别的
+/// 管理员」的合法降级/删除也拒掉。同名条目不算（那是同一个人）。
+pub(crate) fn config_admin_fallback(config: &Config, name: &str) -> u64 {
+    let count = config
+        .auth
+        .users
+        .iter()
+        .filter(|(candidate, user)| {
+            user.role == Role::Admin && !candidate.eq_ignore_ascii_case(name)
+        })
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// 账户库已接入但读写失败（磁盘、锁、库损坏）时的 503 文案。
+///
+/// 与 [`ACCOUNTS_NOT_CONFIGURED_MESSAGE`] 分开：一个说「这个实例没配账户库」，
+/// 一个说「配了但暂时用不了」，运维看到后该查的方向完全不同。
+pub(crate) const ACCOUNTS_UNAVAILABLE_MESSAGE: &str = "账户库暂时不可用，请稍后重试";
 
 /// 回写给客户端与反向代理的请求 id 头。
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -63,6 +126,14 @@ pub struct AppState {
     /// `/healthz` 的 `bdpan` 探活器；`None` 表示未注入（嵌入用法/测试），此时
     /// `/healthz` 按不可用报降级，不谎报健康。
     probe: Option<Arc<BdpanProbe>>,
+    /// SQLite 账户库；`None` 表示未接入（嵌入用法/既有测试），此时认证只查
+    /// `[auth.users]`，`/account/*` 一律 503。
+    accounts: Option<Arc<UserStore>>,
+    /// 浏览器会话表（进程内）；无状态构造，不需要配置，重启即清空。
+    sessions: Arc<SessionStore>,
+    /// 登录失败限速（按小写用户名）与注册限速（按来源地址）；进程内状态，重启清零。
+    login_limits: Arc<SlidingWindowLimiter>,
+    register_limits: Arc<SlidingWindowLimiter>,
 }
 
 impl AppState {
@@ -79,7 +150,34 @@ impl AppState {
 
     /// 注入已扫描、已清理的缓存；`main` 的启动路径用这个。
     pub fn with_cache(store: Arc<dyn ObjectStore>, config: Arc<Config>, cache: Cache) -> Self {
-        Self { store, config, cache, probe: None }
+        Self {
+            store,
+            config,
+            cache,
+            probe: None,
+            accounts: None,
+            sessions: Arc::new(SessionStore::new()),
+            login_limits: Arc::new(SlidingWindowLimiter::new(LOGIN_WINDOW)),
+            register_limits: Arc::new(SlidingWindowLimiter::new(REGISTRATION_WINDOW)),
+        }
+    }
+
+    /// 在已装配的 state 上注入账户库；`main` 的启动路径用这个。
+    ///
+    /// 与 [`Self::with_bdpan_probe`] 一样是可选注入：不注入时认证退回「只认
+    /// `[auth.users]`」的旧行为，既有测试与嵌入用法不需要改。
+    pub fn with_account_store(mut self, users: Arc<UserStore>) -> Self {
+        self.accounts = Some(users);
+        self
+    }
+
+    /// 构造一个接入了账户库的 state（空缓存、无探活）；测试与嵌入用法用这个。
+    pub fn with_accounts(
+        store: Arc<dyn ObjectStore>,
+        config: Arc<Config>,
+        users: Arc<UserStore>,
+    ) -> Self {
+        Self::new(store, config).with_account_store(users)
     }
 
     /// 注入 `bdpan` 探活器；`main` 在启动时接上它，`/healthz` 才会真的探测登录态。
@@ -113,6 +211,29 @@ impl AppState {
     pub fn bdpan_probe(&self) -> Option<&BdpanProbe> {
         self.probe.as_deref()
     }
+
+    /// 账户库；未接入时为 `None`（此时 `/account/*` 返回 503，认证只查配置）。
+    pub fn accounts(&self) -> Option<&UserStore> {
+        self.accounts.as_deref()
+    }
+
+    /// 浏览器会话表；登录端点建会话、认证中间件查会话、管理端撤销会话都走它。
+    ///
+    /// 返回借用而非 `Arc` 克隆：会话表本身不跨任务 move，`AppState` 已经用 `Arc`
+    /// 让各 handler 共享同一份。
+    pub fn sessions(&self) -> &SessionStore {
+        &self.sessions
+    }
+
+    /// 登录失败限速器；认证中间件用它按用户名计数。
+    pub(crate) fn login_limits(&self) -> &SlidingWindowLimiter {
+        &self.login_limits
+    }
+
+    /// 注册限速器；注册端点用它按来源地址计数。
+    pub(crate) fn register_limits(&self) -> &SlidingWindowLimiter {
+        &self.register_limits
+    }
 }
 
 /// 构造路由表。
@@ -124,9 +245,62 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(metrics::metrics))
+        .merge(login_router())
+        .merge(register_router())
+        .merge(account_router(state.clone()))
+        .merge(admin_router(state.clone()))
         .merge(lfs_router(state.clone()))
+        // 全局会话 CSRF 守卫：必须套在 `request_span` 之内（错误页要用它注入的
+        // request id），同时位于路由处理之外——跨站写请求在认证之前就被挡掉，
+        // 不依赖具体端点自己再判一次。
+        .layer(middleware::from_fn(csrf::guard))
         .layer(middleware::from_fn(request_span))
         .with_state(state)
+}
+
+/// 登录与退出路由：都不需要认证——登录本来就是拿凭据的入口，退出必须对「Cookie
+/// 已失效」的请求幂等。
+fn login_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(login::page))
+        .route("/login", post(login::submit))
+        .route("/logout", post(login::logout))
+}
+
+/// 公开的注册路由：注册页与注册提交都不需要认证（否则没人能注册）。
+fn register_router() -> Router<AppState> {
+    Router::new().route("/account/register", get(register::page).post(register::submit))
+}
+
+/// 登录后的自身账户路由：单独一条受保护子路由，不并进 `/lfs`，避免 LFS 端点
+/// 将来加路径级例外时误伤账户端点。
+fn account_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/account/me", get(account::me))
+        .route("/account/password", post(account::change_password))
+        .route("/account", get(account::page).delete(account::delete_self))
+        .route_layer(middleware::from_fn_with_state(state, auth::require))
+}
+
+/// 管理员路由：JSON API 与 HTML 管理页共用一条受保护子路由。
+///
+/// 两层层按「后注册的在外层」包裹：先 `auth::require` 认人，再
+/// `admin::require_admin` 判角色——判角色只读扩展，不重复解析凭据。
+fn admin_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/admin", get(admin::page))
+        .route("/admin/users", get(admin::list).post(admin::create))
+        .route("/admin/users/{name}", patch(admin::patch).delete(admin::delete))
+        .route("/admin/users/{name}/password", post(admin::reset_password))
+        // 以下为 HTML 管理页的便捷端点：只解析表单、复用上面同一套逻辑，成功后 303。
+        .route("/admin/users/{name}/approve", post(admin::approve))
+        .route("/admin/users/{name}/disable", post(admin::disable))
+        .route("/admin/users/{name}/enable", post(admin::enable))
+        .route("/admin/users/{name}/role", post(admin::role_form))
+        .route("/admin/users/{name}/password-form", post(admin::password_form))
+        .route("/admin/users/{name}/delete", post(admin::delete_form))
+        .route_layer(middleware::from_fn(admin::require_admin))
+        .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 
 /// `/lfs` 子路由：认证统一挂这里，后续分支新增的 PUT/GET/verify 自动继承。
@@ -262,16 +436,39 @@ impl Drop for DurationGuard {
 /// 而 api.md 要求 `application/vnd.git-lfs+json`。序列化失败说明响应模型不可
 /// 序列化，属服务端缺陷，按 500 处理并保留同一个 request id。
 pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> Response {
+    json_body(StatusCode::OK, LFS_MEDIA_TYPE, value, request_id)
+}
+
+/// 账户类端点的 JSON 响应：`application/json`（不是 LFS 媒体类型），带请求 id。
+pub(crate) fn json_with_status<T: Serialize>(
+    status: StatusCode,
+    value: &T,
+    request_id: &RequestId,
+) -> Response {
+    json_body(status, "application/json", value, request_id)
+}
+
+/// 统一的 JSON 序列化出口：状态码与媒体类型由调用方给，错误路径共用同一套处理。
+fn json_body<T: Serialize>(
+    status: StatusCode,
+    content_type: &'static str,
+    value: &T,
+    request_id: &RequestId,
+) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => {
             let mut response = Response::new(Body::from(body));
             response
                 .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(LFS_MEDIA_TYPE));
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            *response.status_mut() = status;
             response
         },
         Err(error) => {
-            tracing::error!(request_id = %request_id, error = %error, "序列化 LFS 响应失败");
+            tracing::error!(request_id = %request_id, error = %error, "序列化 JSON 响应失败");
             ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
         },
     }
@@ -384,7 +581,9 @@ mod tests {
         OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, action_base, object_href, outcome_for_status,
         verify_href,
     };
-    use crate::config::{AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig};
+    use crate::config::{
+        AccountsConfig, AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig,
+    };
     use crate::store::Oid;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -404,6 +603,10 @@ mod tests {
                 bdpan_min_throughput_bytes_per_sec: 102_400,
             },
             cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
+            accounts: AccountsConfig {
+                db: std::env::temp_dir().join("netdisk-lfs-http-tests-accounts.db"),
+                ..AccountsConfig::default()
+            },
             auth: AuthConfig::default(),
             runtime_env: RuntimeEnv::Dev,
             data_dir: None,

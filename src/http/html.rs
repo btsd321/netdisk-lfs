@@ -1,0 +1,354 @@
+//! HTML 转义、表单解析与响应构造：页面外壳与样式在 [`super::layout`]。
+//!
+//! 不引模板引擎、不加载任何外部资源、页面里没有一行脚本：页面全靠字符串拼接。
+//! 正因如此，**所有**动态文本都必须先经 [`escape_html`]；[`table`] 的单元格是
+//! 「已渲染的 HTML 片段」（按钮、表单等），转义责任在调用方——纯文本单元格请传
+//! `escape_html(text)`，不要直接把用户输入塞进去。
+//!
+//! 表单一律用 `application/x-www-form-urlencoded`，与查询串同源，所以
+//! [`parse_form`] 也用来解析 `?status=` 这类查询参数。
+
+use std::collections::HashMap;
+
+use axum::body::Body;
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, LOCATION};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::Response;
+
+use super::error::ApiError;
+
+/// HTML 转义：`&` 最先替换，避免把后续生成的实体二次转义。
+pub(crate) fn escape_html(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// 构造 HTML 响应（`text/html; charset=utf-8`），并统一加 `Cache-Control: no-store`。
+///
+/// 页面里会出现用户名、角色、创建/最后登录时间、账户列表：共享浏览器、反代缓存或
+/// 「后退」都可能把上一个人的页面交给下一个人。这些页面没有任何可缓存的理由，
+/// 统一 no-store 比逐个端点记着加更不容易漏。
+pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    *response.status_mut() = status;
+    response
+}
+
+/// 请求是否期望 HTML 响应：`Accept` 头里带 `text/html` 就按浏览器处理。
+///
+/// 只有「错误该回 JSON 还是 HTML」需要这个判断（例如 403）：同一路径上既有脚本
+/// 客户端也有浏览器的表单提交，按 `Accept` 分流比按路径猜更准。
+pub(crate) fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+}
+
+/// 303 See Other：浏览器按 GET 跟随目标，不会把原来的 POST 再提交一次。
+pub(crate) fn see_other(location: &str) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    response.headers_mut().insert(LOCATION, location_header(location));
+    response
+}
+
+/// 把回跳地址变成合规的 `Location` 头值。
+///
+/// 注意 `HeaderValue::from_str` **不**能当校验用：按 RFC 7230，它接受 obs-text
+/// （0x80–0xff），所以 UTF-8 路径（`/account?q=中文`）能通过 `from_str`，却把非 ASCII
+/// 原始字节写进了 `Location`——`Location` 是 URI 引用，只能是 ASCII，部分代理与浏览器
+/// 会直接丢掉这条头，页面就停在空白页。因此这里先自己判「是否全为可见 ASCII」，
+/// 不是就先编码（只编非可见 ASCII 字节，保留 `?`、`&`、`=`、`/` 这些结构字符）。
+///
+/// 编码后仍失败时回落 `/`：宁可回首页，也不要 303 一个没有目标的响应。
+fn location_header(location: &str) -> HeaderValue {
+    let printable_ascii = location.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
+    if printable_ascii && let Ok(value) = HeaderValue::from_str(location) {
+        return value;
+    }
+    let encoded = percent_encode_location(location);
+    match HeaderValue::from_str(&encoded) {
+        Ok(value) => {
+            tracing::debug!(location = %location, encoded = %encoded, "回跳地址含非 ASCII 字节，已百分号编码");
+            value
+        },
+        Err(error) => {
+            tracing::error!(location = %location, error = %error, "回跳地址无法编成响应头值，回落到首页");
+            HeaderValue::from_static("/")
+        },
+    }
+}
+
+/// 渲染一张表：表头按纯文本转义，单元格是**已渲染的 HTML 片段**。
+///
+/// 单元格里要放纯文本时请传 [`escape_html`] 的结果；要放按钮/表单时由调用方拼接
+/// 并自行保证其中没有未转义的用户输入。
+pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut html = String::from("<table>\n<thead><tr>");
+    for header in headers {
+        // `scope="col"` 让读屏器把表头与整列关联起来（行数多时尤其重要）。
+        html.push_str(&format!(r#"<th scope="col">{}</th>"#, escape_html(header)));
+    }
+    html.push_str("</tr></thead>\n<tbody>\n");
+    for row in rows {
+        html.push_str("<tr>");
+        for cell in row {
+            html.push_str(&format!("<td>{cell}</td>"));
+        }
+        html.push_str("</tr>\n");
+    }
+    html.push_str("</tbody>\n</table>");
+    html
+}
+
+/// unix 秒格式化成 `YYYY-MM-DD HH:MM:SS UTC`。
+///
+/// 页面只需要「人能读的时间」，为此引一个日期库不划算：公历换算用 Howard
+/// Hinnant 的 `civil_from_days`，闰年与世纪规则都已包含在整数运算里。
+pub(crate) fn format_unix_seconds(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rest / 3_600;
+    let minute = rest % 3_600 / 60;
+    let second = rest % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// 1970-01-01 起的天数 → `(年, 月, 日)`；支持 1970 之前的负数天数。
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // 把纪元挪到 0000-03-01，让闰日落在年末，月份换算就成了线性公式。
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// 解析 `application/x-www-form-urlencoded`：`&` 分隔、`=` 切分、`+` 与 `%XX` 解码。
+///
+/// 同名键取第一次出现的值（浏览器不会重复提交同一个控件），避免后出现的值覆盖
+/// 前面的校验结果。
+pub(crate) fn parse_form(body: &str) -> Result<HashMap<String, String>, ApiError> {
+    let mut fields = HashMap::new();
+    for pair in body.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(raw_key)?;
+        let value = percent_decode(raw_value)?;
+        fields.entry(key).or_insert(value);
+    }
+    Ok(fields)
+}
+
+/// 百分号编码：只保留 RFC 3986 §2.3 的 unreserved 字符，其余一律编成 `%XX`（大写）。
+///
+/// 与 [`percent_decode`] 互为逆运算。只用于构造「回跳地址的 `next` 值」：`/`、`?`、
+/// `&`、`=` 都必须编码，否则原地址会被当成外层查询串的一部分（`?next=/account?tab=x`
+/// 里的 `tab=x` 就成了外层参数）。
+pub(crate) fn percent_encode(raw: &str) -> String {
+    // 每个字节的转义要追加 3 个字符，先按最坏情况预留，避免反复扩容。
+    let mut encoded = String::with_capacity(raw.len() * 3);
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            },
+            other => push_hex_escape(&mut encoded, other),
+        }
+    }
+    encoded
+}
+
+/// 只编码非可见 ASCII 字节，保留 `?`、`&`、`=`、`/` 这些 URI 结构字符。
+///
+/// 与 [`percent_encode`] 的分工：那个用于「`next` 参数的值」，必须把 `/`、`?`、`&`、
+/// `=` 一并编码；这个用于「已经是一条地址」的场景，只处理放不进响应头的字节。
+fn percent_encode_location(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if (0x21..=0x7e).contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            push_hex_escape(&mut encoded, byte);
+        }
+    }
+    encoded
+}
+
+/// 百分号转义用的大写十六进制数字表：查表比每个字节一次 `format!` 分配便宜得多。
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+/// 把一个字节按 `%XX`（大写）追加到 `encoded`。
+fn push_hex_escape(encoded: &mut String, byte: u8) {
+    encoded.push('%');
+    encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+    encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+}
+
+/// 百分号与 `+` 解码；非法转义或非 UTF-8 都报 400。
+pub(crate) fn percent_decode(raw: &str) -> Result<String, ApiError> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            },
+            b'%' => {
+                let pair = bytes
+                    .get(index + 1..index + 3)
+                    .ok_or_else(|| ApiError::BadRequest("表单转义不完整".to_owned()))?;
+                // 先逐字节校验是 ASCII 十六进制：`u8::from_str_radix` 接受正负号，
+                // `%+b` / `%-b` 会被解析成 0x0b / 0x-b 的怪异结果，绕开「非法转义」判断。
+                let is_hex = pair.iter().all(u8::is_ascii_hexdigit);
+                let byte = if is_hex {
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap_or_default(), 16)
+                        .map_err(|_| ApiError::BadRequest("表单转义不是十六进制".to_owned()))?
+                } else {
+                    return Err(ApiError::BadRequest("表单转义不是十六进制".to_owned()));
+                };
+                decoded.push(byte);
+                index += 3;
+            },
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            },
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ApiError::BadRequest("表单不是合法的 UTF-8".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        civil_from_days, escape_html, format_unix_seconds, location_header, parse_form,
+        percent_decode, percent_encode, table, wants_html,
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    #[test]
+    fn given_html_special_chars_when_escape_then_entities() {
+        assert_eq!(
+            escape_html("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+        assert_eq!(escape_html("a & b \"c\" 'd'"), "a &amp; b &quot;c&quot; &#39;d&#39;");
+        // & 必须先替换，否则会二次转义成 &amp;lt;
+        assert_eq!(escape_html("&lt;"), "&amp;lt;");
+    }
+
+    #[test]
+    fn given_urlencoded_body_when_parse_then_fields_decoded() {
+        let fields = parse_form("username=Alice_01&password=a%2Bb+c&confirm_password=a%2Bb+c")
+            .expect("合法表单");
+
+        assert_eq!(fields["username"], "Alice_01");
+        assert_eq!(fields["password"], "a+b c");
+        assert_eq!(fields["confirm_password"], "a+b c");
+    }
+
+    #[test]
+    fn given_duplicate_key_when_parse_then_first_wins() {
+        let fields = parse_form("username=alice&username=bob").expect("合法表单");
+
+        assert_eq!(fields["username"], "alice");
+    }
+
+    #[test]
+    fn given_broken_percent_escape_when_decode_then_bad_request() {
+        assert!(percent_decode("%2").is_err(), "不完整的转义应被拒");
+        assert!(percent_decode("%zz").is_err(), "非十六进制应被拒");
+        assert!(percent_decode("%ff").is_err(), "非 UTF-8 字节应被拒");
+        // `u8::from_str_radix` 会把 `+`/`-` 当符号：带符号的「十六进制」必须被拒，
+        // 否则 `%+b` 会被解码成 0x0b 而绕过转义校验。
+        assert!(percent_decode("%+b").is_err(), "带符号的转义应被拒");
+        assert!(percent_decode("%-b").is_err(), "带负号的转义应被拒");
+        assert_eq!(percent_decode("%2B").expect("合法转义"), "+", "%2B 才是加号");
+        assert_eq!(percent_decode("a%20b").expect("合法转义"), "a b");
+    }
+
+    #[test]
+    fn given_unix_seconds_when_format_then_utc_calendar_time() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01 00:00:00 UTC");
+        // 2026-11-24T12:34:56Z：闰年与世纪规则都落在这条路径上。
+        assert_eq!(format_unix_seconds(1_795_523_696), "2026-11-24 12:34:56 UTC");
+        // 2000-02-29（闰日）与 2100-03-01（非闰年的世纪年）。
+        assert_eq!(format_unix_seconds(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(format_unix_seconds(4_107_542_400), "2100-03-01 00:00:00 UTC");
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn given_headers_when_wants_html_then_checks_accept() {
+        let mut headers = HeaderMap::new();
+        assert!(!wants_html(&headers), "没有 Accept 按 API 客户端处理");
+
+        headers.insert(
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!wants_html(&headers));
+
+        headers.insert(
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("text/html,application/xhtml+xml;q=0.9"),
+        );
+        assert!(wants_html(&headers), "浏览器表单一定带 text/html");
+    }
+
+    #[test]
+    fn given_component_with_delimiters_when_percent_encode_then_only_unreserved_kept() {
+        // `?`、`&`、`=`、`/` 与中文都必须编码，否则会变成外层查询串或非 ASCII 头值。
+        assert_eq!(percent_encode("/a/b?c=d&e=f 中"), "%2Fa%2Fb%3Fc%3Dd%26e%3Df%20%E4%B8%AD");
+        assert_eq!(percent_encode("AZaz09-._~"), "AZaz09-._~");
+    }
+
+    #[test]
+    fn given_non_ascii_location_when_location_header_then_percent_encoded_not_dropped() {
+        // `HeaderValue` 只接受可见 ASCII：不编码就会得到一条没有 Location 的 303。
+        let value = location_header("/account?q=中文");
+        assert_eq!(value.to_str().expect("编码后应是合法头值"), "/account?q=%E4%B8%AD%E6%96%87");
+    }
+
+    #[test]
+    fn given_ascii_location_when_location_header_then_unchanged() {
+        let value = location_header("/admin?status=pending");
+        assert_eq!(value.to_str().expect("合法头值"), "/admin?status=pending");
+    }
+
+    #[test]
+    fn given_rows_when_table_then_headers_and_cells_rendered() {
+        let html = table(
+            &["用户名", "操作"],
+            &[vec![escape_html("<script>"), "<form></form>".to_owned()]],
+        );
+
+        assert!(html.starts_with("<table>"));
+        assert!(html.contains(r#"<th scope="col">用户名</th>"#));
+        assert!(html.contains("<td>&lt;script&gt;</td>"), "文本单元格必须已转义：{html}");
+        assert!(html.contains("<td><form></form></td>"), "HTML 片段原样输出：{html}");
+    }
+}
