@@ -308,7 +308,7 @@ pub(crate) async fn get(
     // 遥测交给响应体读取器：直到流真正结束（或客户端断开）才落 duration_ms，
     // 这样慢客户端的大对象下载也能看到真实传输耗时；`bytes` 记实际发送的字节数，
     // Range 时就是区间长度。
-    let reader = BodyReader::new(file.take(length), temp, guard);
+    let reader = BodyReader::new(file.take(length), temp, guard, length);
     let stream = ReaderStream::with_capacity(reader, HASH_BUFFER_BYTES);
     let mut response = Response::new(Body::from_stream(stream));
     let response_headers = response.headers_mut();
@@ -602,16 +602,18 @@ struct BodyReader<R> {
     /// 下划线前缀是刻意的：字段只靠 Drop 生效、从不被读，直接叫 `temp` 会触发
     /// `dead_code`，而这里又不能加 `#[allow]`（本仓库 lint 集中在 Cargo.toml）。
     _temp: Option<TempPath>,
-    /// 遥测守卫：读到 EOF 后取出并 `finish`，否则（客户端断连）由 Drop 记 aborted。
+    /// 遥测守卫：读到 EOF 后取出并 `finish`，否则由 Drop 按已发字节数收尾。
     telemetry: Option<DurationGuard>,
     /// 已读出的字节数。
     bytes: u64,
+    /// 期望发送的总字节数（Content-Length）：Drop 时据此区分「发完」与「断连」。
+    expected: u64,
 }
 
 impl<R> BodyReader<R> {
-    /// 绑定读取端、清理守卫与遥测守卫。
-    fn new(reader: R, temp: Option<TempPath>, guard: DurationGuard) -> Self {
-        Self { reader, _temp: temp, telemetry: Some(guard), bytes: 0 }
+    /// 绑定读取端、清理守卫、遥测守卫与期望发送长度。
+    fn new(reader: R, temp: Option<TempPath>, guard: DurationGuard, expected: u64) -> Self {
+        Self { reader, _temp: temp, telemetry: Some(guard), bytes: 0, expected }
     }
 
     /// 结束遥测；重复调用无副作用（`telemetry` 取出后即为 `None`）。
@@ -654,8 +656,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for BodyReader<R> {
 
 impl<R> Drop for BodyReader<R> {
     fn drop(&mut self) {
-        // 走到这里还没 settle，说明响应体没读完就被丢弃：客户端断连或响应被取消。
-        self.settle(OUTCOME_ABORTED);
+        // 走到这里还没 settle 的原因有两种：客户端断连，或 hyper 在 Content-Length
+        // 满足后直接丢弃 body（不再 poll 到 EOF，小对象尤其常见）。已发出的字节数
+        // 达到期望长度就说明传输完整，别把成功记成 aborted；没发完才是真断连。
+        let outcome = if self.bytes >= self.expected { OUTCOME_OK } else { OUTCOME_ABORTED };
+        self.settle(outcome);
         // `reader`、`_temp` 随后按声明顺序 Drop：先关文件，再删中转文件。
     }
 }
