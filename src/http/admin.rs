@@ -516,6 +516,11 @@ async fn patch_account(
         request_id = %request_id,
         "管理员修改账户"
     );
+    // 角色或状态一变，手里的会话就不能再代表这个人：降到只读、被禁用都要立刻踢下线。
+    // 认证中间件每次请求也会复核库里的角色，这里只是让失效**立即**发生并顺手释放内存。
+    if updated.role != target.role || updated.status == UserStatus::Disabled {
+        state.sessions().revoke_user(&updated.username);
+    }
     Ok(updated)
 }
 
@@ -581,6 +586,8 @@ async fn delete_account(
         request_id = %request_id,
         "管理员删除账户（LFS 对象不随账户删除）"
     );
+    // 账户没了，它的会话也必须立刻消失。
+    state.sessions().revoke_user(&target.username);
     Ok(())
 }
 
@@ -618,6 +625,8 @@ async fn reset_password_for(
         request_id = %request_id,
         "管理员重置账户口令"
     );
+    // 口令是凭据：换掉之后旧会话不能再代表这个人（管理员重置自己也一样）。
+    state.sessions().revoke_user(&target.username);
     Ok(())
 }
 

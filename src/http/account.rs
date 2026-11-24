@@ -170,6 +170,8 @@ async fn change_password_inner(
         accounts_unavailable()
     })?;
     tracing::info!(username = %user.username, "账户自助修改口令成功");
+    // 改口令 = 换凭据：所有设备上的旧会话立即失效，只保留（即将重新登录的）当前浏览器。
+    state.sessions().revoke_user(&user.username);
     Ok(())
 }
 
@@ -264,6 +266,8 @@ async fn delete_self_inner(state: &AppState, auth: &AuthUser, body: &[u8]) -> Re
         role = %user.role,
         "账户自助注销成功（LFS 对象不随账户删除）"
     );
+    // 账户行已删，会话也必须跟着消失。
+    state.sessions().revoke_user(&user.username);
     Ok(())
 }
 
