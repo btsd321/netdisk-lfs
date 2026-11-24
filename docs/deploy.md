@@ -347,12 +347,15 @@ sudo scripts/uninstall.sh --yes --purge
 | 行为 | 说明 |
 |---|---|
 | 安装位置 | `PREFIX`（默认 `/opt/netdisk-lfs`）：`bin/netdisk-lfs` + `share/deploy.md` + `share/config.toml.example` |
-| 配置 | 缺失时才从 `config.toml.example` 生成到 `CONFIG_DIR`（默认 `/etc/netdisk-lfs`，权限 `600`），并把 `bdpan_bin`、`cache.dir` 改成当前环境值；**已存在则不覆盖** |
+| 配置 | 缺失时才从 `config.toml.example` 生成到 `CONFIG_DIR`（默认 `/etc/netdisk-lfs`，权限 `600`），并把 `bdpan_bin`、`cache.dir` 改成当前环境值；**已存在则不覆盖**，但会校正属主并检查 `bdpan_bin`/`cache.dir` 是否与当前身份、`DATA_DIR` 一致 |
 | 数据 | 创建 `DATA_DIR` 及 `cache/`、`upload/` 并 chown 给运行用户（默认 `/var/lib/netdisk-lfs`） |
-| unit | 由 `deploy/netdisk-lfs.service` 渲染 `ExecStart`/`User`/`WorkingDirectory`/`Environment`/`ReadWritePaths`，安装后 `daemon-reload` + `enable --now` |
+| unit | 由 `deploy/netdisk-lfs.service` 渲染 `ExecStart`/`User`/`Group`/`WorkingDirectory`/`Environment`/`ReadWritePaths`（每个替换都校验模板未漂移），安装后 `daemon-reload` + `enable` + `restart`，再用 `is-active` 确认进程没在崩溃循环 |
+| 构建 | 以调用用户（`SUDO_USER`）身份 `cargo build --release --locked`，避免 root 污染 `target/` 与 sudo 的 secure_path 找不到 cargo |
 | 运行身份 | 默认 `$SUDO_USER`；不允许 root（bdpan 凭据在普通用户家目录） |
-| 幂等 | 重复执行只会刷新二进制与 unit，配置不动 |
-| 卸载护栏 | 拒绝删除 `/`、`/opt`、`/etc`、`/var` 等顶层目录；非交互环境必须显式 `--yes` |
+| 幂等 | 重复执行只刷新二进制与 unit 并重启服务（可当升级用），配置不动 |
+| 路径安全 | 所有路径先归一化（去尾斜杠、拒绝空段/`.`/`..`），再按白名单校验：`PREFIX` 只能在 `/opt`、`/usr/local`、`/tmp` 下，`CONFIG_DIR` 只能在 `/etc`、`/tmp` 下，`DATA_DIR` 只能在 `/var/lib`、`/tmp` 下，且不能等于这些顶层目录本身 |
+| 自测 | `scripts/deploy.sh --self-test` / `scripts/uninstall.sh --self-test` 覆盖归一化与白名单边界；`SKIP_SYSTEMD=1` 且 `UNIT_DIR` 仍是 `/etc/systemd/system` 时，卸载脚本拒绝删除 unit 文件，避免自测误删生产 unit |
+| 卸载护栏 | 默认保留配置与数据；`--purge` 才删除；非交互环境必须显式 `--yes`；每个删除步骤失败都会带上下文报错 |
 | 不触碰 | bdpan 登录凭据（`~/.config/bdpan`）、Caddy 配置、网盘对象 |
 
 脚本不做、需要你手动完成的两件事：替换配置里的占位口令哈希、以运行用户执行 `bdpan login`
