@@ -19,8 +19,8 @@ mod test_support;
 pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, BdpanStore, LsEntry, RetryPolicy};
 pub use cache::{Cache, CachedFile, SweepReport, transient_dir};
 pub use config::{
-    AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, Role, RuntimeEnv,
-    ServerConfig, StorageConfig, UserConfig,
+    AccountsConfig, AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG,
+    Role, RuntimeEnv, ServerConfig, StorageConfig, UserConfig,
 };
 pub use http::{ApiError, AppState, BdpanProbe, BdpanState, PROBE_TIMEOUT, PROBE_TTL, router};
 pub use logging::init as init_logging;

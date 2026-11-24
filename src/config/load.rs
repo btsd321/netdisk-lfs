@@ -12,7 +12,8 @@ use serde::Deserialize;
 use crate::config::env::{self, EnvSource};
 use crate::config::error::ConfigError;
 use crate::config::model::{
-    AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig, UserConfig,
+    AccountsConfig, AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig,
+    UserConfig,
 };
 
 /// 缓存预算缺省值：200 GiB，与 `specs/storage.md` 一致。
@@ -32,7 +33,7 @@ impl Config {
 
     /// 归一化并校验；返回的配置可直接用于启动。
     fn from_raw(raw: RawConfig, env: &EnvSource) -> Result<Self, ConfigError> {
-        let RawConfig { server, storage, cache, auth } = raw;
+        let RawConfig { server, storage, cache, accounts, auth } = raw;
 
         let runtime_env = match env.get(env::NETDISK_LFS_ENV) {
             Some(raw_env) => RuntimeEnv::parse(raw_env)?,
@@ -76,10 +77,30 @@ impl Config {
             },
         };
 
+        let accounts_db = match (accounts.db.as_os_str().is_empty(), &data_dir) {
+            (false, _) if accounts.db.is_absolute() => accounts.db,
+            (false, _) => {
+                return Err(ConfigError::invalid(format!(
+                    "accounts.db 必须是绝对路径，实际为 {}",
+                    accounts.db.display()
+                )));
+            },
+            (true, Some(root)) => root.join("accounts.db"),
+            (true, None) => {
+                return Err(ConfigError::invalid(
+                    "缺少 accounts.db，且未设置 NETDISK_LFS_DATA_DIR：请把 accounts.db 配成绝对路径，或设置 NETDISK_LFS_DATA_DIR（缺省取 $NETDISK_LFS_DATA_DIR/accounts.db）",
+                ));
+            },
+        };
+
         let config = Self {
             server,
             storage,
             cache: CacheConfig { dir: cache_dir, max_bytes: cache.max_bytes },
+            accounts: AccountsConfig {
+                db: accounts_db,
+                min_password_len: accounts.min_password_len,
+            },
             auth: AuthConfig { users: auth.users },
             runtime_env,
             data_dir,
@@ -175,6 +196,8 @@ struct RawConfig {
     #[serde(default)]
     cache: RawCache,
     #[serde(default)]
+    accounts: RawAccounts,
+    #[serde(default)]
     auth: RawAuth,
 }
 
@@ -226,6 +249,21 @@ impl Default for RawCache {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawAccounts {
+    /// 账户库路径；留空时由数据根推导。
+    #[serde(default)]
+    db: PathBuf,
+    #[serde(default = "default_min_password_len")]
+    min_password_len: usize,
+}
+
+/// 口令最小长度缺省值：12 个字符。
+fn default_min_password_len() -> usize {
+    12
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAuth {
     #[serde(default)]
     users: BTreeMap<String, UserConfig>,
@@ -265,6 +303,9 @@ max_bdpan_procs = 4
 dir = "/var/lib/netdisk-lfs/cache"
 max_bytes = 214748364800
 
+[accounts]
+db = "/var/lib/netdisk-lfs/accounts.db"
+
 [auth.users]
 alice = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readwrite" }
 bob = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readonly" }
@@ -295,6 +336,8 @@ bob = { password_sha256 = "00000000000000000000000000000000000000000000000000000
         assert_eq!(config.storage.bdpan_min_throughput_bytes_per_sec, 102_400);
         assert_eq!(config.cache.dir, PathBuf::from("/var/lib/netdisk-lfs/cache"));
         assert_eq!(config.cache.max_bytes, 214_748_364_800);
+        assert_eq!(config.accounts.db, PathBuf::from("/var/lib/netdisk-lfs/accounts.db"));
+        assert_eq!(config.accounts.min_password_len, 12);
         assert_eq!(config.auth.users.len(), 2);
         assert_eq!(config.auth.users["alice"].role, Role::Readwrite);
         assert_eq!(config.auth.users["bob"].role, Role::Readonly);
@@ -354,6 +397,7 @@ max_bdpan_procs = 4
         assert_eq!(config.storage.bdpan_bin, PathBuf::from("/opt/bdpan/bin/bdpan"));
         assert_eq!(config.cache.dir, PathBuf::from("/srv/netdisk-lfs/cache"));
         assert_eq!(config.cache.max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(config.accounts.db, PathBuf::from("/srv/netdisk-lfs/accounts.db"));
         assert_eq!(config.runtime_env, crate::config::model::RuntimeEnv::Prod);
         assert_eq!(config.data_dir.as_deref(), Some(Path::new("/srv/netdisk-lfs")));
     }
@@ -473,11 +517,68 @@ dir = "/var/lib/netdisk-lfs/cache"
 
     #[test]
     fn given_unknown_role_when_load_then_rejected() {
-        let contents = VALID_CONFIG.replace("role = \"readonly\"", "role = \"admin\"");
+        let contents = VALID_CONFIG.replace("role = \"readonly\"", "role = \"owner\"");
 
         let message = load_error(&contents, &[]);
 
         assert!(message.contains("role"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_admin_role_when_load_then_accepted() {
+        let contents = VALID_CONFIG.replace("role = \"readonly\"", "role = \"admin\"");
+
+        let config = load(&contents, &[]).expect("admin 是合法角色");
+
+        assert_eq!(config.auth.users["bob"].role, Role::Admin);
+    }
+
+    #[test]
+    fn given_empty_accounts_db_and_data_dir_when_load_then_under_data_root() {
+        let contents = r#"
+[server]
+listen = "127.0.0.1:9001"
+
+[storage]
+objects_root = "/apps/bdpan/lfs"
+tmp_root = "/apps/bdpan/lfs/tmp"
+bdpan_bin = "/usr/local/bin/bdpan"
+max_object_bytes = 0
+max_bdpan_procs = 4
+
+[cache]
+dir = "/var/lib/netdisk-lfs/cache"
+
+[accounts]
+db = ""
+"#;
+
+        let config = load(contents, &[("NETDISK_LFS_DATA_DIR", "/srv/netdisk-lfs")])
+            .expect("空 db 应由数据根推导");
+
+        assert_eq!(config.accounts.db, PathBuf::from("/srv/netdisk-lfs/accounts.db"));
+        assert_eq!(config.accounts.min_password_len, 12);
+    }
+
+    #[test]
+    fn given_relative_accounts_db_when_load_then_rejected() {
+        let contents = VALID_CONFIG
+            .replace("db = \"/var/lib/netdisk-lfs/accounts.db\"", "db = \"accounts.db\"");
+
+        let message = load_error(&contents, &[]);
+
+        assert!(message.contains("绝对路径"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_no_accounts_db_and_no_data_dir_when_load_then_both_options_reported() {
+        let contents =
+            VALID_CONFIG.replace("db = \"/var/lib/netdisk-lfs/accounts.db\"", "db = \"\"");
+
+        let message = load_error(&contents, &[]);
+
+        assert!(message.contains("accounts.db"), "实际错误：{message}");
+        assert!(message.contains("NETDISK_LFS_DATA_DIR"), "实际错误：{message}");
     }
 
     #[test]

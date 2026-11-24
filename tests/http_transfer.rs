@@ -18,8 +18,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http_body_util::BodyExt;
 use netdisk_lfs::{
-    AppState, AuthConfig, CacheConfig, Config, FakeStore, ObjectStore, Oid, Role, RuntimeEnv,
-    ServerConfig, Sha256Writer, StorageConfig, UserConfig, router,
+    AccountsConfig, AppState, AuthConfig, CacheConfig, Config, FakeStore, ObjectStore, Oid, Role,
+    RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, UserConfig, router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -130,6 +130,7 @@ fn test_config(data_dir: &Path, max_object_bytes: u64) -> Config {
             bdpan_min_throughput_bytes_per_sec: 102_400,
         },
         cache: CacheConfig { dir: data_dir.join("cache"), max_bytes: 1024 },
+        accounts: AccountsConfig { db: data_dir.join("accounts.db"), min_password_len: 12 },
         auth: AuthConfig { users: auth_users },
         runtime_env: RuntimeEnv::Dev,
         data_dir: Some(data_dir.to_path_buf()),
