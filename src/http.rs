@@ -98,7 +98,8 @@ fn lfs_router(state: AppState) -> Router<AppState> {
         DefaultBodyLimit::max(body_limit_bytes(state.config().storage.max_object_bytes));
     Router::new()
         .route("/lfs/objects/batch", post(batch::handle))
-        .route("/lfs/objects/{oid}", put(transfer::put).layer(body_limit))
+        .route("/lfs/objects/{oid}", put(transfer::put).get(transfer::get).layer(body_limit))
+        .route("/lfs/objects/{oid}/verify", post(transfer::verify))
         .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 
