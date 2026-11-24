@@ -544,7 +544,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent);
   gap: 64px;
   align-items: start;
   align-content: center;
-  min-height: calc(100vh - 145px);
+  min-height: calc(100vh - 220px);
   padding: 48px 0 40px;
 }
 .scroll-hint { display: none; }
