@@ -21,7 +21,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use super::error::ApiError;
-use super::{AppState, RequestId, json_response};
+use super::{AppState, RequestId, json_response, object_href, verify_href};
 use crate::config::Role;
 use crate::store::{ObjectMeta, Oid, StoreError};
 
@@ -343,24 +343,9 @@ struct ObjectError {
     message: String,
 }
 
-/// 对象内容端点；B5 的 PUT/GET 路由复用同一路径。
-fn object_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}")
-}
-
-/// 上传后校验端点；B5 在此实现 verify。
-fn verify_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}/verify")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Operation, object_href, verify_href};
-    use crate::store::Oid;
-
-    fn oid() -> Oid {
-        Oid::parse(&"0123456789abcdef".repeat(4)).expect("合法 oid")
-    }
+    use super::Operation;
 
     #[test]
     fn given_known_operations_when_parse_then_ok() {
@@ -373,14 +358,5 @@ mod tests {
         let error = Operation::parse("verify").expect_err("verify 不是 batch 操作");
 
         assert!(error.to_string().contains("verify"), "实际错误：{error}");
-    }
-
-    #[test]
-    fn given_oid_when_hrefs_then_relative_paths() {
-        let oid = oid();
-
-        assert_eq!(object_href(&oid), format!("/lfs/objects/{oid}"));
-        assert_eq!(verify_href(&oid), format!("/lfs/objects/{oid}/verify"));
-        assert!(object_href(&oid).starts_with('/'), "href 必须是相对路径");
     }
 }
