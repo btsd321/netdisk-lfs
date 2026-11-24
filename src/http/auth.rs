@@ -29,15 +29,26 @@
 //! 登录成功、下一个请求 401」——判定口径一旦分叉，登录端点多放行的身份认证端点就会
 //! 拒掉。
 //!
-//! **未登录的页面请求**回登录页而不是 JSON 401：`Accept` 含 `text/html` 且路径在
-//! `/admin`、`/account` 之下时 303 到 `/?next=<原地址>`。git 客户端与脚本不带
-//! `Accept: text/html`，仍拿到 JSON 401（带 `WWW-Authenticate`），协议语义不变。
+//! **未登录的页面请求**回登录页而不是 JSON 401：`Accept` 含 `text/html`、方法是
+//! GET/HEAD、路径在 `/admin`、`/account` 之下、且失败原因确实是「没有有效身份」时，
+//! 303 到 `/?next=<原地址>`。三条限制都不能松：
+//!
+//! - **只认会话 Cookie 通道**：请求带 `Authorization` 时一律 401 + 挑战头。若 Basic
+//!   失败也去 303，浏览器缓存的旧凭据会让「`/admin` → 登录页（无 `WWW-Authenticate`，
+//!   弹不出框）→ 登录页看到会话有效 → 回 `/admin`」转成 `ERR_TOO_MANY_REDIRECTS`；
+//! - **只认 GET/HEAD**：表单 POST 被 303 到登录页后，登录完浏览器只会 GET 那个
+//!   POST-only 路径，得到 405，表单内容也丢了；
+//! - **只认「没有有效身份」**：429（被限速）与 503（账户库故障）是另外两种语义，
+//!   把它们变成登录页会掩盖真实原因。
+//!
+//! git 客户端与脚本不带 `Accept: text/html`，仍拿到 JSON 401（带 `WWW-Authenticate`），
+//! 协议语义不变。
 
 use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Uri};
+use axum::http::{HeaderMap, HeaderValue, Method, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
@@ -186,7 +197,7 @@ pub(crate) async fn require(
     // 清 Cookie 时要与服务端签发时同样带不带 Secure，否则 HTTPS 站点上清不掉。
     let secure = session::request_is_https(request.headers(), state.config());
     // 浏览器访问页面时的回登录页地址；在进入异步之前算好（`&request` 不能跨 `.await`）。
-    let login_redirect = html_login_redirect(request.uri(), request.headers());
+    let login_redirect = html_login_redirect(request.method(), request.uri(), request.headers());
 
     let outcome = match authorization {
         Some(header) => authenticate(&state, Some(header)).await.map_err(Rejection::Basic),
@@ -212,8 +223,11 @@ pub(crate) async fn require(
                 "认证失败"
             );
             // 浏览器访问受保护页面：303 到登录页并带上原地址，而不是让用户看到一坨
-            // JSON。放在认证失败之后、错误体之前，因此 JSON 客户端的分支完全不变。
-            if let Some(location) = login_redirect {
+            // JSON。只有「会话通道 + 没有有效身份 + GET/HEAD」才跳（见模块文档），
+            // Basic 失败与 429/503 仍走原来的错误响应。
+            if rejection.redirects_to_login()
+                && let Some(location) = login_redirect
+            {
                 tracing::info!(request_id = %request_id, location = %location, "未登录的页面请求，跳转登录页");
                 let response = html::see_other(&location);
                 // 失效/被撤销/畸形的会话 Cookie 顺手清掉：跳转链路上不清，浏览器就会
@@ -231,11 +245,15 @@ pub(crate) async fn require(
 
 /// 未登录的浏览器页面请求该跳到哪里；`None` 表示维持 401。
 ///
-/// 只对 `Accept` 含 `text/html` 且路径在 `/admin`、`/account` 之下的请求生效，并且
-/// 明确排除 `/account/register`（公开的注册页）与 `/lfs/*`（git 客户端）。`next` 只带
-/// path+query 并整体百分号编码：`?next=/a?b=1` 不编码时 `b=1` 会变成外层的查询参数。
-fn html_login_redirect(uri: &Uri, headers: &HeaderMap) -> Option<String> {
-    if !html::wants_html(headers) {
+/// 只对 `Accept` 含 `text/html`、方法是 GET/HEAD 且路径在 `/admin`、`/account` 之下
+/// 的请求生效，并明确排除 `/account/register`（公开的注册页）与 `/lfs/*`（git 客户端）。
+/// `next` 只带 path+query 并整体百分号编码：`?next=/a?b=1` 不编码时 `b=1` 会变成外层
+/// 的查询参数。
+///
+/// 方法限制在这里而不是调用方：写请求被 303 到登录页后，登录完浏览器只会 GET 那个
+/// POST-only 路径（405），而且表单内容已经丢了，没有意义。
+fn html_login_redirect(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if !matches!(*method, Method::GET | Method::HEAD) || !html::wants_html(headers) {
         return None;
     }
     let path = uri.path();
@@ -274,6 +292,18 @@ impl Rejection {
         match self {
             Self::Basic(failure) => failure.reason(),
             Self::Session(failure) => failure.as_str(),
+        }
+    }
+
+    /// 这个失败是否该把浏览器送到登录页。
+    ///
+    /// 只有「会话通道 + 这条请求没有有效身份」才算：Basic 失败要保持 401 让浏览器
+    /// 重新弹框（否则旧凭据会让 `/admin` 与 `/` 互相 303 成死循环），429/503 要保持
+    /// 自己的状态码，不能伪装成「你还没登录」。
+    fn redirects_to_login(&self) -> bool {
+        match self {
+            Self::Basic(_) => false,
+            Self::Session(failure) => failure.is_missing_identity(),
         }
     }
 
@@ -320,6 +350,14 @@ impl SessionFailure {
             Self::Revoked => "session_revoked",
             Self::AccountsUnavailable => "accounts_unavailable",
         }
+    }
+
+    /// 这条请求是不是「没有有效身份」（而不是基础设施故障）。
+    ///
+    /// 登录跳转与 429/503 的分界就看它：`AccountsUnavailable` 是账户库坏了，用户
+    /// 现在去登录也登不上，必须让他看到 503 的原因。
+    pub(crate) fn is_missing_identity(self) -> bool {
+        matches!(self, Self::Missing | Self::Malformed | Self::Expired | Self::Revoked)
     }
 
     /// 是否该顺手清掉浏览器里那条 Cookie。
