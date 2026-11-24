@@ -354,6 +354,11 @@ async fn given_root_when_get_then_login_page_with_fields_register_link_and_appro
     assert!(page.contains("管理员审批"), "approval 策略应提示需审批");
     assert!(!page.contains("<script"), "登录页不得含脚本");
     assert!(set_cookies(&headers).is_empty(), "未登录的登录页不该下发 Cookie");
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "页面不得被共享缓存留下来"
+    );
 }
 
 #[tokio::test]
@@ -651,10 +656,19 @@ async fn given_session_when_get_account_then_200_with_identity_and_logout_form()
     assert!(page.contains("读写"), "应显示角色：{page}");
     assert!(page.contains("正常"), "应显示状态：{page}");
     assert!(page.contains("创建时间") && page.contains("最后登录"), "应显示时间：{page}");
-    assert!(page.contains("http://lfs.test"), "应显示 LFS 端点：{page}");
+    // git-lfs 会把 `objects/batch` 拼在 lfs.url 后面：示例必须给到 `/lfs/`，
+    // 只给站点根地址的话用户照抄会打到 `/objects/batch` 拿 404。
+    assert!(page.contains("http://lfs.test/lfs/"), "LFS 端点应带 /lfs/：{page}");
+    let snippet = page.matches("url = http://lfs.test/lfs/").count();
+    assert_eq!(snippet, 1, ".lfsconfig 片段应写成 url = <base>/lfs/：{page}");
     assert!(page.contains(".lfsconfig"), "应给出 .lfsconfig 片段：{page}");
     assert!(page.contains(r#"action="/logout""#), "应有退出表单：{page}");
     assert!(page.contains("退出登录"));
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "账户页含用户名/时间，不得被缓存"
+    );
     assert!(!page.contains("管理账户"), "普通用户不该看到管理入口：{page}");
     assert!(!page.contains("<script"), "账户页不得含脚本");
 }
@@ -835,6 +849,109 @@ async fn given_session_when_cross_site_logout_then_403_and_session_kept() {
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(app.state.sessions().len(), 1, "被拒的跨站退出不得撤销会话");
+}
+
+// ---------------------------------------------------------------------------
+// 跳转边界：Basic 通道、429/503、写请求、非 ASCII next、Basic 用户的账户页
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_stale_basic_when_get_admin_or_account_page_then_401_not_303() {
+    // 浏览器缓存了旧凭据（或账户已被删）时，Basic 失败必须是 401 + 挑战头：
+    // 303 到登录页会让「登录页看到会话有效 → 回 /admin → Basic 又失败」转成
+    // ERR_TOO_MANY_REDIRECTS，而且登录页没有 WWW-Authenticate，弹不出重新输入。
+    let app = TestApp::new();
+
+    for path in ["/admin", "/account"] {
+        let (status, headers, body) = app
+            .send(Req::new(Method::GET, path).accept_html().basic("ghost", "wrong").build())
+            .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 的 Basic 失败不得跳转");
+        assert!(!headers.contains_key(header::LOCATION), "{path} 不应带 Location");
+        assert_json_401(&headers, &body);
+    }
+}
+
+#[tokio::test]
+async fn given_rate_limited_basic_when_get_admin_page_then_429_not_303() {
+    // M1：429 是「你被限速了」，不是「你没登录」——变成登录页会掩盖真实原因，
+    // 用户还会在登录页继续被限速。
+    let app = TestApp::with(|config| {
+        add_config_user(config, "legacy", PASSWORD, Role::Readwrite);
+        config.accounts.login_failures_per_5min = 1;
+    });
+
+    // 先失败一次，把 legacy 打满 1 次的上限。
+    let (first, _, _) =
+        app.send(Req::new(Method::GET, "/admin").basic("legacy", "wrong").build()).await;
+    assert_eq!(first, StatusCode::UNAUTHORIZED);
+
+    let (status, headers, _) = app
+        .send(Req::new(Method::GET, "/admin").accept_html().basic("legacy", "wrong").build())
+        .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    assert!(!headers.contains_key(header::LOCATION), "429 不得被换成 303");
+}
+
+#[tokio::test]
+async fn given_expired_session_when_post_admin_form_then_401_not_303() {
+    // M2：写请求被 303 到登录页后，登录完浏览器只会 GET 那个 POST-only 路径（405），
+    // 表单内容也丢了。写请求必须保持 401。
+    let app = TestApp::new();
+    let unknown = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let (status, headers, _) = app
+        .send(
+            Req::new(Method::POST, "/admin/users/alice/approve")
+                .accept_html()
+                .cookie_value(unknown)
+                .header("sec-fetch-site", "same-origin")
+                .build(),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "写请求不参与登录跳转");
+    assert!(!headers.contains_key(header::LOCATION));
+}
+
+#[tokio::test]
+async fn given_non_ascii_next_when_login_then_location_is_percent_encoded() {
+    // M3：`Location` 只能是 ASCII 的 URI 引用；直接把中文写进头值会被部分代理/浏览器
+    // 丢掉，表现成「303 之后空白页」。
+    let app = TestApp::new();
+    app.create_user("alice", Role::Readwrite, UserStatus::Active).await;
+
+    let (status, headers, _) = app
+        .send(
+            Req::new(Method::POST, "/login")
+                .login("alice", PASSWORD, Some("/account?q=中文"))
+                .build(),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/account?q=%E4%B8%AD%E6%96%87");
+}
+
+#[tokio::test]
+async fn given_basic_when_get_account_then_hints_credential_clearing_and_no_logout_form() {
+    // M4：Basic 是浏览器缓存的凭据，/logout 只清会话 Cookie——不能给出一个按了也不
+    // 生效的退出按钮，提示必须说明「清除浏览器凭据」才是退出方式。
+    let app = TestApp::new();
+    app.create_user("bob", Role::Readwrite, UserStatus::Active).await;
+
+    let (status, _, body) =
+        app.send(Req::new(Method::GET, "/account").basic("bob", PASSWORD).build()).await;
+    let page = body_text(body);
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("HTTP Basic"), "应说明当前是 Basic 登录：{page}");
+    assert!(page.contains("清除浏览器"), "应提示清除浏览器凭据才能退出：{page}");
+    assert!(!page.contains(r#"action="/logout""#), "Basic 用户不显示无效的退出表单：{page}");
+    assert!(page.contains("http://lfs.test/lfs/"), "Basic 用户同样要看到 LFS 端点");
 }
 
 // ---------------------------------------------------------------------------
