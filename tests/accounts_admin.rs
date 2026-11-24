@@ -1115,7 +1115,7 @@ async fn given_admin_page_when_get_then_table_with_escaped_username() {
     // 每行都有状态按钮、角色下拉、口令输入与带确认框的删除表单。
     assert!(body.contains(r#"action="/admin/users/pending-pal/approve""#));
     assert!(body.contains(r#"action="/admin/users/root/disable""#));
-    assert!(body.contains(r#"<select name="role">"#));
+    assert!(body.contains(r#"name="role""#), "角色下拉要在操作格里：{body}");
     assert!(body.contains(r#"name="password""#));
     assert!(body.contains(r#"action="/admin/users/root/delete""#));
     assert!(body.contains(r#"name="confirm""#));
@@ -1125,7 +1125,9 @@ async fn given_admin_page_when_get_then_table_with_escaped_username() {
     assert_eq!(status, StatusCode::OK);
     let filtered = body_text(filtered);
     assert!(filtered.contains("pending-pal"));
-    assert!(!filtered.contains(">root<"), "过滤后不应出现 normal 账户：{filtered}");
+    // 页头的账号 chip 会显示当前管理员自己的用户名，所以「没有 root 这一行」要按行内
+    // 操作表单的地址判断，不能按纯文本 `>root<` 判断。
+    assert!(!filtered.contains("/admin/users/root/"), "过滤后不应出现 active 账户：{filtered}");
 
     // 无法识别的过滤值：忽略并转义回显，不 500。
     let (status, _, unknown) =
