@@ -1,0 +1,68 @@
+# netdisk-lfs 配置样例（入库）。
+#
+# 用法：
+#   sudo install -d -m 750 -o root -g lixinlong /etc/netdisk-lfs
+#   sudo install -m 600 -o lixinlong -g lixinlong config.toml.example /etc/netdisk-lfs/config.toml
+#   sudoedit /etc/netdisk-lfs/config.toml      # 替换口令哈希与 bdpan 路径
+#
+# 真实的 config.toml 已在 .gitignore 中排除（含账号口令哈希），绝不入库；
+# 本文件只保留占位值。systemd unit 见 deploy/netdisk-lfs.service，安装与排障见
+# docs/deploy.md。
+#
+# 字段与 src/config/model.rs 一一对应：拼错键名或漏掉必填项时，程序会在启动阶段
+# 直接报错（`deny_unknown_fields` + 语义校验），不会带病运行。
+
+[server]
+# 监听地址。只监听回环，对外一律经 Caddy 等反向代理（specs/architecture.md「部署」）。
+# 千万别改成 0.0.0.0：Basic Auth 之外的端点（/healthz、/metrics）没有认证，
+# /lfs 也只有应用层口令，裸暴露到公网等于把服务交给扫描器。
+listen = "127.0.0.1:9001"
+# 对外基地址。经反向代理时留空：batch 返回的 href 是相对路径（如 /lfs/objects/<oid>），
+# 客户端按请求 URL 自行拼接，反代改主机名/端口都不会错。
+# 只有「客户端直连本进程且地址与监听地址不同」时才需要填 https://lfs.example.com。
+public_base = ""
+
+[storage]
+# 网盘对象根目录（远端路径）。必须落在 bdpan 授权目录 /apps/bdpan/ 下，
+# 且对象最终路径由 oid 决定：<objects_root>/objects/<aa>/<bb>/<oid>。
+objects_root = "/apps/bdpan/lfs"
+# 上传中转目录（远端路径），必须是 objects_root 的子目录。
+# 上传先落这里再 mv 到最终路径，保证网盘侧「要么不存在，要么完整」。
+tmp_root = "/apps/bdpan/lfs/tmp"
+# bdpan CLI 的绝对路径（必须是绝对路径）。注意 systemd unit 里的 PATH 也要包含
+# 它所在目录，CLI 自身可能再调用同目录工具。
+bdpan_bin = "/home/lixinlong/.local/bin/bdpan"
+# 单对象上限（字节）：4 GiB。超限在 batch 与 PUT 两处都直接拒绝（422），
+# 不做内部分片映射。实测网盘单文件可用上限后再调整。
+max_object_bytes = 4294967296
+# 同时存在的 bdpan 子进程上限（并发许可数）。bdpan 的并发安全性未压测，
+# 保守取 4；调大前先确认网盘侧不触发风控。
+max_bdpan_procs = 4
+
+[cache]
+# 本地读缓存目录。必须在 systemd unit 的 ReadWritePaths 之内（/var/lib/netdisk-lfs），
+# 否则 ProtectSystem=strict 下会被拒绝写、静默降级为直通。
+# 布局：<dir>/<aa>/<bb>/<oid>；命中即可直接流式返回，不再回源。
+dir = "/var/lib/netdisk-lfs/cache"
+# 缓存预算（字节）：200 GiB。超出后按 LRU 淘汰；单个对象比预算还大时直通返回、
+# 不入缓存（不报错）。缓存可随时清空，正确性不受影响——
+# `sudo systemctl stop netdisk-lfs && sudo rm -rf /var/lib/netdisk-lfs/cache/*`。
+max_bytes = 214748364800
+
+# 客户端凭据：用户名 → 口令哈希与角色。用户名即 HTTP Basic 的用户名，
+# 不允许包含 ':'（会让 user:password 拆分有歧义）。
+#
+# 口令哈希用 sha256 的十六进制小写摘要，生成方式：
+#   printf '%s' '<口令>' | sha256sum
+#   # 输出形如 `3f1c...9a  -`，取第一个字段（64 个十六进制字符）。
+#   # 注意 printf 不加换行，否则换行符也会被算进哈希。
+#
+# role 只接受两个值：
+#   readwrite —— 允许 batch 上传、PUT、verify 与下载（日常开发用）；
+#   readonly  —— 只允许下载（CI、只读镜像站、需要临时借看的人）。
+#
+# 下面两个是**占位值**，原样部署会导致谁也登录不了（口令未知），务必替换或删除。
+# 口令本身不要写进本文件、不要让 `bash -x` 之类的调试开着跑哈希命令。
+[auth.users]
+maintainer = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readwrite" }
+reader     = { password_sha256 = "0000000000000000000000000000000000000000000000000000000000000000", role = "readonly" }

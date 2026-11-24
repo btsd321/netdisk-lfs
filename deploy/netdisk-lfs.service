@@ -1,0 +1,111 @@
+# netdisk-lfs 的 systemd unit。
+#
+# 为什么选 **system** unit 而不是 user unit（`~/.config/systemd/user/`）：
+#
+# - 服务必须在开机后、无人登录时可用。user unit 默认随用户会话启停，要 `loginctl
+#   enable-linger` 才能在未登录时运行，多一层容易漏配的隐式前提；运维里最常见的
+#   事故就是「重启服务器后 LFS 没起来」。
+# - `ProtectSystem=` / `ProtectHome=` / `StateDirectory=` 这些沙箱与目录指令在
+#   system manager 下语义最完整（user manager 不允许 `User=`，home 本身就是
+#   `ProtectHome=` 的作用对象，组合起来容易失效）。
+# - 运行身份仍是普通用户 `lixinlong`（`User=`/`Group=`），不需要 root：唯一需要写的
+#   本地路径 `/var/lib/netdisk-lfs` 由 `StateDirectory=` 自动创建并 chown 给该用户。
+#
+# 安装步骤、`bdpan login`、Caddy 反代与排障见 docs/deploy.md；配置样例见
+# config.toml.example。本文件由仓库分发，安装到 /etc/systemd/system/netdisk-lfs.service。
+
+[Unit]
+Description=netdisk-lfs — 以百度网盘为对象存储的自建 Git LFS 服务端
+Documentation=https://github.com/btsd321/netdisk-lfs/blob/develop/docs/deploy.md
+Documentation=file:/usr/share/doc/netdisk-lfs/deploy.md
+# bdpan 要访问网盘，等网络就绪再启动；即便网盘晚到，Restart=always 也会兜住。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# `exec` 与 `simple` 一样不依赖应用发 sd_notify，但 systemd 会等 exec() 成功
+# （可执行文件不存在/无执行权限会立刻报错，而不是先报 started 再退出）。
+Type=exec
+
+# 运行身份：固定普通用户，不用 root，也不用 DynamicUser（需要稳定的 ~/.config/bdpan）。
+User=lixinlong
+Group=lixinlong
+
+# 工作目录必须是可写的：程序按「当前工作目录」读 `.env`（不存在即可），
+# 且降级直通模式的中转文件落在系统临时目录（见 PrivateTmp）。
+WorkingDirectory=/var/lib/netdisk-lfs
+
+# NETDISK_LFS_ENV=prod：JSON 日志、默认 info 级别（tracing 初始化按它选格式）。
+Environment=NETDISK_LFS_ENV=prod
+# 本地数据根：上传缓冲取 $NETDISK_LFS_DATA_DIR/upload；config.toml 里 cache.dir
+# 通常指向 $NETDISK_LFS_DATA_DIR/cache，保持一致。
+Environment=NETDISK_LFS_DATA_DIR=/var/lib/netdisk-lfs
+# bdpan 装在 ~/.local/bin 且自身可能再调用同目录下的工具；system unit 默认 PATH
+# 不含家目录，必须显式补上，否则 bdpan 内部调用会隐性失败。
+Environment=PATH=/home/lixinlong/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# 配置里含账号口令哈希，权限 600、只给运行用户读。
+ExecStart=/usr/local/bin/netdisk-lfs --config /etc/netdisk-lfs/config.toml
+
+# 崩了就拉起：`always` 覆盖「非零退出」与「被信号杀死」两种情况；
+# `systemctl stop` 属于正常停机，不会触发重启。
+Restart=always
+RestartSec=5
+
+# 启动期要给缓存目录扫描留余量（200 GiB 缓存重建索引可能要几十秒到几分钟）。
+# 注意：Type=exec 下 systemd 在 exec() 成功后就认为「已启动」，缓存扫描发生在
+# 这之后，因此它本身不受启动超时限制；这里仍显式给出上限，避免将来加
+# ExecStartPre/改成 Type=notify 时无意中使用 90s 默认值把慢盘误杀。
+TimeoutStartSec=300
+# 停机要给在途大对象留时间：4 GiB 传输按实测带宽可能要十几分钟，默认 90s 会在
+# 传输中途 SIGKILL，客户端看到的是「连接被重置」而非优雅退出。
+TimeoutStopSec=600
+
+# /var/lib/netdisk-lfs（缓存与上传缓冲）。StateDirectory 负责创建目录并 chown 给
+# User=；ReadWritePaths 再显式声明一次可写区域——ProtectSystem=strict 会把 /var
+# 整体挂成只读，两者叠加是刻意的双保险（删掉 StateDirectory 也不会静默变成只读）。
+StateDirectory=netdisk-lfs
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/netdisk-lfs
+
+# 缓存与上传缓冲是临时数据，组/其他用户不该读；配置文件的 600 由安装步骤保证。
+UMask=0027
+
+# --- 沙箱 ---
+NoNewPrivileges=true
+# 私有 /tmp：降级直通模式的中转文件落这里，隔离后既不污染宿主 /tmp，
+# 也避免宿主 /tmp 里的同名残留互相干扰。
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ProtectHome 刻意**不**设为 true，也不能只靠 read-only 了事：
+#   bdpan 的登录凭据在 ~/.config/bdpan/（config.json、.token_key），token 每 30 天
+#   到期后由 CLI 自动续期，续期要**写**这个目录；`ProtectHome=true` 会把 /home 变成
+#   空目录，bdpan 既找不到凭据也无法续期，表现为 /healthz 一直 auth_failed。
+#   保守可选加固（确认 token 目录后二选一启用，注意 read-only 仍允许读+执行
+#   ~/.local/bin/bdpan，只有 true 会把 home 藏掉）：
+#
+#     ProtectHome=read-only
+#     ReadWritePaths=/home/lixinlong/.config/bdpan
+#
+# 同理不设 MemoryDenyWriteExecute：它是进程级的，会连带约束 bdpan 子进程，若该 CLI
+#（或其运行时）依赖可写可执行页会直接崩，属于用可用性换来的边际收益。
+
+# 日志进 journal：journalctl -u netdisk-lfs 查看，字段与 request id 见 docs/deploy.md。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netdisk-lfs
+
+[Install]
+WantedBy=multi-user.target
