@@ -1,7 +1,9 @@
 //! 极简 HTML 渲染与表单解析：注册页与管理员页共用。
 //!
 //! 不引模板引擎、不加载任何外部资源、页面里没有一行脚本：页面全靠字符串拼接。
-//! 正因如此，**所有**动态文本都必须先经 [`escape_html`]。
+//! 正因如此，**所有**动态文本都必须先经 [`escape_html`]；[`table`] 的单元格是
+//! 「已渲染的 HTML 片段」（按钮、表单等），转义责任在调用方——纯文本单元格请传
+//! `escape_html(text)`，不要直接把用户输入塞进去。
 //!
 //! 表单一律用 `application/x-www-form-urlencoded`，与查询串同源，所以
 //! [`parse_form`] 也用来解析 `?status=` 这类查询参数。
@@ -9,8 +11,8 @@
 use std::collections::HashMap;
 
 use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 
 use super::error::ApiError;
@@ -93,6 +95,68 @@ pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
     response
 }
 
+/// 请求是否期望 HTML 响应：`Accept` 头里带 `text/html` 就按浏览器处理。
+///
+/// 只有「错误该回 JSON 还是 HTML」需要这个判断（例如 403）：同一路径上既有脚本
+/// 客户端也有浏览器的表单提交，按 `Accept` 分流比按路径猜更准。
+pub(crate) fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+}
+
+/// 渲染一张表：表头按纯文本转义，单元格是**已渲染的 HTML 片段**。
+///
+/// 单元格里要放纯文本时请传 [`escape_html`] 的结果；要放按钮/表单时由调用方拼接
+/// 并自行保证其中没有未转义的用户输入。
+pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut html = String::from("<table>\n<thead><tr>");
+    for header in headers {
+        html.push_str(&format!("<th>{}</th>", escape_html(header)));
+    }
+    html.push_str("</tr></thead>\n<tbody>\n");
+    for row in rows {
+        html.push_str("<tr>");
+        for cell in row {
+            html.push_str(&format!("<td>{cell}</td>"));
+        }
+        html.push_str("</tr>\n");
+    }
+    html.push_str("</tbody>\n</table>");
+    html
+}
+
+/// unix 秒格式化成 `YYYY-MM-DD HH:MM:SS UTC`。
+///
+/// 页面只需要「人能读的时间」，为此引一个日期库不划算：公历换算用 Howard
+/// Hinnant 的 `civil_from_days`，闰年与世纪规则都已包含在整数运算里。
+pub(crate) fn format_unix_seconds(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rest / 3_600;
+    let minute = rest % 3_600 / 60;
+    let second = rest % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// 1970-01-01 起的天数 → `(年, 月, 日)`；支持 1970 之前的负数天数。
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // 把纪元挪到 0000-03-01，让闰日落在年末，月份换算就成了线性公式。
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// 解析 `application/x-www-form-urlencoded`：`&` 分隔、`=` 切分、`+` 与 `%XX` 解码。
 ///
 /// 同名键取第一次出现的值（浏览器不会重复提交同一个控件），避免后出现的值覆盖
@@ -141,7 +205,11 @@ pub(crate) fn percent_decode(raw: &str) -> Result<String, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, parse_form, percent_decode};
+    use super::{
+        civil_from_days, escape_html, format_unix_seconds, parse_form, percent_decode, table,
+        wants_html,
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
     #[test]
     fn given_html_special_chars_when_escape_then_entities() {
@@ -177,5 +245,47 @@ mod tests {
         assert!(percent_decode("%zz").is_err(), "非十六进制应被拒");
         assert!(percent_decode("%ff").is_err(), "非 UTF-8 字节应被拒");
         assert_eq!(percent_decode("a%20b").expect("合法转义"), "a b");
+    }
+
+    #[test]
+    fn given_unix_seconds_when_format_then_utc_calendar_time() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01 00:00:00 UTC");
+        // 2026-11-24T12:34:56Z：闰年与世纪规则都落在这条路径上。
+        assert_eq!(format_unix_seconds(1_795_523_696), "2026-11-24 12:34:56 UTC");
+        // 2000-02-29（闰日）与 2100-03-01（非闰年的世纪年）。
+        assert_eq!(format_unix_seconds(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(format_unix_seconds(4_107_542_400), "2100-03-01 00:00:00 UTC");
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn given_headers_when_wants_html_then_checks_accept() {
+        let mut headers = HeaderMap::new();
+        assert!(!wants_html(&headers), "没有 Accept 按 API 客户端处理");
+
+        headers.insert(
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!wants_html(&headers));
+
+        headers.insert(
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("text/html,application/xhtml+xml;q=0.9"),
+        );
+        assert!(wants_html(&headers), "浏览器表单一定带 text/html");
+    }
+
+    #[test]
+    fn given_rows_when_table_then_headers_and_cells_rendered() {
+        let html = table(
+            &["用户名", "操作"],
+            &[vec![escape_html("<script>"), "<form></form>".to_owned()]],
+        );
+
+        assert!(html.starts_with("<table>"));
+        assert!(html.contains("<th>用户名</th>"));
+        assert!(html.contains("<td>&lt;script&gt;</td>"), "文本单元格必须已转义：{html}");
+        assert!(html.contains("<td><form></form></td>"), "HTML 片段原样输出：{html}");
     }
 }

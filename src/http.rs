@@ -208,15 +208,23 @@ fn account_router(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 
-/// 管理员路由：认证之后再过一道「是不是管理员」。
+/// 管理员路由：JSON API 与 HTML 管理页共用一条受保护子路由。
 ///
 /// 两层层按「后注册的在外层」包裹：先 `auth::require` 认人，再
 /// `admin::require_admin` 判角色——判角色只读扩展，不重复解析凭据。
 fn admin_router(state: AppState) -> Router<AppState> {
     Router::new()
+        .route("/admin", get(admin::page))
         .route("/admin/users", get(admin::list).post(admin::create))
         .route("/admin/users/{name}", patch(admin::patch).delete(admin::delete))
         .route("/admin/users/{name}/password", post(admin::reset_password))
+        // 以下为 HTML 管理页的便捷端点：只解析表单、复用上面同一套逻辑，成功后 303。
+        .route("/admin/users/{name}/approve", post(admin::approve))
+        .route("/admin/users/{name}/disable", post(admin::disable))
+        .route("/admin/users/{name}/enable", post(admin::enable))
+        .route("/admin/users/{name}/role", post(admin::role_form))
+        .route("/admin/users/{name}/password-form", post(admin::password_form))
+        .route("/admin/users/{name}/delete", post(admin::delete_form))
         .route_layer(middleware::from_fn(admin::require_admin))
         .route_layer(middleware::from_fn_with_state(state, auth::require))
 }

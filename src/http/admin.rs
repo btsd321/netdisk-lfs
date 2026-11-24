@@ -1,11 +1,15 @@
-//! 管理员账户管理 JSON API：`/admin/users` 的列表、创建、改角色/状态、删除与重置口令。
+//! 管理员账户管理：JSON API（`/admin/users`）与极简 HTML 管理页（`/admin`）。
 //!
 //! 全部端点都过两道闸：先 Basic 认证（`auth::require`，判定「你是谁」），再过
-//! [`require_admin`]（判定「能不能进」）；非管理员一律 403，错误体沿用
-//! `{message, request_id}`。账户库未接入时所有端点 503。
+//! [`require_admin`]（判定「能不能进」）。非管理员一律 403：脚本客户端拿到统一
+//! JSON 错误体，浏览器（`Accept: text/html`）拿到 403 页。
 //!
-//! 这些 handler 是**唯一**的管理逻辑实现：后续的 HTML 管理页只做「解析表单 → 调
-//! 同一套函数 → 303 回跳」，不复制任何判定。
+//! 两条入口、一套逻辑：
+//!
+//! - JSON API 是规范入口，供脚本与将来的 UI 使用；
+//! - HTML 管理页的操作按钮走表单 POST（`.../approve`、`.../disable`、`.../delete`
+//!   等），只做「解析表单 → 调同一套函数 → 303 回 `/admin`」，不复制任何判定逻辑。
+//!   成功后 303（See Other）而不是 200：浏览器刷新时重新 GET 管理页，不会重复提交。
 //!
 //! 保护规则（顺序即优先级，见各函数）：
 //!
@@ -21,9 +25,10 @@
 use std::collections::HashMap;
 
 use axum::Extension;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::StatusCode;
+use axum::http::header::LOCATION;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
@@ -32,7 +37,9 @@ use serde::{Deserialize, Serialize};
 use super::account::would_remove_last_admin;
 use super::auth::AuthUser;
 use super::error::ApiError;
-use super::html::parse_form;
+use super::html::{
+    escape_html, format_unix_seconds, html_response, page_shell, parse_form, table, wants_html,
+};
 use super::register::duplicate_username;
 use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
 use crate::accounts::{AccountError, User, UserStatus, validate_password, validate_username};
@@ -40,6 +47,9 @@ use crate::config::Role;
 
 /// `GET /admin/users` 未带 `limit` 时的页大小（与账户库的默认值一致）。
 const DEFAULT_LIMIT: u32 = 50;
+
+/// 单页上限，同时也是管理页一次展示的上限（账户库会把更大的 `limit` 截到这里）。
+const MAX_LIMIT: u32 = 100;
 
 /// 写操作请求体上限：字段都很短，16 KiB 足够，超出直接 400。
 const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -61,8 +71,16 @@ pub(crate) async fn require_admin(request: Request, next: Next) -> Response {
     let request_id =
         request.extensions().get::<RequestId>().cloned().unwrap_or_else(RequestId::generate);
     tracing::warn!(request_id = %request_id, "非管理员访问管理端点");
-    ApiError::Forbidden("需要管理员权限：当前账户不是管理员".to_owned())
-        .into_response_with(&request_id)
+    if wants_html(request.headers()) {
+        let body = format!(
+            r#"<h1>禁止访问</h1><p class="error">管理页只对管理员开放：当前账户不是管理员。</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+            escape_html(request_id.as_str())
+        );
+        html_response(StatusCode::FORBIDDEN, page_shell("禁止访问", &body))
+    } else {
+        ApiError::Forbidden("需要管理员权限：当前账户不是管理员".to_owned())
+            .into_response_with(&request_id)
+    }
 }
 
 /// 对外暴露的账户视图；字段与 `/account/me` 保持一致，额外包含管理需要的 `status`。
@@ -528,10 +546,386 @@ fn read_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
         .map_err(|error| ApiError::BadRequest(format!("请求体不是合法 JSON：{error}")))
 }
 
+/// 管理页的过滤条件：合法的 `?status=`，外加（若有）无法识别的原始输入。
+#[derive(Debug)]
+struct Filter {
+    /// 生效的状态过滤；`None` 表示显示全部。
+    status: Option<UserStatus>,
+    /// 无法识别的 `?status=` 原文：页面提示「已忽略」并**转义**后回显。
+    unknown: Option<String>,
+}
+
+/// `GET /admin`：只读的用户表格，所有改动都是页面上的表单 POST。
+pub(crate) async fn page(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    query: RawQuery,
+) -> Response {
+    let Some(users) = state.accounts() else {
+        return accounts_unavailable_page();
+    };
+    let filter = match parse_filter(query.0.as_deref()) {
+        Ok(filter) => filter,
+        Err(error) => return error_page(&error, &request_id),
+    };
+    let (list, total) = match users.list(filter.status, MAX_LIMIT, 0).await {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::error!(error = %error, "管理页列出账户失败");
+            return accounts_unavailable_page();
+        },
+    };
+    let min_password_len = state.config().accounts.min_password_len;
+    let body = render_page(&list, total, &filter, min_password_len);
+    html_response(StatusCode::OK, page_shell("账户管理", &body))
+}
+
+/// 没有账户库时的管理页：503 页而不是空表格（空表格会被误读成「一个账户都没有」）。
+fn accounts_unavailable_page() -> Response {
+    let body = format!(
+        r#"<h1>管理页不可用</h1><p class="error">{}</p>"#,
+        escape_html(ACCOUNTS_NOT_CONFIGURED_MESSAGE)
+    );
+    html_response(StatusCode::SERVICE_UNAVAILABLE, page_shell("管理页不可用", &body))
+}
+
+/// 解析管理页的 `?status=`。
+fn parse_filter(raw: Option<&str>) -> Result<Filter, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Filter { status: None, unknown: None });
+    };
+    let fields = parse_form(raw)?;
+    let Some(value) = fields.get("status").filter(|value| !value.is_empty()) else {
+        return Ok(Filter { status: None, unknown: None });
+    };
+    match UserStatus::parse(value) {
+        Some(status) => Ok(Filter { status: Some(status), unknown: None }),
+        None => Ok(Filter { status: None, unknown: Some(value.clone()) }),
+    }
+}
+
+/// 渲染整页：过滤链接、提示、表格。
+fn render_page(list: &[User], total: u64, filter: &Filter, min_password_len: usize) -> String {
+    let mut body = String::from("<h1>账户管理</h1>");
+    body.push_str(&format!(
+        r#"<p class="hint">共 {total} 个账户，本页显示 {} 个（每页最多 {MAX_LIMIT} 个）。删除账户不会删除任何 LFS 对象：对象全局共享、内容寻址。</p>"#,
+        list.len()
+    ));
+    body.push_str(&render_filters(filter));
+    if let Some(unknown) = &filter.unknown {
+        body.push_str(&format!(
+            r#"<p class="error">无法识别的状态过滤 “{}”，已显示全部账户；可选 active、pending、disabled。</p>"#,
+            escape_html(unknown)
+        ));
+    }
+    let rows = list
+        .iter()
+        .map(|user| render_row(user, filter.status, min_password_len))
+        .collect::<Vec<_>>();
+    body.push_str(&table(&["用户名", "角色", "状态", "创建时间", "最后登录", "操作"], &rows));
+    body.push_str(
+        r#"<p class="hint">账户来自账户库；<code>[auth.users]</code> 里的配置用户在首次登录后才会出现在这里。</p>"#,
+    );
+    body
+}
+
+/// 状态过滤链接；每个链接都带 `?status=`，当前生效的那条加「(当前)」。
+fn render_filters(filter: &Filter) -> String {
+    let mut html = String::from(r#"<nav class="filters">"#);
+    for (label, status) in [
+        ("全部", None),
+        ("正常", Some(UserStatus::Active)),
+        ("待审批", Some(UserStatus::Pending)),
+        ("已禁用", Some(UserStatus::Disabled)),
+    ] {
+        let href = match status {
+            Some(status) => format!("/admin?status={}", status.as_str()),
+            None => "/admin".to_owned(),
+        };
+        let current = if filter.status == status { " <strong>(当前)</strong>" } else { "" };
+        html.push_str(&format!(r#"<a href="{href}">{label}{current}</a>"#));
+    }
+    html.push_str("</nav>");
+    html
+}
+
+/// 一行表格：纯文本单元格全部转义，最后一格是操作表单。
+fn render_row(user: &User, filter: Option<UserStatus>, min_password_len: usize) -> Vec<String> {
+    vec![
+        escape_html(&user.username),
+        format!(r#"<span title="{}">{}</span>"#, user.role.as_str(), role_label(user.role)),
+        format!(r#"<span title="{}">{}</span>"#, user.status.as_str(), status_label(user.status)),
+        format_unix_seconds(user.created_at),
+        match user.last_login_at {
+            Some(seconds) => format_unix_seconds(seconds),
+            None => "从未登录".to_owned(),
+        },
+        render_actions(user, filter, min_password_len),
+    ]
+}
+
+/// 操作格：按状态给「批准 / 禁用 / 启用」，外加角色切换、重置口令与删除。
+///
+/// 每个按钮各自一个 `<form>`（HTML 不允许嵌套表单）；当前过滤条件作为隐藏字段
+/// 随表单提交，操作完再跳回同一个过滤视图。
+fn render_actions(user: &User, filter: Option<UserStatus>, min_password_len: usize) -> String {
+    // 用户名虽然按规则只允许 ASCII 字母数字与 `.` `_` `-`，这里仍然转义：页面渲染要对
+    // 「有人手工改库、或将来放宽用户名规则」保持安全，属性值也不例外。
+    let name = escape_html(&user.username);
+    let hidden = filter
+        .map(|status| format!(r#"<input type="hidden" name="status" value="{}">"#, status.as_str()))
+        .unwrap_or_default();
+
+    let mut html = String::from(r#"<div class="actions">"#);
+    let (action, label) = match user.status {
+        UserStatus::Pending => ("approve", "批准"),
+        UserStatus::Active => ("disable", "禁用"),
+        UserStatus::Disabled => ("enable", "启用"),
+    };
+    html.push_str(&format!(
+        r#"<form method="post" action="/admin/users/{name}/{action}">{hidden}<button type="submit">{label}</button></form>"#
+    ));
+
+    let mut options = String::new();
+    for role in [Role::Readonly, Role::Readwrite, Role::Admin] {
+        let selected = if role == user.role { " selected" } else { "" };
+        options.push_str(&format!(
+            r#"<option value="{}"{selected}>{}</option>"#,
+            role.as_str(),
+            role_label(role)
+        ));
+    }
+    html.push_str(&format!(
+        r#"<form method="post" action="/admin/users/{name}/role">{hidden}<select name="role">{options}</select><button type="submit">保存角色</button></form>"#
+    ));
+
+    html.push_str(&format!(
+        r#"<form method="post" action="/admin/users/{name}/password-form">{hidden}<input type="password" name="password" placeholder="新口令" autocomplete="new-password" required minlength="{min_password_len}"><button type="submit">重置口令</button></form>"#
+    ));
+
+    // 删除是不可逆的：浏览器侧 `required` 勾选框 + 服务端再查一次 `confirm` 字段。
+    html.push_str(&format!(
+        r#"<form method="post" action="/admin/users/{name}/delete">{hidden}<label class="inline"><input type="checkbox" name="confirm" value="yes" required>确认删除</label><button type="submit" class="danger">删除</button></form>"#
+    ));
+    html.push_str("</div>");
+    html
+}
+
+/// 角色在页面上的中文标签。
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Readonly => "只读",
+        Role::Readwrite => "读写",
+        Role::Admin => "管理员",
+    }
+}
+
+/// 状态在页面上的中文标签。
+fn status_label(status: UserStatus) -> &'static str {
+    match status {
+        UserStatus::Active => "正常",
+        UserStatus::Pending => "待审批",
+        UserStatus::Disabled => "已禁用",
+    }
+}
+
+/// `POST /admin/users/{name}/approve`：待审批 → 正常（303）。
+pub(crate) async fn approve(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    set_status(state, auth, request_id, name, body, UserStatus::Active).await
+}
+
+/// `POST /admin/users/{name}/disable`：正常 → 已禁用（303）。
+pub(crate) async fn disable(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    set_status(state, auth, request_id, name, body, UserStatus::Disabled).await
+}
+
+/// `POST /admin/users/{name}/enable`：已禁用 → 正常（303）。
+pub(crate) async fn enable(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    set_status(state, auth, request_id, name, body, UserStatus::Active).await
+}
+
+/// 三个状态按钮的公共实现：解析隐藏的过滤条件 → 调 [`patch_account`] → 303 回管理页。
+async fn set_status(
+    state: AppState,
+    auth: AuthUser,
+    request_id: RequestId,
+    name: String,
+    body: Bytes,
+    status: UserStatus,
+) -> Response {
+    let fields = match form_fields(&body) {
+        Ok(fields) => fields,
+        Err(error) => return error_page(&error, &request_id),
+    };
+    let filter = fields.get("status").and_then(|value| UserStatus::parse(value));
+    let changes = PatchPayload { role: None, status: Some(status) };
+    match patch_account(&state, &request_id, &auth, &name, changes).await {
+        Ok(_) => redirect_to_admin(filter),
+        Err(error) => error_page(&error, &request_id),
+    }
+}
+
+/// `POST /admin/users/{name}/role`：切换角色（303）。
+pub(crate) async fn role_form(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let fields = match form_fields(&body) {
+        Ok(fields) => fields,
+        Err(error) => return error_page(&error, &request_id),
+    };
+    let filter = fields.get("status").and_then(|value| UserStatus::parse(value));
+    let role = match fields.get("role").map(String::as_str) {
+        Some(raw) => match Role::parse(raw) {
+            Some(role) => role,
+            None => {
+                let error = ApiError::BadRequest(format!(
+                    "未知的角色 {raw}：只能是 readonly、readwrite 或 admin"
+                ));
+                return error_page(&error, &request_id);
+            },
+        },
+        None => {
+            let error = ApiError::BadRequest("缺少表单字段 role".to_owned());
+            return error_page(&error, &request_id);
+        },
+    };
+    let changes = PatchPayload { role: Some(role), status: None };
+    match patch_account(&state, &request_id, &auth, &name, changes).await {
+        Ok(_) => redirect_to_admin(filter),
+        Err(error) => error_page(&error, &request_id),
+    }
+}
+
+/// `POST /admin/users/{name}/password-form`：管理页的重置口令表单（303）。
+pub(crate) async fn password_form(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let fields = match form_fields(&body) {
+        Ok(fields) => fields,
+        Err(error) => return error_page(&error, &request_id),
+    };
+    let filter = fields.get("status").and_then(|value| UserStatus::parse(value));
+    let Some(password) = fields.get("password").filter(|value| !value.is_empty()).cloned() else {
+        let error = ApiError::BadRequest("缺少表单字段 password".to_owned());
+        return error_page(&error, &request_id);
+    };
+    match reset_password_for(&state, &request_id, &auth, &name, password).await {
+        Ok(()) => redirect_to_admin(filter),
+        Err(error) => error_page(&error, &request_id),
+    }
+}
+
+/// `POST /admin/users/{name}/delete`：管理页的删除表单（303）。
+///
+/// 页面上的勾选框只是浏览器侧的护栏，服务端同样要求 `confirm` 字段：不能指望
+/// 每个客户端都执行 HTML 校验。
+pub(crate) async fn delete_form(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let fields = match form_fields(&body) {
+        Ok(fields) => fields,
+        Err(error) => return error_page(&error, &request_id),
+    };
+    let filter = fields.get("status").and_then(|value| UserStatus::parse(value));
+    if !fields.get("confirm").is_some_and(|value| !value.is_empty()) {
+        let error = ApiError::BadRequest("删除需要先勾选确认框".to_owned());
+        return error_page(&error, &request_id);
+    }
+    match delete_account(&state, &request_id, &auth, &name).await {
+        Ok(()) => redirect_to_admin(filter),
+        Err(error) => error_page(&error, &request_id),
+    }
+}
+
+/// 解析表单请求体（`application/x-www-form-urlencoded`）。
+fn form_fields(body: &[u8]) -> Result<HashMap<String, String>, ApiError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| ApiError::BadRequest("表单不是合法的 UTF-8".to_owned()))?;
+    parse_form(text)
+}
+
+/// 表单操作成功后的回跳地址：保留当前 `?status=` 过滤，避免审批完丢掉上下文。
+fn redirect_to_admin(filter: Option<UserStatus>) -> Response {
+    let location = match filter {
+        Some(status) => format!("/admin?status={}", status.as_str()),
+        None => "/admin".to_owned(),
+    };
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(LOCATION, value);
+    }
+    response
+}
+
+/// 表单操作的失败页：状态码沿用 [`ApiError`]，消息与 request id 都转义后回显。
+fn error_page(error: &ApiError, request_id: &RequestId) -> Response {
+    let status = error.status();
+    let body = format!(
+        r#"<h1>操作失败</h1><p class="error">{}</p><p class="hint">请求 id：{}</p><p class="hint"><a href="/admin">返回管理页</a></p>"#,
+        escape_html(error.message()),
+        escape_html(request_id.as_str())
+    );
+    html_response(status, page_shell("操作失败", &body))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_list_query;
-    use crate::accounts::UserStatus;
+    use super::{
+        Filter, MAX_LIMIT, parse_filter, parse_list_query, render_actions, role_label, status_label,
+    };
+    use crate::accounts::{User, UserStatus};
+    use crate::config::Role;
+
+    #[test]
+    fn given_hostile_username_when_render_actions_then_escaped_in_attributes() {
+        let user = User {
+            username: "<script>alert(1)</script>".to_owned(),
+            role: Role::Admin,
+            status: UserStatus::Active,
+            created_at: 0,
+            last_login_at: None,
+        };
+
+        let html = render_actions(&user, None, 12);
+
+        assert!(!html.contains("<script"), "属性值也必须转义：{html}");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "实际：{html}");
+        // 状态按钮、角色下拉、口令输入与删除确认都在同一格里。
+        assert!(html.contains("/disable"), "active 账户应给「禁用」");
+        assert!(html.contains(r#"<select name="role">"#));
+        assert!(html.contains(r#"name="confirm" value="yes" required"#));
+    }
 
     #[test]
     fn given_query_when_parse_list_then_defaults_and_filters() {
@@ -545,8 +939,10 @@ mod tests {
             (None, 50, 0)
         );
         // 上限由账户库截断，解析层只负责接受大值（不报错）。
-        let (_, limit, _) = parse_list_query(Some("limit=1000")).expect("大值可接受");
-        assert_eq!(limit, 1000);
+        assert_eq!(
+            parse_list_query(Some(&format!("limit={}", MAX_LIMIT + 900))).expect("大值可接受").1,
+            MAX_LIMIT + 900
+        );
     }
 
     #[test]
@@ -555,5 +951,28 @@ mod tests {
         assert!(parse_list_query(Some("limit=abc")).is_err(), "非整数 limit 应 400");
         assert!(parse_list_query(Some("limit=-1")).is_err(), "负数 limit 应 400");
         assert!(parse_list_query(Some("offset=%zz")).is_err(), "非法转义应 400");
+    }
+
+    #[test]
+    fn given_status_query_when_parse_filter_then_known_and_unknown() {
+        assert_eq!(parse_filter(None).expect("缺省").status, None);
+        assert_eq!(
+            parse_filter(Some("status=active")).expect("合法").status,
+            Some(UserStatus::Active)
+        );
+
+        let unknown: Filter = parse_filter(Some("status=bogus")).expect("未知值不报错");
+        assert_eq!(unknown.status, None);
+        assert_eq!(unknown.unknown.as_deref(), Some("bogus"), "原文留给页面提示（转义后回显）");
+    }
+
+    #[test]
+    fn given_roles_and_statuses_when_label_then_chinese() {
+        assert_eq!(role_label(Role::Admin), "管理员");
+        assert_eq!(role_label(Role::Readwrite), "读写");
+        assert_eq!(role_label(Role::Readonly), "只读");
+        assert_eq!(status_label(UserStatus::Active), "正常");
+        assert_eq!(status_label(UserStatus::Pending), "待审批");
+        assert_eq!(status_label(UserStatus::Disabled), "已禁用");
     }
 }
