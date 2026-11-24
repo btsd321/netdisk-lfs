@@ -654,12 +654,21 @@ impl<R: AsyncRead + Unpin> AsyncRead for BodyReader<R> {
     }
 }
 
+/// Drop 时的收尾结论：已读出字节达到期望长度记 ok，否则 aborted。
+///
+/// 近似说明：`bytes` 是**从本地文件读出**的字节数（交给 ReaderStream 的缓冲），
+/// 不是已写入 socket 的字节数。客户端在最后一块读完之后、刷出之前断开时，这里
+/// 仍会记 ok——窗口很小（≤64 KiB），只影响遥测口径，不影响数据正确性。
+fn dropped_outcome(bytes: u64, expected: u64) -> &'static str {
+    if bytes >= expected { OUTCOME_OK } else { OUTCOME_ABORTED }
+}
+
 impl<R> Drop for BodyReader<R> {
     fn drop(&mut self) {
         // 走到这里还没 settle 的原因有两种：客户端断连，或 hyper 在 Content-Length
-        // 满足后直接丢弃 body（不再 poll 到 EOF，小对象尤其常见）。已发出的字节数
-        // 达到期望长度就说明传输完整，别把成功记成 aborted；没发完才是真断连。
-        let outcome = if self.bytes >= self.expected { OUTCOME_OK } else { OUTCOME_ABORTED };
+        // 满足后直接丢弃 body（不再 poll 到 EOF，小对象尤其常见）。按已读出字节数
+        // 与期望长度比较，避免把成功记成 aborted（口径近似见 `dropped_outcome`）。
+        let outcome = dropped_outcome(self.bytes, self.expected);
         self.settle(outcome);
         // `reader`、`_temp` 随后按声明顺序 Drop：先关文件，再删中转文件。
     }
@@ -669,11 +678,20 @@ impl<R> Drop for BodyReader<R> {
 mod tests {
     use axum::http::HeaderValue;
 
-    use super::{RangeSpec, content_range, parse_range};
+    use super::{RangeSpec, content_range, dropped_outcome, parse_range};
+    use crate::http::{OUTCOME_ABORTED, OUTCOME_OK};
 
     /// 造一个 `Range` 头值。
     fn range(value: &str) -> HeaderValue {
         HeaderValue::from_str(value).expect("测试用 Range 头值合法")
+    }
+
+    #[test]
+    fn given_bytes_and_expected_when_dropped_outcome_then_completion_classified() {
+        // 发满（含 0 字节空对象）→ ok；没发完 → aborted。
+        assert_eq!(dropped_outcome(43, 43), OUTCOME_OK);
+        assert_eq!(dropped_outcome(0, 0), OUTCOME_OK, "空对象不发字节也算完成");
+        assert_eq!(dropped_outcome(42, 43), OUTCOME_ABORTED);
     }
 
     #[test]

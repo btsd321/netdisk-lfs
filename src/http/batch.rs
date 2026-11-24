@@ -4,7 +4,8 @@
 //!
 //! - 单个对象的错误写进 `objects[].error`，HTTP 仍是 200；只有整体失败
 //!   （请求体非法、批次超限、`bdpan` 失败）才用 4xx/5xx；
-//! - `href` 一律返回**相对路径**，由客户端按请求 URL 解析，避免反代后主机名错乱。
+//! - `href` 必须是**绝对 URL**（git-lfs 3.4.1 拒绝相对路径，实测报 `missing protocol`）：
+//!   优先用 `server.public_base`，为空时按请求的 `Host` 与 `X-Forwarded-Proto` 推导。
 //!
 //! 上传协商只在对象不存在时给 `upload` action；已存在则不给（客户端据此跳过传输），
 //! 但附带 `verify` 让客户端补一次校验。
@@ -327,7 +328,7 @@ struct Actions {
 /// 一个 action 的目标与附加请求头。
 #[derive(Debug, Serialize)]
 struct Action {
-    /// 相对路径，由客户端按请求 URL 解析。
+    /// 绝对 URL（含 scheme 与 authority），由 [`super::action_base`] 拼出。
     href: String,
     /// 客户端调用该 action 时要带的头；`None` 时整个字段省略（verify 即如此）。
     #[serde(skip_serializing_if = "Option::is_none")]
