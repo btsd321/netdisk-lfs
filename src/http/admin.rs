@@ -723,7 +723,7 @@ pub(crate) async fn page(
     let min_password_len = state.config().accounts.min_password_len;
     let body = render_page(&list, total, &stats, &filter, min_password_len);
     // 认证只放行 active 账户（DB 与 config 两条路径都查了状态），所以当前账号在
-    // 页面上的状态恒为「正常」，不必为 chip 再查一次库。
+    // 页面上的状态恒为「已启用」，不必为 chip 再查一次库。
     html_response(
         StatusCode::OK,
         layout::authed_page(
@@ -742,9 +742,9 @@ fn render_stats(counts: &StatusCounts) -> String {
     let mut html = String::from(r#"<section class="stats" aria-label="账户统计">"#);
     for (label, count) in [
         ("总数", counts.total),
-        ("待审批", counts.pending),
-        ("已启用", counts.active),
-        ("已禁用", counts.disabled),
+        (status_label(UserStatus::Pending), counts.pending),
+        (status_label(UserStatus::Active), counts.active),
+        (status_label(UserStatus::Disabled), counts.disabled),
     ] {
         html.push_str(&format!(
             r#"<div class="stat"><span class="stat-n">{count}</span><span class="stat-k">{label}</span></div>"#
@@ -831,7 +831,17 @@ fn render_page(
         list.len()
     ));
     if list.is_empty() {
-        body.push_str(r#"<p class="note">当前筛选下没有账户。</p>"#);
+        let offset = u64::from(filter.page.offset);
+        if total > 0 && offset >= total {
+            // 页码越界（手工改地址栏，或翻页后数据变少）不是「没有账户」，而是
+            // 「这个位置没有账户」：给出实际总数并给一条回到第一页的路。
+            body.push_str(&format!(
+                r#"<p class="note">偏移 {offset} 超出范围：当前筛选下共 {total} 个账户。<a href="{}">回到第一页</a></p>"#,
+                page_location(PageQuery { status: filter.page.status, offset: 0 })
+            ));
+        } else {
+            body.push_str(r#"<p class="note">当前筛选下没有账户。</p>"#);
+        }
     } else {
         let rows = list
             .iter()
@@ -890,11 +900,12 @@ fn render_pager(filter: &Filter, total: u64) -> String {
 /// 状态筛选页签：每个链接都带 `?status=`，当前生效的那条标 `aria-current`。
 fn render_tabs(filter: &Filter) -> String {
     let mut html = String::from(r#"<nav class="tabs" aria-label="按状态筛选">"#);
+    // 页签文案与表格、统计条共用 status_label：同一状态在页面上只能有一种说法。
     for (label, status) in [
         ("全部", None),
-        ("待审批", Some(UserStatus::Pending)),
-        ("已启用", Some(UserStatus::Active)),
-        ("已禁用", Some(UserStatus::Disabled)),
+        (status_label(UserStatus::Pending), Some(UserStatus::Pending)),
+        (status_label(UserStatus::Active), Some(UserStatus::Active)),
+        (status_label(UserStatus::Disabled), Some(UserStatus::Disabled)),
     ] {
         let href = page_location(PageQuery { status, offset: 0 });
         let current = if filter.page.status == status { r#" aria-current="page""# } else { "" };
@@ -997,7 +1008,7 @@ fn hidden_page_fields(page: PageQuery) -> String {
     hidden
 }
 
-/// `POST /admin/users/{name}/approve`：待审批 → 正常（303）。
+/// `POST /admin/users/{name}/approve`：待审批 → 已启用（303）。
 pub(crate) async fn approve(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -1012,7 +1023,7 @@ pub(crate) async fn approve(
     set_status(state, auth, request_id, name, body, UserStatus::Active).await
 }
 
-/// `POST /admin/users/{name}/disable`：正常 → 已禁用（303）。
+/// `POST /admin/users/{name}/disable`：已启用 → 已禁用（303）。
 pub(crate) async fn disable(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -1027,7 +1038,7 @@ pub(crate) async fn disable(
     set_status(state, auth, request_id, name, body, UserStatus::Disabled).await
 }
 
-/// `POST /admin/users/{name}/enable`：已禁用 → 正常（303）。
+/// `POST /admin/users/{name}/enable`：已禁用 → 已启用（303）。
 pub(crate) async fn enable(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
@@ -1269,7 +1280,7 @@ mod tests {
         assert_eq!(role_label(Role::Admin), "管理员");
         assert_eq!(role_label(Role::Readwrite), "读写");
         assert_eq!(role_label(Role::Readonly), "只读");
-        assert_eq!(status_label(UserStatus::Active), "正常");
+        assert_eq!(status_label(UserStatus::Active), "已启用");
         assert_eq!(status_label(UserStatus::Pending), "待审批");
         assert_eq!(status_label(UserStatus::Disabled), "已禁用");
     }

@@ -67,7 +67,7 @@ pub(crate) fn role_label(role: Role) -> &'static str {
 /// 状态在页面上的中文标签。
 pub(crate) fn status_label(status: UserStatus) -> &'static str {
     match status {
-        UserStatus::Active => "正常",
+        UserStatus::Active => "已启用",
         UserStatus::Pending => "待审批",
         UserStatus::Disabled => "已禁用",
     }
@@ -153,7 +153,7 @@ const BRAND_MARK: &str =
 const FACTS: &str = r#"<ul class="facts">
 <li><span class="fact-k">Git LFS 协议</span><span class="fact-v">git push/pull 照常使用，大对象不进 Git 历史，仓库里只留指针。</span></li>
 <li><span class="fact-k">网盘对象存储</span><span class="fact-v">对象按 sha256 内容寻址，落在百度网盘 <code>/apps/bdpan/</code> 下。</span></li>
-<li><span class="fact-k">审批制账户</span><span class="fact-v">自助注册后由管理员启用；浏览器用会话 Cookie，Git 客户端用 HTTP Basic。</span></li>
+<li><span class="fact-k">账户分级</span><span class="fact-v">只读 / 读写 / 管理员三档；浏览器用会话 Cookie，Git 客户端用 HTTP Basic。</span></li>
 </ul>"#;
 
 /// 页脚：服务身份 + 探针/指标端点（相对链接，注明只在本机监听）。
@@ -613,7 +613,7 @@ mod tests {
 
         assert!(page.contains("alice"), "chip 必须显示用户名");
         assert!(page.contains("读写"), "chip 必须显示角色");
-        assert!(page.contains(">正常<"), "chip 必须显示状态");
+        assert!(page.contains(">已启用<"), "chip 必须显示状态");
         assert!(page.contains(r#"aria-current="page""#), "当前导航项要标出来");
         assert!(page.contains(r#"<form method="post" action="/logout""#));
         assert!(page.contains("退出登录"));
@@ -691,6 +691,17 @@ mod tests {
         assert!(page.contains("max-width: 720px"));
         assert!(page.contains("prefers-reduced-motion: reduce"));
         assert!(page.contains("--bg: #dfdedb") && page.contains("--accent: #2456d6"));
+    }
+
+    #[test]
+    fn given_public_page_when_registration_policy_would_differ_then_facts_stay_neutral() {
+        // 左侧三条事实与注册策略无关：approval 的提示只由登录/注册页正文按策略给出。
+        // 否则 registration = open 或 closed 时，左侧「需审批」的说法会与页面自相矛盾。
+        let page = public_page("登录", "说明", "");
+
+        assert!(page.contains("账户分级"), "事实应写账户分级：{page}");
+        assert!(page.contains("Git LFS 协议") && page.contains("网盘对象存储"));
+        assert!(!page.contains("审批"), "公开页外壳不得承诺审批制：{page}");
     }
 
     #[test]

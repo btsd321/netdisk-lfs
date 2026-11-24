@@ -217,7 +217,7 @@ async fn given_session_when_get_account_then_identity_panels_and_logout() {
     assert!(page.contains(r#"class="initial""#), "应有首字母方块：{page}");
     assert!(page.contains("alice"));
     assert!(page.contains(">读写<"), "角色徽章：{page}");
-    assert!(page.contains(">正常<"), "状态点 + 文字：{page}");
+    assert!(page.contains(">已启用<"), "状态点 + 文字：{page}");
     assert!(page.contains("创建时间") && page.contains("最后登录"));
     // LFS 面板：端点、.lfsconfig 片段、三步命令。
     assert!(page.contains("http://lfs.test/lfs/"));
@@ -307,6 +307,10 @@ async fn given_session_when_get_admin_then_stats_tabs_and_logout() {
         );
     }
 
+    // 状态文案只有一套：表格、统计条、页签都用「已启用 / 待审批 / 已禁用」。
+    assert!(!page.contains(">正常<"), "表格不该再用「正常」：{page}");
+    assert!(page.contains(">已启用<"), "表格与统计条都写「已启用」：{page}");
+
     // 表格行：三种状态各一行，操作表单保留原有端点。
     assert!(page.contains("<table>"));
     assert!(page.contains("/admin/users/pending-pal/approve"));
@@ -327,6 +331,27 @@ async fn given_session_when_filter_has_no_match_then_empty_state() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("当前筛选下没有账户"), "空筛选要有空状态：{page}");
     assert!(!page.contains("<table>"), "没有行就不渲染空表格：{page}");
+}
+
+#[tokio::test]
+async fn given_offset_beyond_total_when_get_admin_then_out_of_range_hint_and_first_page_link() {
+    let app = TestApp::new();
+    app.seed("worker", Role::Readwrite, UserStatus::Active).await;
+    let id = app.session("root", Role::Admin);
+
+    let (status, _, page) = app
+        .send(Req::new(Method::GET, "/admin?status=active&offset=100").cookie(&id).build())
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    // 越界不是「这个筛选下没有账户」：说清实际总数，并给一条保留筛选的回头路。
+    assert!(page.contains("超出范围"), "越界要有专门提示：{page}");
+    assert!(page.contains("共 1 个账户"), "要说清当前筛选下的实际总数：{page}");
+    assert!(
+        page.contains(r#"<a href="/admin?status=active">回到第一页</a>"#),
+        "回到第一页要保留筛选：{page}"
+    );
+    assert!(!page.contains("当前筛选下没有账户"), "不能把越界说成空筛选：{page}");
 }
 
 #[tokio::test]
@@ -363,7 +388,7 @@ async fn given_root_when_get_then_ticket_form_register_link_and_approval_hint() 
     // 左侧三条事实：协议、存储、账户。
     assert!(page.contains("Git LFS 协议"));
     assert!(page.contains("网盘对象存储"));
-    assert!(page.contains("审批制账户"));
+    assert!(page.contains("账户分级"), "事实必须与注册策略无关");
 }
 
 #[tokio::test]
@@ -410,7 +435,8 @@ async fn given_rendered_page_when_read_css_then_ledger_tokens_and_breakpoints() 
     assert!(page.contains("--bg: #dfdedb"));
     assert!(page.contains("--surface: #d3d2ce"));
     assert!(page.contains("--ink: #26251e"));
-    assert!(page.contains("--muted: #6b6a62"));
+    assert!(page.contains("--muted: #55544d"));
+    assert!(page.contains("--danger-ink: #b42318"));
     assert!(page.contains("--rule: #c2c1ba"));
     assert!(page.contains("--accent: #2456d6"));
     assert!(page.contains("--radius: 2px"));
