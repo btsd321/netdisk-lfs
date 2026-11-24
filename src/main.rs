@@ -9,9 +9,12 @@ mod cli;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
-use netdisk_lfs::{Config, ConfigError, EnvSource, init_logging, router};
+use netdisk_lfs::{
+    AppState, BdpanStore, Config, ConfigError, EnvSource, ObjectStore, init_logging, router,
+};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -85,12 +88,19 @@ fn serve(config: Config) -> Result<(), StartupError> {
 
 async fn run(config: Config) -> Result<(), StartupError> {
     let addr = config.server.listen;
+
+    // 构造后端不触发任何子进程：`bdpan` 只在第一次真实读写时才被调用，
+    // 所以配置错误（如路径不可执行）不会在这里暴露，而是留给首个请求与
+    // 部署分支的 `whoami` 探活。
+    let store: Arc<dyn ObjectStore> = Arc::new(BdpanStore::from_storage(&config.storage));
+    let state = AppState::new(store, Arc::new(config));
+
     let listener =
         TcpListener::bind(addr).await.map_err(|source| StartupError::Bind { addr, source })?;
     let bound = listener.local_addr().unwrap_or(addr);
     info!(address = %bound, "开始监听");
 
-    axum::serve(listener, router())
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(StartupError::Serve)?;
