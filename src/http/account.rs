@@ -7,17 +7,34 @@
 //! 账户库未接入时统一 503：没有库就没有可改的账户（config 用户改口令请直接改
 //! `config.toml` 后重启）。
 
+//! 自身账户端点：`GET /account`（HTML 落地页）、`GET /account/me`、
+//! `POST /account/password`、`DELETE /account`。
+//!
+//! 三个 API 端点挂认证（任意角色），只能操作**自己**——用户名取自认证中间件写进
+//! 请求扩展的 [`AuthUser`]，没有「按用户名指定目标」的入口，因此不存在越权修改他人
+//! 账户的可能；管理员管理他人账户是 C3 的 `/admin/*`。
+//!
+//! `GET /account` 是浏览器登录后的落地页：只读展示「我是谁 + LFS 端点怎么配 + 退出」，
+//! 不提供任何改密/注销按钮（那两个是 API，走 `POST /account/password` 与
+//! `DELETE /account`，需要重新确认口令）。账户库未接入时它照样能渲染：config-only
+//! 用户本来就该有落地页，只是创建/最后登录时间显示 `—`。
+//!
+//! 账户库未接入时 API 端点统一 503：没有库就没有可改的账户（config 用户改口令请
+//! 直接改 `config.toml` 后重启）。
+
 use axum::Extension;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use super::admin::{role_label, status_label};
 use super::auth::AuthUser;
 use super::error::ApiError;
+use super::html::{escape_html, format_unix_seconds, html_response, page_shell, table};
 use super::{
     ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
-    config_admin_fallback, config_username, json_with_status, passwords,
+    action_base, config_admin_fallback, config_username, json_with_status, passwords,
 };
 use crate::accounts::{AccountError, User, UserStatus, validate_password};
 use crate::config::Role;
@@ -69,6 +86,102 @@ impl AccountView {
             last_login_at: None,
         }
     }
+}
+
+/// `GET /account`：登录后的落地页（无脚本；退出走表单 POST `/logout`）。
+///
+/// 与 [`me`] 共用 [`AccountView`]，但**不**因为账户库未接入就 503：config-only 用户
+/// 也有权看到自己的身份与 LFS 端点，只是创建/最后登录时间显示 `—`。
+pub(crate) async fn page(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let view = match state.accounts() {
+        Some(users) => match users.get(&auth.username).await {
+            Ok(Some(user)) => AccountView::from_user(&user),
+            // 库里没有这一行：config-only 用户（尚未懒升级，或用户名不符合库规则）。
+            // 认证中间件刚刚放行过，这里按配置视图展示，不再 503。
+            Ok(None) | Err(AccountError::InvalidUsername { .. }) => {
+                AccountView::from_config(&auth.username, auth.role)
+            },
+            Err(error) => {
+                tracing::error!(username = %auth.username, error = %error, "账户页读取自身账户失败");
+                return problem_page(ACCOUNTS_UNAVAILABLE_MESSAGE);
+            },
+        },
+        None => AccountView::from_config(&auth.username, auth.role),
+    };
+    // 与 batch 下发的 href 同一份推导：`public_base` 优先，否则按请求头算。
+    let base = action_base(state.config(), &headers);
+    tracing::debug!(request_id = %request_id, username = %view.username, "渲染账户页");
+    html_response(StatusCode::OK, page_shell("我的账户", &render_page(&view, &base)))
+}
+
+/// 账户页读库失败时的 503 页。
+fn problem_page(message: &str) -> Response {
+    let body =
+        format!(r#"<h1>我的账户暂时不可用</h1><p class="error">{}</p>"#, escape_html(message));
+    html_response(StatusCode::SERVICE_UNAVAILABLE, page_shell("我的账户", &body))
+}
+
+/// 账户页正文：身份表格 + LFS 端点与 `.lfsconfig` 片段 + 退出表单。
+///
+/// 所有动态文本都过 [`escape_html`]：`base` 在没有 `public_base` 时来自 `Host` 头，
+/// 用户名来自账户库，两者都必须按不可信输入处理。
+fn render_page(view: &AccountView, base: &str) -> String {
+    let time = |seconds: Option<i64>| match seconds {
+        Some(seconds) => format_unix_seconds(seconds),
+        // 只有 config-only 用户会走到这里（库里有行就一定有 created_at）。
+        None => "—".to_owned(),
+    };
+    let rows = vec![
+        vec!["用户名".to_owned(), escape_html(&view.username)],
+        vec![
+            "角色".to_owned(),
+            format!(
+                r#"<span title="{}">{}</span>"#,
+                view.role.as_str(),
+                escape_html(role_label(view.role))
+            ),
+        ],
+        vec![
+            "状态".to_owned(),
+            format!(
+                r#"<span title="{}">{}</span>"#,
+                view.status.as_str(),
+                escape_html(status_label(view.status))
+            ),
+        ],
+        vec!["创建时间".to_owned(), time(view.created_at)],
+        vec!["最后登录".to_owned(), time(view.last_login_at)],
+    ];
+
+    let mut body = String::from("<h1>我的账户</h1>");
+    body.push_str(
+        r#"<p class="hint">当前以会话 Cookie 登录，无需再输入口令；Git 客户端请用同一账户的 HTTP Basic 凭据。</p>"#,
+    );
+    body.push_str(&table(&["项目", "值"], &rows));
+    body.push_str(&format!(
+        r#"<h2>LFS 端点</h2>
+<p>把仓库的 LFS 地址指向 <code>{}</code>：</p>
+<pre>[lfs]
+	url = {}</pre>
+<p class="hint">在仓库根目录提交 <code>.lfsconfig</code> 后，<code>git lfs push/pull</code> 会自动使用该地址（凭据仍走 HTTP Basic）。</p>"#,
+        escape_html(base),
+        escape_html(base)
+    ));
+    body.push_str(
+        r#"<h2>退出</h2>
+<form method="post" action="/logout">
+<button type="submit" class="danger">退出登录</button>
+</form>"#,
+    );
+    if view.role == Role::Admin {
+        body.push_str(r#"<p class="hint"><a href="/admin">管理账户</a></p>"#);
+    }
+    body
 }
 
 /// `GET /account/me`：返回当前登录账户的资料。

@@ -23,7 +23,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{get, patch, post, put};
 use serde::Serialize;
 use tracing::{Instrument, Span, field, info_span};
 
@@ -276,7 +276,7 @@ fn account_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/account/me", get(account::me))
         .route("/account/password", post(account::change_password))
-        .route("/account", delete(account::delete_self))
+        .route("/account", get(account::page).delete(account::delete_self))
         .route_layer(middleware::from_fn_with_state(state, auth::require))
 }
 

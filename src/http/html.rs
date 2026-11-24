@@ -194,6 +194,24 @@ pub(crate) fn parse_form(body: &str) -> Result<HashMap<String, String>, ApiError
     Ok(fields)
 }
 
+/// 百分号编码：只保留 RFC 3986 §2.3 的 unreserved 字符，其余一律编成 `%XX`（大写）。
+///
+/// 与 [`percent_decode`] 互为逆运算。只用于构造「回跳地址的 `next` 值」：`/`、`?`、
+/// `&`、`=` 都必须编码，否则原地址会被当成外层查询串的一部分（`?next=/account?tab=x`
+/// 里的 `tab=x` 就成了外层参数）。
+pub(crate) fn percent_encode(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            },
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
 /// 百分号与 `+` 解码；非法转义或非 UTF-8 都报 400。
 pub(crate) fn percent_decode(raw: &str) -> Result<String, ApiError> {
     let bytes = raw.as_bytes();

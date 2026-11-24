@@ -907,7 +907,7 @@ fn hidden_page_fields(page: PageQuery) -> String {
 }
 
 /// 角色在页面上的中文标签。
-fn role_label(role: Role) -> &'static str {
+pub(crate) fn role_label(role: Role) -> &'static str {
     match role {
         Role::Readonly => "只读",
         Role::Readwrite => "读写",
@@ -916,7 +916,7 @@ fn role_label(role: Role) -> &'static str {
 }
 
 /// 状态在页面上的中文标签。
-fn status_label(status: UserStatus) -> &'static str {
+pub(crate) fn status_label(status: UserStatus) -> &'static str {
     match status {
         UserStatus::Active => "正常",
         UserStatus::Pending => "待审批",

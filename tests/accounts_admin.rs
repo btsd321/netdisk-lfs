@@ -517,19 +517,26 @@ async fn given_wrong_content_type_when_admin_write_then_415() {
 }
 
 #[tokio::test]
-async fn given_unauthenticated_when_admin_page_then_401_with_www_authenticate() {
+async fn given_unauthenticated_when_admin_endpoints_then_login_redirect_or_challenge() {
     let app = TestApp::new();
 
-    // 浏览器只有看到标准 `WWW-Authenticate` 才会弹 Basic 登录框，`/admin` 靠它才打得开；
-    // `lfs-authenticate` 仍是 git-lfs 客户端的契约，两个都要有。
+    // 浏览器（`Accept: text/html`）访问页面：登录页上线后 303 回登录页并带上原地址，
+    // 不再依赖 Basic 弹框——弹框既不能退出，也给不了普通用户落地页。
     let (status, headers, _) = app
         .send(request(Method::GET, "/admin", None, Some("text/html"), None, String::new()))
         .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/?next=%2Fadmin");
+
+    // 不带 `Accept: text/html` 的客户端（脚本、git-lfs）仍是 401，且两个挑战头都在：
+    // `WWW-Authenticate` 是标准契约，`lfs-authenticate` 是 git-lfs 客户端的契约。
+    let (status, headers, _) =
+        app.send(request(Method::GET, "/admin", None, None, None, String::new())).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(
         headers.get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
         Some("Basic realm=\"netdisk-lfs\""),
-        "缺少 WWW-Authenticate 时浏览器不会弹登录框"
+        "401 必须带标准认证挑战头"
     );
     assert_eq!(
         headers.get("lfs-authenticate").and_then(|value| value.to_str().ok()),

@@ -29,11 +29,15 @@
 //! 登录成功、下一个请求 401」——判定口径一旦分叉，登录端点多放行的身份认证端点就会
 //! 拒掉。
 //!
+//! **未登录的页面请求**回登录页而不是 JSON 401：`Accept` 含 `text/html` 且路径在
+//! `/admin`、`/account` 之下时 303 到 `/?next=<原地址>`。git 客户端与脚本不带
+//! `Accept: text/html`，仍拿到 JSON 401（带 `WWW-Authenticate`），协议语义不变。
+
 use std::time::Duration;
 
 use axum::extract::{Request, State};
-use axum::http::HeaderValue;
 use axum::http::header::{AUTHORIZATION, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
@@ -41,6 +45,7 @@ use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 
 use super::error::{self, ApiError};
+use super::html;
 use super::passwords;
 use super::session::{self, SessionCookieState, SessionId};
 use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId};
@@ -180,6 +185,8 @@ pub(crate) async fn require(
     let cookie = session::parse_session_cookie(request.headers());
     // 清 Cookie 时要与服务端签发时同样带不带 Secure，否则 HTTPS 站点上清不掉。
     let secure = session::request_is_https(request.headers(), state.config());
+    // 浏览器访问页面时的回登录页地址；在进入异步之前算好（`&request` 不能跨 `.await`）。
+    let login_redirect = html_login_redirect(request.uri(), request.headers());
 
     let outcome = match authorization {
         Some(header) => authenticate(&state, Some(header)).await.map_err(Rejection::Basic),
@@ -204,9 +211,44 @@ pub(crate) async fn require(
                 reason = rejection.reason(),
                 "认证失败"
             );
+            // 浏览器访问受保护页面：303 到登录页并带上原地址，而不是让用户看到一坨
+            // JSON。放在认证失败之后、错误体之前，因此 JSON 客户端的分支完全不变。
+            if let Some(location) = login_redirect {
+                tracing::info!(request_id = %request_id, location = %location, "未登录的页面请求，跳转登录页");
+                let response = html::see_other(&location);
+                // 失效/被撤销/畸形的会话 Cookie 顺手清掉：跳转链路上不清，浏览器就会
+                // 带着同一个坏值走完「页面 → 登录页」两跳才被清除。
+                return if rejection.clears_cookie() {
+                    with_clear_cookie(response, secure)
+                } else {
+                    response
+                };
+            }
             rejection.into_response(&request_id, secure)
         },
     }
+}
+
+/// 未登录的浏览器页面请求该跳到哪里；`None` 表示维持 401。
+///
+/// 只对 `Accept` 含 `text/html` 且路径在 `/admin`、`/account` 之下的请求生效，并且
+/// 明确排除 `/account/register`（公开的注册页）与 `/lfs/*`（git 客户端）。`next` 只带
+/// path+query 并整体百分号编码：`?next=/a?b=1` 不编码时 `b=1` 会变成外层的查询参数。
+fn html_login_redirect(uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if !html::wants_html(headers) {
+        return None;
+    }
+    let path = uri.path();
+    let is_page =
+        (path.starts_with("/admin") || path.starts_with("/account")) && path != "/account/register";
+    if !is_page {
+        return None;
+    }
+    let original = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_owned(),
+    };
+    Some(format!("/?next={}", html::percent_encode(&original)))
 }
 
 /// 认证失败的通道归属：两条通道的失败语义不同（Basic 有 429、Cookie 要清 Cookie）。
@@ -232,6 +274,15 @@ impl Rejection {
         match self {
             Self::Basic(failure) => failure.reason(),
             Self::Session(failure) => failure.as_str(),
+        }
+    }
+
+    /// 这个失败是否该顺手清掉浏览器里的会话 Cookie。
+    fn clears_cookie(&self) -> bool {
+        match self {
+            // Basic 头坏掉与会话 Cookie 无关，不能因此清掉浏览器里的有效会话。
+            Self::Basic(_) => false,
+            Self::Session(failure) => failure.clears_cookie(),
         }
     }
 
