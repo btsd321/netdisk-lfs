@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::AuthUser;
 use super::error::ApiError;
-use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
 use crate::accounts::{AccountError, User, UserStatus, validate_password};
 use crate::config::Role;
 
 /// 账户库未接入时的 503。
 fn accounts_unavailable() -> ApiError {
-    ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned())
+    ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned())
 }
 
 /// `GET /account/me` 的响应体。

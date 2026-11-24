@@ -93,10 +93,11 @@ pub struct AccountsConfig {
     pub registration_per_hour: u64,
     /// 每个用户名每 5 分钟的登录失败上限；`0` = 不限。
     pub login_failures_per_5min: u64,
-    /// 是否信任 `X-Forwarded-For` 的第一段作为注册限速的来源地址。
+    /// 是否用 `X-Forwarded-For` 的**最后一段**作为注册限速的来源地址。
     ///
-    /// 只在服务确实处于可信反向代理之后时才应打开：该头由客户端完全可控，
-    /// 直连场景下打开它等于让攻击者用伪造 IP 绕过注册限速。
+    /// 取最后一段（代理「追加」语义下由代理写入的真实对端），而不是第一段——
+    /// 第一段是客户端可伪造的。仍只应在可信反向代理之后打开：直连场景下该头
+    /// 完全可控，打开等于让攻击者用伪造 IP 绕过注册限速。
     pub trust_proxy: bool,
 }
 
@@ -163,12 +164,13 @@ pub struct UserConfig {
 }
 
 /// LFS 客户端的权限档位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// 只读：仅允许下载。
     Readonly,
-    /// 读写：允许上传与下载。
+    /// 读写：允许上传与下载（缺省角色）。
+    #[default]
     Readwrite,
     /// 管理员：除读写权限外，还可在后续分支使用 `/admin/*` 管理账户。
     Admin,

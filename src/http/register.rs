@@ -27,7 +27,7 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
 use crate::accounts::{UserStatus, validate_password, validate_username};
 use crate::config::RegistrationPolicy;
 
@@ -58,7 +58,7 @@ pub(crate) async fn page(State(state): State<AppState>) -> Response {
             page_shell(
                 "注册不可用",
                 &format!(
-                    r#"<h1>注册不可用</h1><p class="error">{ACCOUNTS_UNAVAILABLE_MESSAGE}</p>"#
+                    r#"<h1>注册不可用</h1><p class="error">{ACCOUNTS_NOT_CONFIGURED_MESSAGE}</p>"#
                 ),
             ),
         );
@@ -230,7 +230,7 @@ async fn register(
     payload: RegisterPayload,
 ) -> Result<Registered, ApiError> {
     let Some(users) = state.accounts() else {
-        return Err(ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned()));
+        return Err(ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned()));
     };
     let accounts = &state.config().accounts;
 
@@ -276,7 +276,7 @@ async fn register(
         Ok(None) => {},
         Err(error) => {
             tracing::error!(username = %payload.username, error = %error, "注册时查询账户库失败");
-            return Err(ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned()));
+            return Err(ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned()));
         },
     }
 
@@ -457,17 +457,19 @@ fn html_response(status: StatusCode, body: String) -> Response {
 /// 仍然是「有限速」而不是「不限」，不会把这类用法变成无保护。
 pub(crate) fn client_key(state: &AppState, parts: &axum::http::request::Parts) -> String {
     if state.config().accounts.trust_proxy
-        && let Some(first) = parts
+        && let Some(last) = parts
             .headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.split(',').next_back())
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
+        // 取**最后**一段：代理是「追加」语义（`client-supplied, observed-peer`），
+        // 最后一段才是代理观测到的对端；取第一段会被客户端伪造绕过限速。
         // 头值长度由客户端决定（最长可到 8 KiB），截断后再当键，避免键池被
         // 单个请求撑大；IPv6 最长 45 个字符，64 足够容纳真实地址。
-        return format!("xff:{}", first.chars().take(64).collect::<String>());
+        return format!("xff:{}", last.chars().take(64).collect::<String>());
     }
     // 只取 IP 不取端口：源端口每次连接都变，用它做键等于不限速。
     if let Some(axum::extract::ConnectInfo(addr)) =

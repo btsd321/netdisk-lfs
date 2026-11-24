@@ -395,7 +395,8 @@ async fn given_trust_proxy_when_forwarded_for_differs_then_each_ip_has_its_own_b
             .method(Method::POST)
             .uri("/account/register")
             .header(header::HOST, TEST_HOST)
-            .header("x-forwarded-for", format!("{forwarded}, 10.0.0.1"))
+            // 代理追加语义：最后一段才是代理观测到的对端，前面是客户端可伪造的。
+            .header("x-forwarded-for", format!("client-supplied-junk, {forwarded}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json!({ "username": username, "password": PASSWORD }).to_string()))
             .expect("构造请求")
@@ -406,6 +407,32 @@ async fn given_trust_proxy_when_forwarded_for_differs_then_each_ip_has_its_own_b
 
     assert_eq!(first, StatusCode::CREATED);
     assert_eq!(second, StatusCode::CREATED, "信任反代时不同 XFF 应各算一个来源");
+}
+
+#[tokio::test]
+async fn given_trust_proxy_when_only_spoofed_prefix_differs_then_same_bucket() {
+    // 最后一段相同 → 同一个来源桶；伪造前缀不能“换 IP”绕过限速。
+    let app = TestApp::with(|config| {
+        config.accounts.registration = RegistrationPolicy::Open;
+        config.accounts.registration_per_hour = 1;
+        config.accounts.trust_proxy = true;
+    });
+    let register = |prefix: &str, username: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/account/register")
+            .header(header::HOST, TEST_HOST)
+            .header("x-forwarded-for", format!("{prefix}, 203.0.113.7"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "username": username, "password": PASSWORD }).to_string()))
+            .expect("构造请求")
+    };
+
+    let (first, _, _) = app.send_json(register("fake-a", "nina")).await;
+    let (second, _, _) = app.send_json(register("fake-b", "olga")).await;
+
+    assert_eq!(first, StatusCode::CREATED);
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS, "伪造前缀不应产生新桶");
 }
 
 #[tokio::test]

@@ -321,12 +321,12 @@ fn default_min_password_len() -> usize {
 
 /// 注册策略缺省值：`approval`（新账户需管理员审批后才可登录）。
 fn default_registration() -> RegistrationPolicy {
-    RegistrationPolicy::Approval
+    RegistrationPolicy::default()
 }
 
 /// 默认角色缺省值：`readwrite`。
 fn default_default_role() -> Role {
-    Role::Readwrite
+    Role::default()
 }
 
 /// 注册限速缺省值。
@@ -630,6 +630,20 @@ dir = "/var/lib/netdisk-lfs/cache"
         let config = load(VALID_CONFIG, &[]).expect("合法配置");
 
         assert_eq!(config.accounts.min_password_len, 12);
+    }
+
+    #[test]
+    fn given_policy_fields_omitted_when_load_then_match_accounts_default() {
+        // VALID_CONFIG 的 [accounts] 只写了 db；其余字段应等于 AccountsConfig::default()，
+        // 防止「字段级默认」与「整段默认」两处漂移。
+        let config = load(VALID_CONFIG, &[]).expect("合法配置");
+        let defaults = crate::config::model::AccountsConfig::default();
+
+        assert_eq!(config.accounts.registration, defaults.registration);
+        assert_eq!(config.accounts.default_role, defaults.default_role);
+        assert_eq!(config.accounts.registration_per_hour, defaults.registration_per_hour);
+        assert_eq!(config.accounts.login_failures_per_5min, defaults.login_failures_per_5min);
+        assert_eq!(config.accounts.trust_proxy, defaults.trust_proxy);
     }
 
     #[test]

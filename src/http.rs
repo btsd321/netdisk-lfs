@@ -53,7 +53,7 @@ pub use transfer::upload_dir;
 pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 
 /// 账户库未接入（`accounts: None`）时 `/account/*` 的 503 文案。
-pub(crate) const ACCOUNTS_UNAVAILABLE_MESSAGE: &str =
+pub(crate) const ACCOUNTS_NOT_CONFIGURED_MESSAGE: &str =
     "账户库未启用：本实例没有接入 [accounts]，注册与账户管理端点不可用";
 
 /// 回写给客户端与反向代理的请求 id 头。
@@ -337,19 +337,7 @@ impl Drop for DurationGuard {
 /// 而 api.md 要求 `application/vnd.git-lfs+json`。序列化失败说明响应模型不可
 /// 序列化，属服务端缺陷，按 500 处理并保留同一个 request id。
 pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> Response {
-    match serde_json::to_vec(value) {
-        Ok(body) => {
-            let mut response = Response::new(Body::from(body));
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(LFS_MEDIA_TYPE));
-            response
-        },
-        Err(error) => {
-            tracing::error!(request_id = %request_id, error = %error, "序列化 LFS 响应失败");
-            ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
-        },
-    }
+    json_body(StatusCode::OK, LFS_MEDIA_TYPE, value, request_id)
 }
 
 /// 账户类端点的 JSON 响应：`application/json`（不是 LFS 媒体类型），带请求 id。
@@ -358,12 +346,22 @@ pub(crate) fn json_with_status<T: Serialize>(
     value: &T,
     request_id: &RequestId,
 ) -> Response {
+    json_body(status, "application/json", value, request_id)
+}
+
+/// 统一的 JSON 序列化出口：状态码与媒体类型由调用方给，错误路径共用同一套处理。
+fn json_body<T: Serialize>(
+    status: StatusCode,
+    content_type: &'static str,
+    value: &T,
+    request_id: &RequestId,
+) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => {
             let mut response = Response::new(Body::from(body));
             response
                 .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
             if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
                 response.headers_mut().insert(REQUEST_ID_HEADER, value);
             }
@@ -371,7 +369,7 @@ pub(crate) fn json_with_status<T: Serialize>(
             response
         },
         Err(error) => {
-            tracing::error!(request_id = %request_id, error = %error, "序列化账户响应失败");
+            tracing::error!(request_id = %request_id, error = %error, "序列化 JSON 响应失败");
             ApiError::Internal("序列化响应失败".to_owned()).into_response_with(request_id)
         },
     }
