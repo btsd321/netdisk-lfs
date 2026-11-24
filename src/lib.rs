@@ -7,6 +7,7 @@
 //! 对外契约从 crate 根导出，模块路径不作为对外 API 的一部分。
 
 pub mod bdpan;
+pub mod cache;
 pub mod config;
 pub mod http;
 pub mod logging;
@@ -16,6 +17,7 @@ pub mod store;
 mod test_support;
 
 pub use bdpan::{BdpanClient, BdpanClientConfig, BdpanError, BdpanStore, LsEntry, RetryPolicy};
+pub use cache::{Cache, SweepReport};
 pub use config::{
     AuthConfig, CacheConfig, Config, ConfigError, EnvSource, NETDISK_LFS_CONFIG, Role, RuntimeEnv,
     ServerConfig, StorageConfig, UserConfig,
