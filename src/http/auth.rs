@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::{self, ApiError};
 use super::passwords;
-use super::session::{self, SessionId};
+use super::session::{self, SessionCookieState, SessionId};
 use super::{ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId};
 use crate::accounts::{AccountError, UserStatus, UserStore};
 use crate::config::{Config, Role, UserConfig};
@@ -131,13 +131,13 @@ pub(crate) async fn require(
     // 先取出认证相关的头再进入异步：`Request<Body>` 不是 `Sync`，把 `&request`
     // 带过 `.await` 会让整个中间件 future 不是 `Send`（axum 的 `FromFn` 要求它）。
     let authorization = request.headers().get(AUTHORIZATION).cloned();
-    let session_id = session::parse_session_cookie(request.headers());
+    let cookie = session::parse_session_cookie(request.headers());
     // 清 Cookie 时要与服务端签发时同样带不带 Secure，否则 HTTPS 站点上清不掉。
     let secure = session::request_is_https(request.headers(), state.config());
 
     let outcome = match authorization {
         Some(header) => authenticate(&state, Some(header)).await.map_err(Rejection::Basic),
-        None => authenticate_session(&state, session_id.as_ref()).await.map_err(Rejection::Session),
+        None => authenticate_session(&state, &cookie).await.map_err(Rejection::Session),
     };
 
     match outcome {
@@ -154,6 +154,7 @@ pub(crate) async fn require(
                 .unwrap_or_else(RequestId::generate);
             tracing::warn!(
                 request_id = %request_id,
+                channel = rejection.channel(),
                 reason = rejection.reason(),
                 "认证失败"
             );
@@ -171,7 +172,16 @@ enum Rejection {
 }
 
 impl Rejection {
-    /// 日志字段值：说明是哪条通道、为什么失败。
+    /// 日志字段值：哪条通道失败（`accounts_unavailable` 这类原因两条通道都会出现，
+    /// 只靠 reason 分不清该去查账户库还是查会话）。
+    fn channel(&self) -> &'static str {
+        match self {
+            Self::Basic(_) => "basic",
+            Self::Session(_) => "session",
+        }
+    }
+
+    /// 日志字段值：为什么失败（Basic 与 Session 的取值集合不同）。
     fn reason(&self) -> &'static str {
         match self {
             Self::Basic(failure) => failure.as_str(),
@@ -193,6 +203,8 @@ impl Rejection {
 enum SessionFailure {
     /// 既没有 `Authorization` 头也没有会话 Cookie。
     Missing,
+    /// 带了会话 Cookie，但值不是合法的会话 id：清掉它，别让浏览器无限重发。
+    Malformed,
     /// Cookie 里的会话 id 不在表里（伪造、空闲/绝对过期或已被撤销）。
     Expired,
     /// 会话对应的账户已不可用：被删除、待审批或已禁用。
@@ -206,6 +218,7 @@ impl SessionFailure {
     fn as_str(self) -> &'static str {
         match self {
             Self::Missing => "missing_session",
+            Self::Malformed => "malformed_session",
             Self::Expired => "session_expired",
             Self::Revoked => "session_revoked",
             Self::AccountsUnavailable => "accounts_unavailable",
@@ -228,8 +241,9 @@ fn session_failure_response(
         ),
         // 没带 Cookie：本来就没有可清的东西，别凭空塞一条 Set-Cookie。
         SessionFailure::Missing => unauthorized(),
-        // 失效/被撤销：让浏览器把那条 Cookie 扔掉，否则每个请求都会带着它回来。
-        SessionFailure::Expired | SessionFailure::Revoked => {
+        // 畸形、失效或被撤销：让浏览器把那条 Cookie 扔掉，否则每个请求都会带着它回来，
+        // 永远 401 且没有出口。
+        SessionFailure::Malformed | SessionFailure::Expired | SessionFailure::Revoked => {
             with_clear_cookie(unauthorized(), secure)
         },
     }
@@ -252,10 +266,13 @@ fn with_clear_cookie(mut response: Response, secure: bool) -> Response {
 ///   不能还按旧角色操作。
 async fn authenticate_session(
     state: &AppState,
-    id: Option<&SessionId>,
+    cookie: &SessionCookieState,
 ) -> Result<AuthUser, SessionFailure> {
-    let Some(id) = id else {
-        return Err(SessionFailure::Missing);
+    let id = match cookie {
+        SessionCookieState::Missing => return Err(SessionFailure::Missing),
+        // 值本身不合法：连查表都不用查，直接让浏览器清掉。
+        SessionCookieState::Malformed => return Err(SessionFailure::Malformed),
+        SessionCookieState::Present(id) => id,
     };
     // `get` 顺带滑动空闲计时：浏览器每访问一次，12 小时的空闲窗口就重新开始。
     let Some(session) = state.sessions().get(id) else {
@@ -276,17 +293,13 @@ async fn authenticate_session(
                 state.sessions().revoke(id);
                 Err(SessionFailure::Revoked)
             },
-            Ok(None) => {
-                tracing::warn!(
-                    username = %session.username,
-                    "会话对应的账户已被删除，撤销会话"
-                );
-                state.sessions().revoke(id);
-                Err(SessionFailure::Revoked)
-            },
-            // 旧 config 用户名（例如 2 个字符）永远不可能进账户库：按「库里没有」回落配置，
-            // 与 Basic 通道的判定保持一致。
-            Err(AccountError::InvalidUsername { .. }) => {
+            // 库里没有这个账户：与 Basic 通道一致回落 `[auth.users]`。config-only 用户
+            // （还没懒升级、或升级时写库失败）本来就是合法存在的身份。
+            //
+            // 被管理员删除的账户不会因此复活：管理端删除会先 revoke_user，而且删除时
+            // `[auth.users]` 里有同名条目会直接 409，所以「库里没有 + config 也没有」
+            // 就是这条会话的终点。用户名不合法（例如 2 个字符的旧 config 用户名）同理。
+            Ok(None) | Err(AccountError::InvalidUsername { .. }) => {
                 session_config_user(state, id, &session.username)
             },
             Err(error) => {
@@ -302,10 +315,11 @@ async fn authenticate_session(
     }
 }
 
-/// 未接入账户库（或账户只可能来自 `[auth.users]`）时，角色取配置里的值。
+/// 账户只能来自 `[auth.users]` 时（未接入账户库，或库里查不到这一行）用配置判角色。
 ///
-/// 配置里的用户一旦被运维删掉，其会话也不能再放行——这里不做「会话建立时有效就一直
-/// 有效」的豁免，配置就是那种场景下的唯一真相源。
+/// 库里查不到这一行**不等于**账户没了：config-only 用户、懒升级写库失败的用户都还
+/// 属于这里。配置里也找不到这个用户名时才是真的没了——会话不能凭空延续，这里不做
+/// 「建立时有效就一直有效」的豁免，撤销后 401。
 fn session_config_user(
     state: &AppState,
     id: &SessionId,

@@ -267,34 +267,62 @@ fn purge_expired(sessions: &mut HashMap<SessionId, Session>, now: Instant) {
     }
 }
 
-/// 从 `Cookie` 头里取会话 id。
+/// 会话 Cookie 的解析结果。
 ///
-/// 支持多条 `Cookie` 头（HTTP/2 允许）与 `a=1; b=2` 形式；同名 cookie **只取第一个**，
-/// 值不是合法会话 id 时返回 `None`——不继续找第二个，避免被注入的同名 cookie 抢先
-/// 顶替真正的会话。
-pub fn parse_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
-    header_cookie_value(headers, SESSION_COOKIE_NAME).and_then(|value| SessionId::parse(&value))
+/// 区分「没带」与「带了但畸形」是为了**能清掉坏的 Cookie**：浏览器会一直重发同一个
+/// 值，只有下发一次 `Max-Age=0` 才能让它停下；压根没带 Cookie 的请求则不该凭空收到
+/// 一条 `Set-Cookie`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionCookieState {
+    /// 请求没有会话 Cookie。
+    Missing,
+    /// 带了会话 Cookie，但值不是合法的会话 id（含无法按 UTF-8 解析的 Cookie 头）。
+    Malformed,
+    /// 解析出合法的会话 id；是否仍然有效要再查会话表。
+    Present(SessionId),
 }
 
-/// 请求是否带会话 Cookie（**不**校验值）。
+/// 解析请求里的会话 Cookie。
+///
+/// 支持多条 `Cookie` 头（HTTP/2 允许）与 `a=1; b=2` 形式；同名 cookie 取**第一个**。
+///
+/// 注意 RFC 6265 并不保证同名 cookie 的先后顺序，所以「取第一个」只是尽力而为，
+/// 不构成任何安全保证：一旦取到的值畸形、或真正的会话 cookie 被另一个同名值挡住，
+/// 一律 fail-closed（[`SessionCookieState::Malformed`] → 401 并清除 Cookie），
+/// 不去猜第二个值，也不把失败伪装成「没带 Cookie」。
+pub fn parse_session_cookie(headers: &HeaderMap) -> SessionCookieState {
+    if let Some(value) = header_cookie_value(headers, SESSION_COOKIE_NAME) {
+        return match SessionId::parse(value) {
+            Some(id) => SessionCookieState::Present(id),
+            None => SessionCookieState::Malformed,
+        };
+    }
+    if cookie_header_mentions(headers, SESSION_COOKIE_NAME) {
+        // Cookie 头不是合法 UTF-8，取不出值，但确实提到了会话名：仍按畸形处理，
+        // 让它被清掉，而不是每个请求都带着重试、永远 401。
+        return SessionCookieState::Malformed;
+    }
+    SessionCookieState::Missing
+}
+
+/// 请求是否带会话 Cookie（**不**校验值，畸形也算带）。
 ///
 /// CSRF 守卫用它判断「浏览器会不会自动附带凭据」：值是否有效是认证层的事，跨站写
 /// 请求在认证之前就该被挡住，所以这里只看有没有这个名字的 cookie。
 pub fn has_session_cookie(headers: &HeaderMap) -> bool {
     header_cookie_value(headers, SESSION_COOKIE_NAME).is_some()
+        || cookie_header_mentions(headers, SESSION_COOKIE_NAME)
 }
 
 /// 在所有 `Cookie` 头里找同名 cookie 的值（名字大小写不敏感，取第一个）。
-fn header_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    for value in headers.get_all(COOKIE) {
-        let Ok(raw) = value.to_str() else {
-            continue;
-        };
-        if let Some(found) = first_cookie(raw, name) {
-            return Some(found.to_owned());
-        }
-    }
-    None
+///
+/// 返回借用而不是 `String`：调用方只需要读一眼，每请求多一次堆分配没有意义。
+fn header_cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .find_map(|value| value.to_str().ok().and_then(|raw| first_cookie(raw, name)))
 }
 
 /// 在一条 `Cookie` 头里找同名 cookie 的值。
@@ -307,6 +335,20 @@ fn first_cookie<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
         let value = value.trim();
         // RFC 6265 允许 cookie-value 用双引号包裹；去掉引号再解析。
         Some(value.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(value))
+    })
+}
+
+/// `Cookie` 头不是合法 UTF-8 时，退一步在原始字节里找会话名。
+///
+/// 只用于「要不要把它清掉」的判定：命中即按畸形 Cookie 处理，取不出值也不去猜。
+fn cookie_header_mentions(headers: &HeaderMap, name: &str) -> bool {
+    let needle = name.as_bytes();
+    headers.get_all(COOKIE).iter().any(|value| {
+        value.to_str().is_err()
+            && value
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
     })
 }
 
@@ -348,11 +390,18 @@ fn cookie_header(value: &str, max_age_secs: u64, secure: bool) -> String {
 
 /// 本次请求是否经 HTTPS 到达。
 ///
-/// 判定只看两处：反向代理透传的 `X-Forwarded-Proto: https`（大小写不敏感，多级代理
-/// 的逗号列表取第一个），或配置的 `public_base` 本身就是 https URL。没有 TLS 终结
-/// 信息的本机直连按 http 处理——`Secure` Cookie 在明文连接上根本存不住。
+/// 判定只看两处，且**不**无条件相信转发头：
+///
+/// - `X-Forwarded-Proto: https`（大小写不敏感，多级代理的逗号列表取第一个）：只有
+///   `[accounts] trust_proxy = true` 时才接受。这个头客户端可以随便伪造，不信任
+///   代理时采信它，等于让任何人决定服务端要不要下发 `Secure` Cookie；与
+///   `register::client_key` 对 `X-Forwarded-For` 的策略保持一致；
+/// - 否则看配置的 `public_base` 是否以 `https://` 开头：这是运维写死的对外地址，
+///   客户端改不了。
+///
+/// 两者都没有 HTTPS 信息时按 http 处理——`Secure` Cookie 在明文连接上根本存不住。
 pub fn request_is_https(headers: &HeaderMap, config: &Config) -> bool {
-    if forwarded_proto_is_https(headers) {
+    if config.accounts.trust_proxy && forwarded_proto_is_https(headers) {
         return true;
     }
     config.server.public_base.trim().to_ascii_lowercase().starts_with("https://")
@@ -374,15 +423,15 @@ mod tests {
 
     use super::{
         ABSOLUTE_TTL, IDLE_TIMEOUT, MAX_SESSIONS, MAX_SESSIONS_PER_USER, SESSION_COOKIE_NAME,
-        SessionStore, clear_session_cookie, has_session_cookie, parse_session_cookie,
-        request_is_https, secure_clear_cookie, secure_cookie, session_cookie,
+        SessionCookieState, SessionId, SessionStore, clear_session_cookie, has_session_cookie,
+        parse_session_cookie, request_is_https, secure_clear_cookie, secure_cookie, session_cookie,
     };
     use crate::config::Role;
     use crate::config::{
         AccountsConfig, AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig,
     };
 
-    fn test_config(public_base: &str) -> Config {
+    fn test_config(public_base: &str, trust_proxy: bool) -> Config {
         Config {
             server: ServerConfig {
                 listen: "127.0.0.1:9001".parse().expect("合法监听地址"),
@@ -400,11 +449,20 @@ mod tests {
             cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
             accounts: AccountsConfig {
                 db: std::env::temp_dir().join("netdisk-lfs-session-tests.db"),
+                trust_proxy,
                 ..AccountsConfig::default()
             },
             auth: AuthConfig::default(),
             runtime_env: RuntimeEnv::Dev,
             data_dir: None,
+        }
+    }
+
+    /// 解析结果里的会话 id；只关心「解析成功」的用例用它，避免到处写 match。
+    fn cookie_id(state: &SessionCookieState) -> Option<&SessionId> {
+        match state {
+            SessionCookieState::Present(id) => Some(id),
+            _ => None,
         }
     }
 
@@ -572,7 +630,8 @@ mod tests {
             "cookie",
             &format!("theme=dark;  NETDISK_LFS_SESSION = {value} ; lang=zh"),
         )]);
-        assert_eq!(parse_session_cookie(&map).as_ref(), Some(&id));
+        assert_eq!(cookie_id(&parse_session_cookie(&map)), Some(&id));
+        assert!(has_session_cookie(&map));
 
         // 多条 Cookie 头（HTTP/2 允许）逐条找。
         let mut multi = HeaderMap::new();
@@ -581,17 +640,27 @@ mod tests {
             HeaderName::from_static("cookie"),
             HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={value}")).expect("合法头值"),
         );
-        assert_eq!(parse_session_cookie(&multi).as_ref(), Some(&id));
+        assert_eq!(cookie_id(&parse_session_cookie(&multi)), Some(&id));
 
-        // 名字不像会话 cookie 的一律忽略。
-        let mut other = HeaderMap::new();
-        other.insert("cookie", HeaderValue::from_static("session=deadbeef"));
-        assert_eq!(parse_session_cookie(&other), None);
-        assert!(!has_session_cookie(&other));
+        // 双引号包裹的合法值可以解析。
+        let map = headers(&[("cookie", &format!("{SESSION_COOKIE_NAME}=\"{value}\""))]);
+        assert_eq!(cookie_id(&parse_session_cookie(&map)), Some(&id));
     }
 
     #[test]
-    fn given_invalid_or_duplicate_cookie_when_parse_then_rejected() {
+    fn given_no_session_cookie_when_parse_then_missing_not_malformed() {
+        // 完全没有 Cookie 头。
+        assert_eq!(parse_session_cookie(&HeaderMap::new()), SessionCookieState::Missing);
+        assert!(!has_session_cookie(&HeaderMap::new()));
+
+        // 只有别的 cookie：同样算「没带会话」，不该因此清 Cookie。
+        let map = headers(&[("cookie", "session=deadbeef; theme=dark")]);
+        assert_eq!(parse_session_cookie(&map), SessionCookieState::Missing);
+        assert!(!has_session_cookie(&map));
+    }
+
+    #[test]
+    fn given_malformed_cookie_when_parse_then_malformed_so_it_gets_cleared() {
         let store = SessionStore::new();
         let id = store.create("alice", Role::Readwrite).expect("应能建立会话");
         let value = id.as_str();
@@ -600,20 +669,40 @@ mod tests {
         let noncanonical = format!("{}B", "A".repeat(42));
         for bad in ["abc", "", "!!!", noncanonical.as_str(), &"A".repeat(44)] {
             let map = headers(&[("cookie", &format!("{SESSION_COOKIE_NAME}={bad}"))]);
-            assert_eq!(parse_session_cookie(&map), None, "非法值 {bad:?} 必须被拒");
-            assert!(has_session_cookie(&map), "但 CSRF 守卫仍认为请求带了会话 cookie");
+            assert_eq!(
+                parse_session_cookie(&map),
+                SessionCookieState::Malformed,
+                "非法值 {bad:?} 必须按畸形处理（否则永远清不掉）"
+            );
+            assert!(has_session_cookie(&map), "CSRF 守卫仍认为请求带了会话 cookie");
         }
 
-        // 同名 cookie 只取第一个：即使后面那个是真的也不认（防注入覆盖）。
+        // 同名 cookie 取第一个（RFC 6265 不保证顺序，这里只是尽力而为）：
+        // 取到的那个坏了就 fail-closed，不去猜后面那个可能是真的值。
         let map = headers(&[(
             "cookie",
             &format!("{SESSION_COOKIE_NAME}=bad; {SESSION_COOKIE_NAME}={value}"),
         )]);
-        assert_eq!(parse_session_cookie(&map), None);
+        assert_eq!(parse_session_cookie(&map), SessionCookieState::Malformed);
 
-        // 双引号包裹的合法值可以解析。
-        let map = headers(&[("cookie", &format!("{SESSION_COOKIE_NAME}=\"{value}\""))]);
-        assert_eq!(parse_session_cookie(&map).as_ref(), Some(&id));
+        // Cookie 头不是合法 UTF-8 但提到了会话名：也按畸形处理，让它被清掉。
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_bytes(format!("{SESSION_COOKIE_NAME}=v\u{00ff}").as_bytes())
+                .expect("obs-text 头值合法"),
+        );
+        assert_eq!(parse_session_cookie(&opaque), SessionCookieState::Malformed);
+        assert!(has_session_cookie(&opaque));
+
+        // 不透明 Cookie 头里没有会话名：与「没带」等价。
+        let mut unrelated = HeaderMap::new();
+        unrelated.insert(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_bytes("theme=v\u{00ff}".as_bytes()).expect("obs-text 头值合法"),
+        );
+        assert_eq!(parse_session_cookie(&unrelated), SessionCookieState::Missing);
+        assert!(!has_session_cookie(&unrelated));
     }
 
     #[test]
@@ -642,19 +731,52 @@ mod tests {
     }
 
     #[test]
-    fn given_request_headers_when_request_is_https_then_forwarded_proto_or_public_base() {
-        assert!(request_is_https(&headers(&[("x-forwarded-proto", "https")]), &test_config("")));
+    fn given_untrusted_proxy_when_request_is_https_then_forwarded_proto_ignored() {
+        // 不信任代理时，客户端伪造的 XFP 不能把明文请求变成「HTTPS」。
+        assert!(!request_is_https(
+            &headers(&[("x-forwarded-proto", "https")]),
+            &test_config("", false)
+        ));
+        assert!(!request_is_https(
+            &headers(&[("x-forwarded-proto", "HTTPS, http")]),
+            &test_config("http://lfs.example.com", false)
+        ));
+        // 此时只有运维写死的 public_base 能证明是 HTTPS。
+        assert!(request_is_https(
+            &HeaderMap::new(),
+            &test_config("https://lfs.example.com", false)
+        ));
+    }
+
+    #[test]
+    fn given_trusted_proxy_when_request_is_https_then_forwarded_proto_accepted() {
+        assert!(request_is_https(
+            &headers(&[("x-forwarded-proto", "https")]),
+            &test_config("", true)
+        ));
         // scheme 大小写不敏感；多级代理的逗号列表取第一个值。
         assert!(request_is_https(
             &headers(&[("x-forwarded-proto", "HTTPS, http")]),
-            &test_config("")
+            &test_config("", true)
         ));
-        assert!(!request_is_https(&headers(&[("x-forwarded-proto", "http")]), &test_config("")));
-        assert!(!request_is_https(&headers(&[("x-forwarded-proto", "gopher")]), &test_config("")));
-        // 没有代理头时看配置的对外地址。
-        assert!(request_is_https(&HeaderMap::new(), &test_config("https://lfs.example.com")));
-        assert!(request_is_https(&HeaderMap::new(), &test_config(" HTTPS://lfs.example.com/")));
-        assert!(!request_is_https(&HeaderMap::new(), &test_config("http://lfs.example.com")));
-        assert!(!request_is_https(&HeaderMap::new(), &test_config("")));
+        assert!(!request_is_https(
+            &headers(&[("x-forwarded-proto", "http")]),
+            &test_config("", true)
+        ));
+        assert!(!request_is_https(
+            &headers(&[("x-forwarded-proto", "gopher")]),
+            &test_config("", true)
+        ));
+    }
+
+    #[test]
+    fn given_public_base_when_request_is_https_then_scheme_decides() {
+        assert!(request_is_https(&HeaderMap::new(), &test_config("https://lfs.example.com", true)));
+        assert!(request_is_https(
+            &HeaderMap::new(),
+            &test_config(" HTTPS://lfs.example.com/", true)
+        ));
+        assert!(!request_is_https(&HeaderMap::new(), &test_config("http://lfs.example.com", true)));
+        assert!(!request_is_https(&HeaderMap::new(), &test_config("", true)));
     }
 }

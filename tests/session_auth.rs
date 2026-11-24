@@ -342,8 +342,39 @@ async fn given_no_credentials_when_protected_endpoint_then_401_without_set_cooki
 }
 
 #[tokio::test]
-async fn given_https_request_when_session_invalid_then_clear_cookie_is_secure() {
+async fn given_malformed_cookie_when_protected_endpoint_then_401_and_clear_cookie() {
     let app = TestApp::new();
+
+    // 值不是合法会话 id：必须与「过期」一样被清掉，否则浏览器会一直重发同一个坏值。
+    let (status, headers, _) =
+        app.send(Req::new(Method::GET, "/account/me").cookie_value("not-a-session").build()).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_clear_cookie(&headers, false);
+}
+
+#[tokio::test]
+async fn given_untrusted_proxy_when_session_invalid_then_clear_cookie_not_secure() {
+    let app = TestApp::new();
+
+    // 默认不信任代理（`[accounts] trust_proxy = false`）：客户端伪造的 XFP 不能让
+    // 服务端以为自己在 HTTPS 上，清除 Cookie 也就不该带 Secure。
+    let (status, headers, _) = app
+        .send(
+            Req::new(Method::GET, "/admin/users")
+                .cookie_value(UNKNOWN_SESSION)
+                .header("x-forwarded-proto", "https")
+                .build(),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_clear_cookie(&headers, false);
+}
+
+#[tokio::test]
+async fn given_trusted_proxy_when_session_invalid_then_clear_cookie_is_secure() {
+    let app = TestApp::with(|config| config.accounts.trust_proxy = true);
 
     let (status, headers, _) = app
         .send(
@@ -353,6 +384,17 @@ async fn given_https_request_when_session_invalid_then_clear_cookie_is_secure() 
                 .build(),
         )
         .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_clear_cookie(&headers, true);
+}
+
+#[tokio::test]
+async fn given_https_public_base_when_session_invalid_then_clear_cookie_is_secure() {
+    let app = TestApp::with(|config| config.server.public_base = "https://lfs.test".to_owned());
+
+    let (status, headers, _) =
+        app.send(Req::new(Method::GET, "/account/me").cookie_value(UNKNOWN_SESSION).build()).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_clear_cookie(&headers, true);
@@ -537,6 +579,38 @@ async fn given_self_delete_when_done_then_sessions_revoked() {
 // ---------------------------------------------------------------------------
 // 没有账户库：config 用户与会话
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_config_only_user_when_session_then_allowed_with_config_role() {
+    // 账户库接入着，但这个名字只在 `[auth.users]` 里（还没懒升级）：会话必须能用，
+    // 规则与 Basic 的 config 回落一致。
+    let app = TestApp::with(|config| add_config_user(config, "legacy", PASSWORD, Role::Readwrite));
+    let id = app.session("legacy", Role::Admin);
+
+    let (status, _, value) =
+        app.send_json(Req::new(Method::GET, "/account/me").cookie(&id).build()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["username"], "legacy");
+    assert_eq!(value["role"], "readwrite", "角色取配置，不取会话里的快照");
+    assert_eq!(value["created_at"], Value::Null, "config 用户没有账户库创建时间");
+
+    // 会话里记成 admin 也没用：配置里的角色才是真的，管理端点仍按 readwrite 拒绝。
+    let (admin, _, _) = app.send(Req::new(Method::GET, "/admin/users").cookie(&id).build()).await;
+    assert_eq!(admin, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn given_db_and_config_same_name_when_session_then_db_role_wins() {
+    let app = TestApp::with(|config| add_config_user(config, "alice", PASSWORD, Role::Readonly));
+    app.create_user("alice", PASSWORD, Role::Readwrite, UserStatus::Active).await;
+    let id = app.session("alice", Role::Admin);
+
+    let (status, _, value) =
+        app.send_json(Req::new(Method::GET, "/account/me").cookie(&id).build()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["role"], "readwrite", "库里有这个人时以库为准");
+    assert_ne!(value["role"], "admin", "会话里的 admin 不该被当回事");
+}
 
 #[tokio::test]
 async fn given_no_account_store_when_config_user_session_then_authenticated() {
