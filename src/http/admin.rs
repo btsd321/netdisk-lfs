@@ -47,7 +47,7 @@ use super::error::ApiError;
 use super::html::{
     escape_html, format_unix_seconds, html_response, page_shell, parse_form, table, wants_html,
 };
-use super::register::duplicate_username;
+use super::register::username_taken;
 use super::{
     ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, config_admin_fallback, config_username,
     json_with_status, passwords,
@@ -428,7 +428,15 @@ async fn create_account(
     let status = payload.status.unwrap_or(UserStatus::Active);
 
     match users.get(&payload.username).await {
-        Ok(Some(_)) => return Err(duplicate_username(&payload.username)),
+        Ok(Some(_)) => {
+            tracing::warn!(
+                actor = %actor.username,
+                target = %payload.username,
+                reason = "duplicate_username",
+                "管理员创建账户被拒：用户名已存在"
+            );
+            return Err(username_taken());
+        },
         // 用户名刚校验通过，理论上不会走到这里；真走到就交给 `create` 的唯一约束兜底。
         Ok(None) | Err(AccountError::InvalidUsername { .. }) => {},
         Err(error) => {
@@ -446,7 +454,13 @@ async fn create_account(
         Ok(user) => user,
         // 预检查与插入之间可能有并发创建抢到同一个用户名。
         Err(AccountError::DuplicateUsername { .. }) => {
-            return Err(duplicate_username(&payload.username));
+            tracing::warn!(
+                actor = %actor.username,
+                target = %payload.username,
+                reason = "duplicate_username",
+                "管理员创建账户被拒：用户名已存在（并发插入）"
+            );
+            return Err(username_taken());
         },
         Err(AccountError::InvalidUsername { reason, .. }) => {
             return Err(ApiError::BadRequest(format!("用户名不合法：{reason}")));

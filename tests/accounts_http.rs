@@ -317,25 +317,56 @@ async fn given_closed_policy_when_register_then_403_and_no_account() {
 }
 
 #[tokio::test]
-async fn given_config_reserved_username_when_register_then_conflict() {
-    // `[auth.users]` 里的名字不能自助注册：DB 优先会让原 config 管理员失效。
+async fn given_config_reserved_username_when_register_then_same_409_as_duplicate() {
+    // `[auth.users]` 里的名字不能自助注册（DB 优先会让原 config 管理员失效），
+    // 而且对外文案必须与普通重名完全一致：文案不同就等于把引导管理员的名字
+    // 交给任何人用一轮注册探测出来。
     let app = TestApp::with(|config| {
         config.accounts.registration = RegistrationPolicy::Open;
         add_config_user(config, "alice", PASSWORD, Role::Admin);
     });
-    let body = json!({ "username": "alice", "password": PASSWORD }).to_string();
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/account/register")
-        .header(header::HOST, TEST_HOST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .expect("构造请求");
+    app.create_user("taken", PASSWORD, Role::Readwrite, UserStatus::Active).await;
 
-    let (status, _, parsed) = app.send_json(request).await;
+    // 大小写变体也算保留名（config 查找与账户库一样大小写不敏感）。
+    for username in ["alice", "Alice", "ALICE", "taken", "Taken"] {
+        let (status, headers, body) = app
+            .send_json(post_json(
+                "/account/register",
+                &json!({ "username": username, "password": PASSWORD }),
+            ))
+            .await;
 
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(parsed["message"].as_str().is_some_and(|m| m.contains("保留")));
+        assert_eq!(status, StatusCode::CONFLICT, "{username} 应 409");
+        assert_error_contract(&headers, &body);
+        assert_eq!(body["message"], "用户名已被占用", "{username} 的文案必须与重名一致：{body}");
+    }
+    assert_eq!(app.store().get("alice").await.expect("查询"), None, "被拒的注册不得写入账户");
+}
+
+#[tokio::test]
+async fn given_closed_policy_when_register_any_name_then_403_before_username_checks() {
+    // closed 必须先于用户名/口令检查：否则「保留名 409、其它 403」「非法用户名 400」
+    // 这类差异就能被用来探测账户名，甚至判断实例的注册策略细节。
+    let app = TestApp::with(|config| {
+        config.accounts.registration = RegistrationPolicy::Closed;
+        add_config_user(config, "alice", PASSWORD, Role::Admin);
+    });
+
+    for username in ["alice", "ALICE", "a:b", "ab"] {
+        let (status, headers, body) = app
+            .send_json(post_json(
+                "/account/register",
+                &json!({ "username": username, "password": PASSWORD }),
+            ))
+            .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{username} 应直接 403");
+        assert_error_contract(&headers, &body);
+        assert!(
+            body["message"].as_str().is_some_and(|message| message.contains("已关闭")),
+            "{username} 应得到统一的关闭提示：{body}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -26,7 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::html::{escape_html, html_response, page_shell, parse_form};
-use super::{ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, json_with_status, passwords};
+use super::{
+    ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, config_username, json_with_status,
+    passwords,
+};
 use crate::accounts::{UserStatus, validate_password, validate_username};
 use crate::config::RegistrationPolicy;
 
@@ -162,6 +165,9 @@ fn check_confirmation(payload: &RegisterPayload) -> Result<(), ApiError> {
 }
 
 /// 校验、限速并按策略创建账户。
+///
+/// 顺序有意如此：先看策略、再碰用户名。`closed` 时连「这个名字是否已存在 / 是否被
+/// `[auth.users]` 保留」都不能被区分出来，否则一个 409 就能探测出引导管理员的用户名。
 async fn register(
     state: &AppState,
     client: &str,
@@ -174,6 +180,11 @@ async fn register(
 
     // 限速放在最前面：否则「非法输入 → 400」这类便宜请求不计数，攻击者可以先用
     // 400/409 探路绕过每小时上限。
+    //
+    // 注意这里只对**创建成功**计数（见下方 `record`）：重名/保留名的探测不计数。
+    // 这是有意的取舍——两者的对外响应已经完全一致（统一 409），不再泄漏额外信息；
+    // 若把失败也计数，攻击者只要用几个错用户名就能把同一出口 IP 后面的正常用户
+    // 锁在 429 外面，代价比收益大。
     if let Some(retry_after) =
         state.register_limits().blocked_for(client, accounts.registration_per_hour)
     {
@@ -187,6 +198,17 @@ async fn register(
             retry_after_secs: retry_after.as_secs().max(1),
         });
     }
+
+    // 策略先于一切用户名/口令检查：closed 一律 403，不能因为「用户名字符集不对」而
+    // 返回 400，把「这个实例关闭了注册」变成可以按输入区分的行为。
+    let (status, policy) = match accounts.registration {
+        RegistrationPolicy::Open => (UserStatus::Active, "open"),
+        RegistrationPolicy::Approval => (UserStatus::Pending, "approval"),
+        RegistrationPolicy::Closed => {
+            tracing::warn!(policy = "closed", "注册被拒：已关闭自助注册");
+            return Err(ApiError::Forbidden("已关闭自助注册，请联系管理员开通账户".to_owned()));
+        },
+    };
 
     if let Err(error) = validate_username(&payload.username) {
         tracing::warn!(reason = "invalid_username", "注册被拒：用户名不合法");
@@ -203,33 +225,28 @@ async fn register(
     // Pending/Active 记录，原 config 账户（常见是引导管理员）就再也登不上，
     // 变成可被利用的锁定路径。管理员在 `/admin/users` 创建同名账户不受此限
     // （那是显式的迁移动作）。
-    if state
-        .config()
-        .auth
-        .users
-        .keys()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&payload.username))
-    {
+    //
+    // 对外与「重名」共用同一条 409 文案：两者返回不同 message 的话，任何人都能
+    // 用一轮探测把引导管理员的名字问出来。
+    if config_username(state.config(), &payload.username).is_some() {
         tracing::warn!(
             username = %payload.username,
             reason = "reserved_username",
             "注册被拒：用户名被 [auth.users] 保留"
         );
-        return Err(ApiError::Conflict("用户名被保留，请换一个".to_owned()));
+        return Err(username_taken());
     }
-
-    let (status, policy) = match accounts.registration {
-        RegistrationPolicy::Open => (UserStatus::Active, "open"),
-        RegistrationPolicy::Approval => (UserStatus::Pending, "approval"),
-        RegistrationPolicy::Closed => {
-            tracing::warn!(username = %payload.username, policy = "closed", "注册被拒：已关闭自助注册");
-            return Err(ApiError::Forbidden("已关闭自助注册，请联系管理员开通账户".to_owned()));
-        },
-    };
 
     // 先查重再哈希：Argon2 不便宜，没必要为一次必然失败的注册付 19 MiB 的开销。
     match users.get(&payload.username).await {
-        Ok(Some(_)) => return Err(duplicate_username(&payload.username)),
+        Ok(Some(_)) => {
+            tracing::warn!(
+                username = %payload.username,
+                reason = "duplicate_username",
+                "注册被拒：用户名已存在"
+            );
+            return Err(username_taken());
+        },
         Ok(None) => {},
         Err(error) => {
             tracing::error!(username = %payload.username, error = %error, "注册时查询账户库失败");
@@ -257,7 +274,12 @@ async fn register(
         },
         // 预检查与插入之间可能有并发注册抢到同一个用户名。
         Err(crate::accounts::AccountError::DuplicateUsername { .. }) => {
-            Err(duplicate_username(&payload.username))
+            tracing::warn!(
+                username = %payload.username,
+                reason = "duplicate_username",
+                "注册被拒：用户名已存在（并发插入）"
+            );
+            Err(username_taken())
         },
         Err(error) => {
             tracing::error!(username = %payload.username, error = %error, "写入新账户失败");
@@ -266,13 +288,18 @@ async fn register(
     }
 }
 
-/// 409：用户名已被占用。
+/// 对外统一的「用户名不可用」文案：重名与 `[auth.users]` 保留名共用。
 ///
-/// 管理员创建账户（`/admin/users`）也走这条映射：两处的「重名」语义与文案一致，
-/// 只有审计日志不同。
-pub(crate) fn duplicate_username(username: &str) -> ApiError {
-    tracing::warn!(username = %username, reason = "duplicate_username", "注册被拒：用户名已存在");
-    ApiError::Conflict("用户名已被占用".to_owned())
+/// 两者返回不同 message 时，任何人都能用一轮注册探测把引导管理员的名字问出来
+/// （`reserved_username` 的差异只允许出现在日志里）。
+const USERNAME_TAKEN_MESSAGE: &str = "用户名已被占用";
+
+/// 409：用户名已被占用（重名与保留名共用同一条文案）。
+///
+/// 只构造错误、不写日志：调用方才知道自己是「自助注册」还是「管理员创建」，
+/// 审计语义与 `reason` 字段由各调用点决定。
+pub(crate) fn username_taken() -> ApiError {
+    ApiError::Conflict(USERNAME_TAKEN_MESSAGE.to_owned())
 }
 
 /// 成功响应：JSON 返回 `{username, role, status}`，表单返回结果页。
