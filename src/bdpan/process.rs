@@ -112,6 +112,20 @@ pub enum BdpanError {
         /// CLI 给出的原因原文。
         message: String,
     },
+    /// `upload` 被 CLI 同名自动重命名（CLI 不覆盖同名文件）。
+    ///
+    /// `actual` 是 CLI 报告的实际落盘名；调用方必须把它与请求名一起清理，
+    /// 否则改名副本会永久留在中转目录（本进程没有 tmp GC）。
+    #[error(
+        "bdpan upload 被自动重命名（期望 {expected}，实际 {}），需清理后重试",
+        actual.as_deref().unwrap_or("(未报告)")
+    )]
+    UploadRenamed {
+        /// 请求的中转文件名（即 oid）。
+        expected: String,
+        /// CLI 报告的实际落盘名；未报告时为 `None`。
+        actual: Option<String>,
+    },
     /// 网络/服务端暂时不可用；可退避重试。
     #[error("bdpan {command} 暂时不可用：{message}")]
     Unavailable {
@@ -225,7 +239,9 @@ impl BdpanClientConfig {
         }
     }
 
-    /// 从 `[storage]` 配置构造：路径、许可数与超时都以配置为准。
+    /// 从 `[storage]` 配置构造：可执行路径与并发许可数取配置值；
+    /// 超时与重试策略用默认值（CLI 侧暂无对应配置项，需要调整时用
+    /// [`with_timeout`](Self::with_timeout) / [`BdpanClientConfig::with_retry`] 覆盖）。
     pub fn from_storage(storage: &StorageConfig) -> Self {
         Self { max_procs: storage.max_bdpan_procs, ..Self::new(storage.bdpan_bin.clone()) }
     }
@@ -313,8 +329,9 @@ impl BdpanClient {
     /// 列目录；目录不存在时返回 `Ok(None)`。
     ///
     /// 实测 `ls` 用 `code:1` 表示「目录不存在」，没有单独的「空目录」区分——空目录返回
-    /// `[]`。除登录态失效、路径越界与网络类失败外，其余 `code:1` 一律当作不存在：
-    /// 这是既有实测语义，也是 `exists` 能把「对象缺失」正常表达成 `None` 的前提。
+    /// `[]`。只有「文案已识别为不存在」（[`BdpanError::NotFound`]）或 `code:1` 才折成
+    /// `None`；`code` 非 1 的未知失败必须原样上抛——把后端新错误吞成「不存在」会让
+    /// `exists` 谎报缺失、`put` 白白重传整份对象。
     pub async fn ls(&self, dir: &str) -> Result<Option<Vec<LsEntry>>, BdpanError> {
         let args = vec![dir.to_owned()];
         let site = CallSite { remote: Some(dir), ..CallSite::default() };
@@ -323,7 +340,9 @@ impl BdpanClient {
                 let entries = parse::ls_entries(&value).map_err(|err| unexpected("ls", &err))?;
                 Ok(Some(entries))
             },
-            Err(err @ (BdpanError::NotFound { .. } | BdpanError::Command { .. })) => {
+            Err(
+                err @ (BdpanError::NotFound { .. } | BdpanError::Command { code: Some(1), .. }),
+            ) => {
                 tracing::debug!(dir, error = %err, "ls 判定远端目录不存在");
                 Ok(None)
             },
@@ -342,8 +361,8 @@ impl BdpanClient {
     /// 上传本地文件到指定远端路径。
     ///
     /// 只做「CLI 是否接受」的判定：CLI 自身只校验 metadata，内容校验由调用方用 sha256
-    /// 负责。若 CLI 因同名而自动重命名，这里按错误处理——见
-    /// [`parse::upload_conflict_detail`]。
+    /// 负责。若 CLI 因同名而自动重命名，返回 [`BdpanError::UploadRenamed`] 并携带实际
+    /// 落盘名，供调用方连改名副本一起清理。
     pub async fn upload(&self, local: &Path, remote: &str) -> Result<(), BdpanError> {
         let meta = tokio::fs::metadata(local)
             .await
@@ -358,8 +377,11 @@ impl BdpanClient {
         let args = vec![local_arg.to_owned(), remote.to_owned()];
         let site = CallSite { remote: Some(remote), local: Some(local), bytes: Some(meta.len()) };
         let value = self.invoke("upload", &args, site).await?;
-        match parse::upload_conflict_detail(&value, remote) {
-            Some(detail) => Err(BdpanError::Unexpected { command: "upload", detail }),
+        match parse::upload_conflict(&value, remote) {
+            Some(conflict) => Err(BdpanError::UploadRenamed {
+                expected: conflict.expected,
+                actual: conflict.actual,
+            }),
             None => Ok(()),
         }
     }
@@ -375,14 +397,17 @@ impl BdpanClient {
 
     /// 删除远端文件；返回是否真的删掉了（`false` 表示本来就不存在）。
     ///
-    /// 除登录态/网络类失败外，`code:1` 一律按「不存在」处理——`rm` 是清理中转文件用的，
-    /// 幂等比精确报错更重要。
+    /// 只有「文案已识别为不存在」或 `code:1` 才折成 `Ok(false)`；其余未知失败上抛——
+    /// `rm` 是清理中转文件用的，幂等很重要，但「删没删成功」不能靠猜：
+    /// 把真实删除失败报成成功，残留文件就再也没人清理了。
     pub async fn rm(&self, remote: &str) -> Result<bool, BdpanError> {
         let args = vec![remote.to_owned()];
         let site = CallSite { remote: Some(remote), ..CallSite::default() };
         match self.invoke("rm", &args, site).await {
             Ok(_) => Ok(true),
-            Err(err @ (BdpanError::NotFound { .. } | BdpanError::Command { .. })) => {
+            Err(
+                err @ (BdpanError::NotFound { .. } | BdpanError::Command { code: Some(1), .. }),
+            ) => {
                 tracing::debug!(remote, error = %err, "rm 判定远端文件本来就不存在");
                 Ok(false)
             },

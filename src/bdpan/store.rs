@@ -7,9 +7,12 @@
 //! - `upload` 只做 metadata 校验，**内容校验必须自己做**；
 //! - `download` 出现过「报成功但内容截断」，所以下载后一律用 sha256 复核，这是唯一防线。
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Arc;
 
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Instrument, Span};
 
 use crate::bdpan::{BdpanClient, BdpanError, DurationTimer};
@@ -29,6 +32,13 @@ pub struct BdpanStore {
     objects_root: String,
     /// 上传中转根，如 `/apps/bdpan/lfs/tmp`。
     tmp_root: String,
+    /// 每个 oid 一把锁：同一对象的 `put` 在进程内全程串行。
+    ///
+    /// 并发 put 共享 `tmp/<oid>` 这一条非独占中转路径，没有锁时「先清残留再上传」
+    /// 会把对方的在途文件删掉，或触发 CLI 同名自动改名。条目首次 put 时创建、之后
+    /// 常驻——每条只是一个 64 字节 oid 加一把空锁，相对 4 GiB 对象可忽略，进程重启
+    /// 自然清空。跨进程/多实例竞态由 `mv` 的 `DestinationExists` + 回读复核兜底。
+    put_locks: AsyncMutex<HashMap<Oid, Arc<AsyncMutex<()>>>>,
 }
 
 impl BdpanStore {
@@ -45,10 +55,12 @@ impl BdpanStore {
             client,
             objects_root: objects_root.into().trim_end_matches('/').to_owned(),
             tmp_root: tmp_root.into().trim_end_matches('/').to_owned(),
+            put_locks: AsyncMutex::new(HashMap::new()),
         }
     }
 
-    /// 从 `[storage]` 配置构造，超时/重试/并发都取默认值后再由 B4 按需覆盖。
+    /// 从 `[storage]` 配置构造：`bdpan_bin` 与 `max_bdpan_procs` 取配置值，
+    /// 超时与重试沿用客户端默认值（无对应配置项，B4 需要时用 `with_*` 覆盖）。
     pub fn from_storage(storage: &StorageConfig) -> Self {
         Self::new(
             BdpanClient::from_storage(storage),
@@ -75,6 +87,11 @@ impl BdpanStore {
         format!("{}/{}", self.tmp_root, oid)
     }
 
+    /// 取（或创建）某个 oid 的进程内互斥锁。
+    async fn oid_lock(&self, oid: &Oid) -> Arc<AsyncMutex<()>> {
+        self.put_locks.lock().await.entry(oid.clone()).or_default().clone()
+    }
+
     async fn exists_inner(&self, oid: &Oid) -> Result<Option<ObjectMeta>, StoreError> {
         let dir = self.remote_object_dir(oid);
         let Some(entries) = self.client.ls(&dir).await.map_err(backend)? else {
@@ -96,6 +113,11 @@ impl BdpanStore {
             return Err(StoreError::hash_mismatch(oid, &digest));
         }
 
+        // 同一 oid 的 put 全程串行：共享 tmp/<oid> 的并发上传必须排队，
+        // 否则「清残留」会删掉对方的在途文件，或触发 CLI 同名自动改名。
+        let lock = self.oid_lock(oid).await;
+        let _guard = lock.lock().await;
+
         // 幂等：同 oid 的内容必然相同，已有对象不值得再花一次 4 GiB 的上行带宽。
         if self.exists(oid).await?.is_some() {
             return Ok(());
@@ -107,10 +129,20 @@ impl BdpanStore {
 
         // 前次崩溃可能留下 `tmp/<oid>`：不清掉的话 upload 会触发 CLI 的同名自动重命名，
         // 随后的 `mv tmp/<oid>` 就会搬走旧文件（内容可能不完整）。
+        // future 被取消（超时/断连/关机）时 kill_on_drop 也会留下残留：本进程没有周期
+        // GC，靠下次同 oid put 的这段清理兜底；长期不再上传的 oid 由 B6 的启动扫描回收
+        // （取舍见 specs/storage.md「进程崩溃恢复」）。
         self.remove_remote_quietly(&tmp, "上传前清理残留中转文件").await;
 
         let outcome = async {
-            self.client.upload(local_source, &tmp).await.map_err(backend)?;
+            let upload_result = self.client.upload(local_source, &tmp).await;
+            // 改名副本落在实际名上，不在 tmp/<oid>：必须连它一起删，
+            // 否则会永久占着网盘配额，且下次同 oid 上传时还会撞名。
+            if let Err(BdpanError::UploadRenamed { actual: Some(actual), .. }) = &upload_result {
+                let stray = format!("{}/{}", self.tmp_root, actual);
+                self.remove_remote_quietly(&stray, "清理被改名的中转副本").await;
+            }
+            upload_result.map_err(backend)?;
             // mkdir 幂等且可建多级；放在 upload 之后，上传失败就不留空目录。
             self.client.mkdir(&dir).await.map_err(backend)?;
             match self.client.mv(&tmp, &dir).await {

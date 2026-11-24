@@ -140,27 +140,36 @@ fn looks_like_result(value: &Value) -> bool {
 
 /// 归纳一条 JSON 的业务结论。
 ///
-/// 判定顺序有意义：`error` 非空优先于 `code`——实测出现过「code 为 0 但带 error」的
-/// 混合输出，宁可当失败处理，也不要放过一次静默的坏对象。
+/// 判定顺序有意义：
+/// - `error` 非空**一律按失败**——实测出现过「code 为 0 但带 error」的混合输出，
+///   宁可当失败处理，也不要放过一次静默的坏对象；
+/// - `message` 只在 `code` 非 0 时才当失败原因：code 成功时它只是附言
+///   （如「下载成功，[点击查看]」），不能反推出失败。
 pub(super) fn status(value: &Value) -> Status {
     let Value::Object(map) = value else {
         // 数组（ls）与其它形态都交给具体命令的解析器，这里不算失败。
         return Status::Success;
     };
     let code = map.get("code").and_then(Value::as_i64);
-    let message = ["error", "message"]
-        .iter()
-        .filter_map(|key| map.get(*key).and_then(Value::as_str))
-        .find(|text| !text.trim().is_empty())
+    let error = map
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned);
+    if let Some(message) = error {
+        return Status::Failure { code, message };
+    }
+    let message = map
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
         .map(str::to_owned);
     match (code, message) {
-        (_, Some(message)) => Status::Failure { code, message },
-        (Some(0), None) => Status::Success,
-        (Some(other), None) => Status::Failure {
+        (Some(0) | None, _) => Status::Success,
+        (Some(other), message) => Status::Failure {
             code: Some(other),
-            message: format!("bdpan 返回 code {other} 但未说明原因"),
+            message: message.unwrap_or_else(|| format!("bdpan 返回 code {other} 但未说明原因")),
         },
-        (None, None) => Status::Success,
     }
 }
 
@@ -283,7 +292,19 @@ pub(super) fn quota(value: &Value) -> Result<Quota, ShapeError> {
 /// 同名文件存在时 CLI 会**自动重命名**（`<name>.1`…）而不是覆盖。中转文件以 oid 命名，
 /// 一旦被改名，随后 `mv tmp/<oid>` 就会搬走旧文件——这是「上传了脏内容却报告成功」的
 /// 入口，所以封装层宁可报错也不接受改名结果。
-pub(super) fn upload_conflict_detail(value: &Value, remote: &str) -> Option<String> {
+/// upload 的同名冲突结论。
+pub(super) struct UploadConflict {
+    /// 请求的落盘名（从 remote 路径取末段）。
+    pub(super) expected: String,
+    /// CLI 报告的实际落盘名；`conflict_detected` 但未报告名字时为 `None`。
+    pub(super) actual: Option<String>,
+}
+
+/// 识别 upload 的同名自动重命名：CLI 不覆盖同名文件，会另起名字落盘。
+///
+/// 返回期望名与实际落盘名，供调用方构造类型化错误并清理改名副本——
+/// 只给一段文案会把实际落盘名埋进字符串，残留清理无从下手。
+pub(super) fn upload_conflict(value: &Value, remote: &str) -> Option<UploadConflict> {
     let data = value.get("data");
     let conflict =
         data.and_then(|data| data.get("conflict_detected")).and_then(as_boolish).unwrap_or(false);
@@ -291,10 +312,10 @@ pub(super) fn upload_conflict_detail(value: &Value, remote: &str) -> Option<Stri
     let landed = data.and_then(|data| data.get("server_filename")).and_then(Value::as_str);
     let renamed = landed.is_some_and(|name| name != expected);
     if conflict || renamed {
-        let landed = landed.unwrap_or("(未报告)");
-        return Some(format!(
-            "upload 被自动重命名（期望 {expected}，实际 {landed}），中转文件需先清理后再上传"
-        ));
+        return Some(UploadConflict {
+            expected: expected.to_owned(),
+            actual: landed.map(str::to_owned),
+        });
     }
     None
 }
@@ -350,8 +371,7 @@ fn as_u64ish(value: &Value) -> Option<u64> {
 mod tests {
     use super::{
         first_json, is_auth_failure, is_conflict_failure, is_not_found_failure, is_scope_failure,
-        is_transient_failure, ls_entries, preview, quota, status, strip_ansi,
-        upload_conflict_detail,
+        is_transient_failure, ls_entries, preview, quota, status, strip_ansi, upload_conflict,
     };
 
     use serde_json::json;
@@ -472,21 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn given_renamed_upload_when_conflict_detail_then_named() {
+    fn given_renamed_upload_when_conflict_then_structured_names() {
         let value =
             json!({"code": 0, "data": {"conflict_detected": true, "server_filename": "abc.1"}});
 
-        let detail = upload_conflict_detail(&value, "/apps/bdpan/lfs/tmp/abc").expect("应识别冲突");
+        let conflict = upload_conflict(&value, "/apps/bdpan/lfs/tmp/abc").expect("应识别冲突");
 
-        assert!(detail.contains("abc.1"), "实际：{detail}");
+        assert_eq!(conflict.expected, "abc");
+        assert_eq!(conflict.actual.as_deref(), Some("abc.1"));
     }
 
     #[test]
-    fn given_upload_on_requested_name_when_conflict_detail_then_none() {
+    fn given_upload_on_requested_name_when_conflict_then_none() {
         let value =
             json!({"code": 0, "data": {"conflict_detected": false, "server_filename": "abc"}});
 
-        assert!(upload_conflict_detail(&value, "/apps/bdpan/lfs/tmp/abc").is_none());
+        assert!(upload_conflict(&value, "/apps/bdpan/lfs/tmp/abc").is_none());
     }
 
     #[test]

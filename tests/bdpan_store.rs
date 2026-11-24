@@ -398,7 +398,39 @@ async fn given_remote_name_taken_when_upload_then_conflict_reported() {
 
     let err = client.upload(&source, &remote).await.expect_err("自动改名必须报错");
 
-    assert!(matches!(err, BdpanError::Unexpected { .. }), "实际错误：{err}");
+    // 类型化错误要带上实际落盘名，调用方才能把改名副本一起清理。
+    let BdpanError::UploadRenamed { expected, actual } = err else {
+        panic!("应报 UploadRenamed，实际：{err}");
+    };
+    assert_eq!(expected, "dup.bin");
+    assert!(actual.as_deref().is_some_and(|name| name != "dup.bin"), "改名副本名应不同于请求名");
+}
+
+#[tokio::test]
+async fn given_same_oid_when_concurrent_puts_then_serialized_and_tmp_clean() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&[]);
+    let contents = b"same oid concurrent payload".to_vec();
+    let (oid, source) = fixture.source("same.bin", &contents).await;
+    let (_, source_copy) = fixture.source("same-copy.bin", &contents).await;
+
+    // 同 oid 两个并发 put：没有按 oid 的锁时，先到的会删掉后到的在途 tmp 文件。
+    let (first, second) = tokio::join!(store.put(&oid, &source), store.put(&oid, &source_copy));
+
+    first.expect("并发 put #1 应成功");
+    second.expect("并发 put #2 应成功");
+    let meta = store.exists(&oid).await.expect("探测").expect("对象应存在");
+    assert_eq!(meta.size, contents.len() as u64);
+
+    // 串行化后第二个 put 直接命中幂等分支：只应有一次 upload，tmp 不留残渣。
+    assert_eq!(fixture.calls("upload").len(), 1, "同一 oid 只应真正上传一次");
+    let tmp_dir = fixture.remote_path("tmp");
+    let leftovers: Vec<_> = fs::read_dir(&tmp_dir)
+        .expect("读中转目录")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "中转目录应清空，实际残留：{leftovers:?}");
 }
 
 #[tokio::test]
