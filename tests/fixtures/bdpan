@@ -257,11 +257,12 @@ cmd_quota() {
 }
 
 cmd_whoami() {
+  # 复刻真实 CLI 的扁平输出（实测 3.8.9：没有 code/data 信封，只有这些字段）。
   if [[ -n "${FAKE_BDPAN_FAIL_AUTH:-}" ]]; then
-    printf '{"code":1,"data":null,"error":"token 已过期，请重新登录"}\n'
+    printf '{"authenticated":false,"has_valid_token":false,"username":"fake-bdpan"}\n'
     return 0
   fi
-  printf '{"code":0,"data":{"name":"fake-bdpan","uid":3208457042}}\n'
+  printf '{"authenticated":true,"has_valid_token":true,"username":"bdsd321_baidu","expires_at":"2026-12-24T05:09:40+08:00","is_svip":true}\n'
 }
 
 case "$command" in

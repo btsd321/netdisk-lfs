@@ -439,10 +439,23 @@ impl BdpanClient {
 
     /// 探测登录态（供 `/healthz` 用）。
     ///
+    /// 真实 CLI 的输出是扁平对象（无 `code`/`data` 信封）：
+    /// `{"authenticated":true,"has_valid_token":true,...}`；token 失效时字段转 `false`。
+    /// 这里按字段判定，缺字段时以 CLI 的成功退出为准（不臆造失败）。
+    ///
     /// 只判定成功与否，**不回显 CLI 输出**：`whoami --json` 可能带账号凭据，按
     /// `docs/git-workflow.md` 不得进日志或入库。
     pub async fn whoami(&self) -> Result<(), BdpanError> {
-        self.invoke("whoami", &[], CallSite::default()).await.map(|_| ())
+        let value = self.invoke("whoami", &[], CallSite::default()).await?;
+        let authenticated = value.get("authenticated").and_then(serde_json::Value::as_bool);
+        let valid_token = value.get("has_valid_token").and_then(serde_json::Value::as_bool);
+        match (authenticated, valid_token) {
+            (Some(false), _) | (_, Some(false)) => Err(BdpanError::Auth {
+                command: "whoami",
+                message: "CLI 报告登录态无效".to_owned(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// 带重试地执行一次命令，返回解析后的结果 JSON。
