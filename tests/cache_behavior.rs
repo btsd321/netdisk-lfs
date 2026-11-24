@@ -27,7 +27,7 @@ use netdisk_lfs::store::StoreFuture;
 use netdisk_lfs::{
     AppState, AuthConfig, Cache, CacheConfig, Config, FakeStore, ObjectMeta, ObjectStore, Oid,
     Quota, Role, RuntimeEnv, ServerConfig, Sha256Writer, StorageConfig, StoreError, UserConfig,
-    router,
+    router, transient_dir,
 };
 use tower::ServiceExt;
 
@@ -581,4 +581,57 @@ async fn given_no_authorization_when_get_then_401_before_touching_cache() {
     assert_eq!(header_str(&headers, "lfs-authenticate"), AUTH_CHALLENGE);
     assert_eq!(app.store.fetch_calls(), 0, "未认证请求不得触达后端");
     assert_eq!(app.cache.len(), 0);
+}
+
+/// 直通下载的 fake fetch：把固定内容写进给定中转路径。
+async fn write_payload(part: PathBuf) -> Result<(), StoreError> {
+    tokio::fs::write(&part, b"0123456789abcdef").await.map_err(|error| StoreError::io(&part, error))
+}
+
+#[tokio::test]
+async fn given_oversized_object_when_two_concurrent_fetches_then_transient_paths_distinct() {
+    // 预算 10、内容 16 字节：两次 fetch 都只能是 Transient。Transient 文件会活到
+    // 响应发送完毕，若并发请求共用同一个中转路径，后到的 create 会截断前者。
+    let workspace = FakeStore::new();
+    let root = workspace.root().join("cache");
+    let config = CacheConfig { dir: root, max_bytes: 10 };
+    let cache = Cache::open(&config).await;
+    let contents = b"0123456789abcdef";
+    let oid = Oid::parse(&sha256_hex(contents)).expect("合法 oid");
+
+    let (first, second) =
+        tokio::join!(cache.fetch_once(&oid, write_payload), cache.fetch_once(&oid, write_payload));
+
+    let first = first.expect("第一份直通下载");
+    let second = second.expect("第二份直通下载");
+    assert!(!first.is_cached() && !second.is_cached(), "超预算对象不缓存");
+    assert_ne!(first.path(), second.path(), "并发直通必须使用不同的中转文件");
+    assert_eq!(tokio::fs::read(first.path()).await.expect("读第一份"), contents);
+    assert_eq!(tokio::fs::read(second.path()).await.expect("读第二份"), contents);
+    // Transient 文件由调用方（响应结束时）清理。
+    tokio::fs::remove_file(first.path()).await.expect("清理第一份");
+    tokio::fs::remove_file(second.path()).await.expect("清理第二份");
+}
+
+#[tokio::test]
+async fn given_degraded_cache_when_sweep_then_stale_transient_part_removed() {
+    // 缓存目录不可用 → 降级直通，中转落 netdisk-lfs-transient 专用目录。
+    // 启动清理必须覆盖它（否则 kill -9 残留会永远占着系统临时目录）。
+    let workspace = FakeStore::new();
+    let blocked = workspace.root().join("cache-is-a-file");
+    tokio::fs::write(&blocked, b"not a directory").await.expect("占位文件");
+    let cache = Cache::open(&CacheConfig { dir: blocked, max_bytes: 4096 }).await;
+    assert!(!cache.is_enabled(), "目录不可用时应降级为直通");
+
+    let transient = transient_dir();
+    tokio::fs::create_dir_all(&transient).await.expect("建中转目录");
+    let oid = Oid::parse(&sha256_hex(b"stale payload")).expect("合法 oid");
+    let stale = transient.join(format!("{oid}.9999.part"));
+    tokio::fs::write(&stale, b"stale").await.expect("写超龄残留");
+    set_mtime_ago(&stale, Duration::from_secs(2 * 3600));
+
+    let report = cache.sweep(std::slice::from_ref(&transient)).await;
+
+    assert!(!stale.exists(), "降级模式的超龄中转文件必须被清理");
+    assert!(report.stale_parts >= 1, "清理计数应包含该文件");
 }

@@ -18,6 +18,7 @@
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::fs;
@@ -25,7 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::lru::LruIndex;
 use super::sweep::{self, SweepReport};
-use super::{PART_EXTENSION, STALE_PART_AGE, object_file};
+use super::{PART_EXTENSION, STALE_PART_AGE, object_file, transient_dir};
 use crate::config::CacheConfig;
 use crate::store::{Oid, StoreError};
 
@@ -34,6 +35,17 @@ use crate::store::{Oid, StoreError};
 /// 分片而不是「一个 oid 一把锁」：后者要一个会无限增长的锁表，还要处理锁的回收；
 /// 分片把内存与复杂度都固定住，代价只有「极少数不相关 oid 互相等一下」。
 const SHARDS: usize = 256;
+
+/// 中转文件名序号：`Transient` 结果会一直活到响应体发送完毕，同一 oid 的并发请求
+/// 绝不能共用同一个中转文件——后到的 `fetch` 会截断前一个正在流式发送的文件。
+///
+/// 序号只保证进程内唯一；崩溃残留由启动扫描按「超龄 1 小时」清除，数量上限是
+/// 进程生命周期内的请求数，不会无限堆积。
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_part_seq() -> u64 {
+    PART_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// 一次取数的结果。
 #[non_exhaustive]
@@ -261,9 +273,22 @@ impl Cache {
         }
 
         let part = self.part_path(oid);
-        if let Some(parent) = part.parent() {
-            fs::create_dir_all(parent).await.map_err(|error| StoreError::io(parent, error))?;
-        }
+        let part = match self.ensure_part_parent(&part).await {
+            Ok(()) => part,
+            Err(error) => {
+                // 缓存侧失败一律降级（模块契约）：改走临时目录直通，请求照常完成。
+                tracing::warn!(
+                    path = %part.display(),
+                    error = %error,
+                    "缓存中转目录不可用，本次改走临时目录直通"
+                );
+                let fallback = self.transient_part_path(oid);
+                self.ensure_part_parent(&fallback)
+                    .await
+                    .map_err(|error| StoreError::io(&fallback, error))?;
+                fallback
+            },
+        };
         let guard = PartFile::new(part.clone());
         fetch(part.clone()).await?;
         let size = fs::metadata(&part).await.map_err(|error| StoreError::io(&part, error))?.len();
@@ -287,18 +312,29 @@ impl Cache {
 
         let target = self.path(oid);
         // 同目录 rename 是原子的：要么没有，要么是完整对象（先 `.part` 再 rename）。
-        fs::rename(&part, &target).await.map_err(|error| StoreError::io(&target, error))?;
+        // 失败同样按缓存侧降级处理：文件还完整地在 part 上，直通交出去，
+        // 不能因为「缓存写不进去」让一个已经哈希校验通过的下载失败。
+        if let Err(error) = fs::rename(&part, &target).await {
+            tracing::warn!(
+                oid = %oid,
+                path = %target.display(),
+                error = %error,
+                "rename 进缓存失败，本次直通返回"
+            );
+            return Ok(CachedFile::Transient(guard.hand_over()));
+        }
         // rename 已把文件移走，Drop 只会在旧路径上删一个不存在的文件（NotFound 静默）。
         drop(guard);
 
-        // 记账与驱逐在锁里只做内存操作，文件删除放到锁外做——删文件是 IO，
-        // 不该挡住同一分片里别的 oid。
-        drop(serialized);
+        // 记账与预算驱逐也在锁内做完（纯内存操作）：先放锁再记账会留一个窗口，
+        // 排队者醒来时看到未命中，会把同一份 4 GiB 再完整下载一遍。
+        // 文件删除是 IO，放到锁外做。
         let victims = {
             let mut index = self.index();
             index.insert(oid, size);
             collect_over_budget(&mut index, self.inner.max_bytes)
         };
+        drop(serialized);
         self.unlink(victims).await;
         Ok(CachedFile::Cached(target))
     }
@@ -332,13 +368,28 @@ impl Cache {
 
     /// 中转文件路径。
     ///
-    /// 正常模式与最终对象同目录（同目录 `rename` 才是原子的）；降级模式下缓存目录
-    /// 不可用，落到系统临时目录，由调用方在响应结束后删除。
+    /// 正常模式与最终对象同目录（同目录 `rename` 才是原子的），文件名追加进程内
+    /// 序号：`Transient` 结果（超预算/降级/rename 失败）会一直活到响应体发送完毕，
+    /// 若与下一次同 oid 下载同名，后者的 `create` 会截断前者正在发送的内容。
+    /// 降级模式落到 [`transient_dir`] 专用子目录，由启动清理覆盖。
     fn part_path(&self, oid: &Oid) -> PathBuf {
         if self.inner.enabled {
-            self.path(oid).with_extension(PART_EXTENSION)
+            self.path(oid).with_extension(format!("{}.{PART_EXTENSION}", next_part_seq()))
         } else {
-            std::env::temp_dir().join(format!("netdisk-lfs-{oid}.{PART_EXTENSION}"))
+            self.transient_part_path(oid)
+        }
+    }
+
+    /// 降级/回退的中转文件路径：专用临时子目录 + 唯一序号。
+    fn transient_part_path(&self, oid: &Oid) -> PathBuf {
+        transient_dir().join(format!("{oid}.{}.{PART_EXTENSION}", next_part_seq()))
+    }
+
+    /// 确保中转文件的父目录存在。
+    async fn ensure_part_parent(&self, part: &Path) -> std::io::Result<()> {
+        match part.parent() {
+            Some(parent) => fs::create_dir_all(parent).await,
+            None => Ok(()),
         }
     }
 
@@ -394,9 +445,9 @@ fn collect_over_budget(index: &mut LruIndex, max_bytes: u64) -> Vec<(Oid, u64)> 
 ///
 /// 成功路径上 `rename` 把文件移走，之后 Drop 只是删一个不存在的路径（NotFound 静默）；
 /// 失败或 future 被取消（客户端断连）时由 Drop 尽力删除。删不掉可以放心留给启动扫描：
-/// 中转文件路径由 oid 决定，
-/// 同一个 oid 只会有一个，下一次下载会用 `create` 截断重建，不会像带请求 id 的上传
-/// 缓冲那样无限堆积，所以这里不做 `spawn_blocking` 重试（Drop 里也不做 IO 等待）。
+/// 中转文件名带进程内序号，数量上限是进程生命周期内的请求数，启动清理会删掉超龄的
+/// `*.part`。这里不在 Drop 里做 IO 等待——中转文件只在本请求内部使用，不存在 B5
+/// 上传缓冲那种「句柄被延迟关闭」的竞态，因此不需要 `spawn_blocking` 重试。
 struct PartFile {
     /// 中转文件路径。
     path: PathBuf,

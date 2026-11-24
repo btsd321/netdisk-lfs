@@ -34,6 +34,18 @@ pub(crate) const PART_EXTENSION: &str = "part";
 /// mtime 一直在更新，不会超龄。
 pub(crate) const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// 降级直通模式的中转目录名（位于系统临时目录下）。
+///
+/// 必须放在专用子目录，而不是直接散在 `temp_dir()` 根下：启动清理会递归删除该目录
+/// 里超龄的 `*.part`，只有专用目录才能保证不误删其它进程的文件。
+const TRANSIENT_DIR: &str = "netdisk-lfs-transient";
+
+/// 降级直通模式的中转目录：缓存不可用时 `.part` 落在这里，由启动 [`Cache::sweep`]
+/// 覆盖清理（与上传缓冲目录一样，崩溃残留不会永远占着磁盘）。
+pub fn transient_dir() -> PathBuf {
+    std::env::temp_dir().join(TRANSIENT_DIR)
+}
+
 /// 缓存对象的本地路径：`<root>/<aa>/<bb>/<oid>`。
 ///
 /// 分片与 `store::object_path` 同一规则（都只从 [`Oid::shards`] 取），但本地缓存

@@ -15,6 +15,7 @@ use clap::Parser;
 use netdisk_lfs::http::upload_dir;
 use netdisk_lfs::{
     AppState, BdpanStore, Cache, Config, ConfigError, EnvSource, ObjectStore, init_logging, router,
+    transient_dir,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -98,8 +99,10 @@ async fn run(config: Config) -> Result<(), StartupError> {
     // 缓存启动清理：删除超龄 `.part` 残留、扫描目录重建索引、按预算收敛。
     // 三步都不返回错误（失败只降级为直通并记 warn）：缓存可随时清空、清空不影响
     // 正确性，所以缓存侧的问题绝不能阻止服务启动。
+    // 降级直通模式的中转文件落在一个专用临时子目录里，同样纳入清理——
+    // 不能把整个系统临时目录传进来（会误删其它进程的文件）。
     let cache = Cache::open(&config.cache).await;
-    let sweep = cache.sweep(&[upload_dir(&config)]).await;
+    let sweep = cache.sweep(&[upload_dir(&config), transient_dir()]).await;
     info!(
         cache_dir = %cache.root().display(),
         cache_max_bytes = cache.max_bytes(),
