@@ -247,7 +247,7 @@ impl Default for RawCache {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAccounts {
     /// 账户库路径；留空时由数据根推导。
@@ -255,6 +255,14 @@ struct RawAccounts {
     db: PathBuf,
     #[serde(default = "default_min_password_len")]
     min_password_len: usize,
+}
+
+impl Default for RawAccounts {
+    fn default() -> Self {
+        // 整个 `[accounts]` 段缺失时走这里；字段级 serde default 不会生效，
+        // 因此必须显式给出 12，否则 min_password_len 会退化成 0。
+        Self { db: PathBuf::new(), min_password_len: default_min_password_len() }
+    }
 }
 
 /// 口令最小长度缺省值：12 个字符。
@@ -398,6 +406,10 @@ max_bdpan_procs = 4
         assert_eq!(config.cache.dir, PathBuf::from("/srv/netdisk-lfs/cache"));
         assert_eq!(config.cache.max_bytes, DEFAULT_CACHE_MAX_BYTES);
         assert_eq!(config.accounts.db, PathBuf::from("/srv/netdisk-lfs/accounts.db"));
+        assert_eq!(
+            config.accounts.min_password_len, 12,
+            "[accounts] 段缺失时最小口令长度仍应是缺省 12"
+        );
         assert_eq!(config.runtime_env, crate::config::model::RuntimeEnv::Prod);
         assert_eq!(config.data_dir.as_deref(), Some(Path::new("/srv/netdisk-lfs")));
     }
