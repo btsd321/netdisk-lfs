@@ -18,7 +18,8 @@ git-lfs 客户端 ──HTTPS + Basic Auth──▶ Caddy（TLS 终止，可选�
 
 ## 0. 目标形态与假设
 
-- 单实例：**同一网盘目录只允许一个 netdisk-lfs 进程**（见第 10 节）。
+- 单实例：**同一数据根只允许一个 netdisk-lfs 进程**——启动时对 `DATA_DIR/netdisk-lfs.lock`
+  flock，第二个实例在绑定端口前就以「已有实例在运行」退出（见第 10 节）。
 - 服务只监听 `127.0.0.1:9001`，对外一律经反向代理；`/healthz` 与 `/metrics` 没有认证。
 - 运行身份是普通用户 `lixinlong`。换用户要同时改 unit 的 `User=`/`Group=`、`PATH`、
   `ReadWritePaths=` 与 `bdpan_bin`（四处漏一处就会在运行期才暴露）。
@@ -288,8 +289,8 @@ curl -s  http://127.0.0.1:9001/metrics | grep -c '^netdisk_lfs_'
 
 | 边界 | 说明 |
 |---|---|
-| 单实例 | 同一网盘目录只能跑一个进程：跨进程没有分布式锁，同 oid 并发上传只靠 `mv` 冲突兜底，不是严格互斥 |
-| token 30 天 | 依赖 `bdpan` 自动续期；续期要求 `~/.config/bdpan` 可写，失败后必须人工 `login` |
+| 单实例 | 进程内强制：`DATA_DIR/netdisk-lfs.lock` 的 flock 由内核维护，第二个实例启动即失败（崩溃自动释放，无残留锁）。跨机器仍没有分布式锁，同 oid 并发上传只靠 `mv` 冲突兜底 |
+| token 30 天 | access_token 官方有效期 30 天、刷新后仍 30 天；长期凭据是 refresh_token（官方文档标称 **10 年**）。`bdpan` 内置刷新流程（`grant_type=refresh_token`），前提是 `~/.config/bdpan` 可写；只有 refresh_token 失效/被撤销或用户解除授权才需人工 `login` |
 | 单对象 4 GiB | 超限直接 422，不做分片；3 GiB 以上的真实对象仍待端到端实测 |
 | 无 LFS 锁 | `git lfs lock` 系列端点未实现 |
 | 无配额/限速 | 不按用户限额，也没有请求速率限制 |

@@ -6,8 +6,9 @@
 
 mod cli;
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -26,7 +27,9 @@ use crate::cli::Cli;
 const DOTENV_FILE: &str = ".env";
 
 fn main() -> ExitCode {
-    match bootstrap().and_then(serve) {
+    // 锁守卫必须活到进程退出：`_lock` 随 `serve` 返回才被丢弃，
+    // 期间任何第二个实例都会在启动阶段被拒绝。
+    match bootstrap().and_then(|(config, _lock)| serve(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 日志可能尚未初始化，直接写 stderr，保证启动失败一定有输出。
@@ -43,13 +46,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// 同步启动阶段：读 `.env`、解析参数与配置、初始化日志。
-fn bootstrap() -> Result<Config, StartupError> {
+/// 同步启动阶段：读 `.env`、解析参数与配置、初始化日志、抢单实例锁。
+fn bootstrap() -> Result<(Config, SingletonLock), StartupError> {
     let cli = Cli::parse();
     let env = EnvSource::load(Path::new(DOTENV_FILE))?;
     let config_path = cli.config_path(&env);
     let config = Config::load_with(&config_path, &env)?;
     init_logging(config.runtime_env)?;
+
+    // 单实例：缓存目录与网盘中转都假定只有一个进程，第二个实例必须在绑定端口前退出。
+    let lock = acquire_singleton(&config)?;
 
     let data_dir = config
         .data_dir
@@ -75,7 +81,7 @@ fn bootstrap() -> Result<Config, StartupError> {
     for (name, user) in &config.auth.users {
         tracing::debug!(user = %name, role = %user.role, "加载 LFS 用户凭据");
     }
-    Ok(config)
+    Ok((config, lock))
 }
 
 /// 建立 tokio 多线程 runtime 并运行服务。
@@ -176,6 +182,44 @@ async fn wait_ctrl_c() {
     }
 }
 
+/// 单实例锁文件名（放在本地数据根下）。
+const LOCK_FILE: &str = "netdisk-lfs.lock";
+
+/// 单实例锁：`File` 持有期间 flock 生效，进程退出（含崩溃）由内核自动释放。
+///
+/// 没有它时两个实例可以同时跑：缓存索引各记各的、上传中转共用 `tmp/<oid>`、
+/// 同一个 oid 的 put 会互相覆盖。systemd 只能保证同名 unit 不重复，
+/// 手工再起一个二进制仍会冲突，所以锁必须在进程内做。
+#[derive(Debug)]
+struct SingletonLock {
+    /// 锁文件句柄；字段只靠 Drop 释放锁，不读取。
+    _file: File,
+}
+
+/// 取本地数据根下的单实例锁；拿不到时区分「已有实例」（WouldBlock）与真实 IO 错。
+fn acquire_singleton(config: &Config) -> Result<SingletonLock, StartupError> {
+    let dir = config.data_dir.clone().unwrap_or_else(std::env::temp_dir);
+    acquire_lock(&dir)
+}
+
+fn acquire_lock(dir: &Path) -> Result<SingletonLock, StartupError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|source| StartupError::LockIo { path: dir.to_path_buf(), source })?;
+    let path = dir.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| StartupError::LockIo { path: path.clone(), source })?;
+    match file.try_lock() {
+        Ok(()) => Ok(SingletonLock { _file: file }),
+        Err(TryLockError::WouldBlock) => Err(StartupError::AlreadyRunning { path }),
+        Err(TryLockError::Error(source)) => Err(StartupError::LockIo { path, source }),
+    }
+}
+
 /// 启动期错误；`main` 统一打印并返回非零退出码。
 #[derive(Debug, thiserror::Error)]
 enum StartupError {
@@ -193,4 +237,48 @@ enum StartupError {
     },
     #[error("HTTP 服务运行失败")]
     Serve(#[source] std::io::Error),
+    #[error("已有 netdisk-lfs 实例在运行（锁文件 {path}）")]
+    AlreadyRunning {
+        /// 锁文件路径，便于定位是哪个数据根。
+        path: PathBuf,
+    },
+    #[error("单实例锁 {} 不可用", path.display())]
+    LockIo {
+        /// 出错的锁文件或数据目录。
+        path: PathBuf,
+        /// 底层 IO 错误。
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupError, acquire_lock};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("netdisk-lfs-lock-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    #[test]
+    fn given_first_instance_holds_lock_when_second_acquires_then_rejected() {
+        let dir = temp_dir();
+        let first = acquire_lock(&dir).expect("首个实例应拿到锁");
+
+        let err = acquire_lock(&dir).expect_err("第二个实例必须被拒绝");
+
+        assert!(matches!(err, StartupError::AlreadyRunning { .. }), "实际错误：{err}");
+        // 守卫释放后（进程退出/重启）可以重新获取。
+        drop(first);
+        acquire_lock(&dir).expect("释放后应能重新获取");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
