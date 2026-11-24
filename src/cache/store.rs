@@ -1,6 +1,6 @@
-//! [`Cache`] 本体：命中校验、预算驱逐、启动扫描与收敛。
+//! [`Cache`] 本体：命中校验、单飞下载、预算驱逐与启动收敛。
 //!
-//! 设计要点（与 `specs/storage.md`「缓存策略」逐条对应）：
+//! 设计要点（与 `specs/storage.md`「缓存策略」「下载状态机」逐条对应）：
 //!
 //! - **索引是内存里的唯一真相**：启动扫描重建（[`Cache::open`]），运行中插入/命中/
 //!   驱逐增量维护；`used_bytes` 与 `max_bytes` 比较决定是否驱逐；
@@ -9,20 +9,62 @@
 //!   `store.fetch` 落盘前那次 sha256 负责，缓存驻留期间不重复哈希（4 GiB 对象每读
 //!   一遍都算一遍哈希没有意义）；
 //! - **只读命中不写盘**：命中只动内存里的访问序号，不做任何文件写入；
-//! - **缓存可随时清空**：索引与磁盘对不上时以「驱逐 + 当未命中」自愈，清空目录后
-//!   下一次请求重新回源。
+//! - **单飞按 oid 分片**：256 把 `tokio::sync::Mutex`，同一 oid 的并发未命中只有一个
+//!   真正下载，其余排队后二次检查命中。等待者被丢弃只是取消它的排队，不影响在途
+//!   fetch；持锁者被丢弃时锁自动释放、下一个请求重下，`.part` 由守卫与启动扫描兜底
+//!   （取消安全）；
+//! - **要么完整要么不存在**：下载写 `<oid>.part`，校验通过才 `rename` 到最终路径。
 
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::fs;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::lru::LruIndex;
 use super::sweep::{self, SweepReport};
-use super::{STALE_PART_AGE, object_file};
+use super::{PART_EXTENSION, STALE_PART_AGE, object_file};
 use crate::config::CacheConfig;
-use crate::store::Oid;
+use crate::store::{Oid, StoreError};
+
+/// 单飞锁的分片数：oid 前两个十六进制字符的取值空间。
+///
+/// 分片而不是「一个 oid 一把锁」：后者要一个会无限增长的锁表，还要处理锁的回收；
+/// 分片把内存与复杂度都固定住，代价只有「极少数不相关 oid 互相等一下」。
+const SHARDS: usize = 256;
+
+/// 一次取数的结果。
+#[non_exhaustive]
+pub enum CachedFile {
+    /// 已提交进 LRU 缓存：响应结束后**不要**删除这个文件。
+    Cached(PathBuf),
+    /// 未入缓存（超过预算或缓存已降级）：这是本次请求私有的临时文件，调用方负责删除。
+    Transient(PathBuf),
+}
+
+impl CachedFile {
+    /// 本地文件路径。
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Cached(path) | Self::Transient(path) => path,
+        }
+    }
+
+    /// 是否已进缓存（调用方据此决定响应结束后是否删文件）。
+    pub fn is_cached(&self) -> bool {
+        matches!(self, Self::Cached(_))
+    }
+}
+
+impl std::fmt::Debug for CachedFile {
+    /// 只暴露形态与路径，避免把整个文件内容带进日志的错觉。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = if self.is_cached() { "Cached" } else { "Transient" };
+        f.debug_tuple(kind).field(&self.path()).finish()
+    }
+}
 
 /// 本地磁盘读缓存。
 ///
@@ -40,6 +82,8 @@ struct Inner {
     max_bytes: u64,
     /// LRU 索引；临界区只有内存操作，绝不跨 `.await` 持锁。
     index: Mutex<LruIndex>,
+    /// 按 oid 分片的单飞锁。
+    shards: Box<[AsyncMutex<()>]>,
     /// `false` 表示启动扫描失败、降级为直通：不读不写缓存，只把对象下载到临时文件。
     enabled: bool,
 }
@@ -92,11 +136,14 @@ impl Cache {
 
     /// 两个构造入口共用。
     fn with_index(config: &CacheConfig, index: LruIndex, enabled: bool) -> Self {
+        let shards =
+            (0..SHARDS).map(|_| AsyncMutex::new(())).collect::<Vec<_>>().into_boxed_slice();
         Self {
             inner: Arc::new(Inner {
                 root: config.dir.clone(),
                 max_bytes: config.max_bytes,
                 index: Mutex::new(index),
+                shards,
                 enabled,
             }),
         }
@@ -185,6 +232,77 @@ impl Cache {
         self.index().remove(oid)
     }
 
+    /// 取一个对象：命中直接返回；未命中则在同一 oid 上**只触发一次** `fetch`。
+    ///
+    /// `fetch` 收到中转文件路径（`<oid>.part`，降级模式下在系统临时目录），负责把
+    /// 对象写进去；写成功后本函数负责校验大小、`rename` 进缓存、记账并按预算驱逐。
+    /// 哈希校验不在这里重复：`ObjectStore::fetch` 的契约就是「完成后 `dest` 的
+    /// sha256 必须等于 oid」，两处各算一遍只是浪费一遍 4 GiB 的读。
+    ///
+    /// # Errors
+    /// `fetch` 的失败原样返回（后端错误、哈希不符、IO 失败）。失败时不留中转文件，
+    /// 也不会在缓存里留下任何索引项——404 之类的结果不会被缓存成负面结果。
+    pub async fn fetch_once<F, Fut>(&self, oid: &Oid, fetch: F) -> Result<CachedFile, StoreError>
+    where
+        F: FnOnce(PathBuf) -> Fut + Send,
+        Fut: Future<Output = Result<(), StoreError>> + Send,
+    {
+        if let Some(path) = self.get(oid).await {
+            return Ok(CachedFile::Cached(path));
+        }
+
+        // 单飞：同一 oid 的并发未命中在这里排队。等待者被丢弃只取消它自己的排队，
+        // 在途 fetch 不受影响；持锁者被丢弃时锁随守卫释放，后到的请求重新下载。
+        let serialized = self.shard(oid).lock().await;
+
+        // 二次检查：排到我们时，前一个请求可能已经把对象放进来了。
+        if let Some(path) = self.get(oid).await {
+            return Ok(CachedFile::Cached(path));
+        }
+
+        let part = self.part_path(oid);
+        if let Some(parent) = part.parent() {
+            fs::create_dir_all(parent).await.map_err(|error| StoreError::io(parent, error))?;
+        }
+        let guard = PartFile::new(part.clone());
+        fetch(part.clone()).await?;
+        let size = fs::metadata(&part).await.map_err(|error| StoreError::io(&part, error))?.len();
+
+        // 降级模式：不建索引，直接把中转文件交出去（由调用方在响应结束后删除）。
+        if !self.inner.enabled {
+            return Ok(CachedFile::Transient(guard.hand_over()));
+        }
+
+        // 单个对象比整个预算还大：缓存它只会立刻把自己驱逐掉，不如直通返回。
+        // 这不是错误，请求照常成功（规格：不得报错，记 warn）。
+        if size > self.inner.max_bytes {
+            tracing::warn!(
+                oid = %oid,
+                size,
+                max_bytes = self.inner.max_bytes,
+                "对象大于缓存预算，本次直通返回且不入缓存"
+            );
+            return Ok(CachedFile::Transient(guard.hand_over()));
+        }
+
+        let target = self.path(oid);
+        // 同目录 rename 是原子的：要么没有，要么是完整对象（先 `.part` 再 rename）。
+        fs::rename(&part, &target).await.map_err(|error| StoreError::io(&target, error))?;
+        // rename 已把文件移走，Drop 只会在旧路径上删一个不存在的文件（NotFound 静默）。
+        drop(guard);
+
+        // 记账与驱逐在锁里只做内存操作，文件删除放到锁外做——删文件是 IO，
+        // 不该挡住同一分片里别的 oid。
+        drop(serialized);
+        let victims = {
+            let mut index = self.index();
+            index.insert(oid, size);
+            collect_over_budget(&mut index, self.inner.max_bytes)
+        };
+        self.unlink(victims).await;
+        Ok(CachedFile::Cached(target))
+    }
+
     /// 启动清理：删超龄 `.part` 残留，再按预算做一次 LRU 收敛。
     ///
     /// `extra_dirs` 是缓存目录之外的清理目标（上传缓冲目录 `data_dir/upload`）。
@@ -210,6 +328,26 @@ impl Cache {
         report.evicted_objects = victims.len() as u64;
         self.unlink(victims).await;
         report
+    }
+
+    /// 中转文件路径。
+    ///
+    /// 正常模式与最终对象同目录（同目录 `rename` 才是原子的）；降级模式下缓存目录
+    /// 不可用，落到系统临时目录，由调用方在响应结束后删除。
+    fn part_path(&self, oid: &Oid) -> PathBuf {
+        if self.inner.enabled {
+            self.path(oid).with_extension(PART_EXTENSION)
+        } else {
+            std::env::temp_dir().join(format!("netdisk-lfs-{oid}.{PART_EXTENSION}"))
+        }
+    }
+
+    /// oid 所属的单飞分片。
+    fn shard(&self, oid: &Oid) -> &AsyncMutex<()> {
+        // `Oid` 保证前两个字符是十六进制，`from_str_radix` 不会失败；兜底分片 0
+        // 只是为了不在生产路径上 `unwrap`。
+        let index = usize::from_str_radix(oid.prefix2(), 16).unwrap_or(0);
+        &self.inner.shards[index % SHARDS]
     }
 
     /// 索引守卫；持锁期间只做内存操作（调用方必须保证不跨 `.await`）。
@@ -250,4 +388,45 @@ fn collect_over_budget(index: &mut LruIndex, max_bytes: u64) -> Vec<(Oid, u64)> 
         victims.push((victim, size));
     }
     victims
+}
+
+/// 下载中转文件的守卫。
+///
+/// 成功路径上 `rename` 把文件移走，之后 Drop 只是删一个不存在的路径（NotFound 静默）；
+/// 失败或 future 被取消（客户端断连）时由 Drop 尽力删除。删不掉可以放心留给启动扫描：
+/// 中转文件路径由 oid 决定，
+/// 同一个 oid 只会有一个，下一次下载会用 `create` 截断重建，不会像带请求 id 的上传
+/// 缓冲那样无限堆积，所以这里不做 `spawn_blocking` 重试（Drop 里也不做 IO 等待）。
+struct PartFile {
+    /// 中转文件路径。
+    path: PathBuf,
+}
+
+impl PartFile {
+    /// 绑定一个待清理路径（文件可以还不存在）。
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// 交出所有权：调用方（超预算直通/降级模式）负责在响应结束后删除。
+    fn hand_over(self) -> PathBuf {
+        let path = self.path.clone();
+        // 不能只靠 Drop：`Drop` 会删掉刚交给调用方的文件。禁止析构是唯一办法。
+        std::mem::forget(self);
+        path
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "清理下载中转文件失败，留给启动扫描"
+            ),
+        }
+    }
 }
