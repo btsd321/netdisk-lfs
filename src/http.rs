@@ -408,7 +408,7 @@ mod tests {
             cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
             accounts: AccountsConfig {
                 db: std::env::temp_dir().join("netdisk-lfs-http-tests-accounts.db"),
-                min_password_len: 12,
+                ..AccountsConfig::default()
             },
             auth: AuthConfig::default(),
             runtime_env: RuntimeEnv::Dev,

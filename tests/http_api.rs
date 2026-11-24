@@ -109,7 +109,7 @@ fn config_with_users(users: &[(&str, Role)]) -> Config {
         cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
         accounts: AccountsConfig {
             db: std::env::temp_dir().join("netdisk-lfs-http-api-tests-accounts.db"),
-            min_password_len: 12,
+            ..AccountsConfig::default()
         },
         auth: AuthConfig { users: auth_users },
         runtime_env: RuntimeEnv::Dev,

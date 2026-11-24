@@ -12,8 +12,9 @@ use serde::Deserialize;
 use crate::config::env::{self, EnvSource};
 use crate::config::error::ConfigError;
 use crate::config::model::{
-    AccountsConfig, AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig,
-    UserConfig,
+    AccountsConfig, AuthConfig, CacheConfig, Config, DEFAULT_LOGIN_FAILURES_PER_5MIN,
+    DEFAULT_MIN_PASSWORD_LEN, DEFAULT_REGISTRATION_PER_HOUR, RegistrationPolicy, Role, RuntimeEnv,
+    ServerConfig, StorageConfig, UserConfig,
 };
 
 /// 缓存预算缺省值：200 GiB，与 `specs/storage.md` 一致。
@@ -110,6 +111,11 @@ impl Config {
             accounts: AccountsConfig {
                 db: accounts_db,
                 min_password_len: accounts.min_password_len,
+                registration: accounts.registration,
+                default_role: accounts.default_role,
+                registration_per_hour: accounts.registration_per_hour,
+                login_failures_per_5min: accounts.login_failures_per_5min,
+                trust_proxy: accounts.trust_proxy,
             },
             auth: AuthConfig { users: auth.users },
             runtime_env,
@@ -148,6 +154,13 @@ impl Config {
                 "accounts.min_password_len 必须在 1..=128 之间，实际为 {}",
                 self.accounts.min_password_len
             )));
+        }
+        // 默认角色只能是普通角色：admin 必须由 `[auth.users]` 显式引导，否则开放注册
+        // 就等于任何人都能自助拿到管理员权限。
+        if self.accounts.default_role == Role::Admin {
+            return Err(ConfigError::invalid(
+                "accounts.default_role 不能是 admin，管理员只能通过 [auth.users] 引导",
+            ));
         }
         for (name, user) in &self.auth.users {
             if name.is_empty() {
@@ -273,19 +286,57 @@ struct RawAccounts {
     db: PathBuf,
     #[serde(default = "default_min_password_len")]
     min_password_len: usize,
+    #[serde(default = "default_registration")]
+    registration: RegistrationPolicy,
+    #[serde(default = "default_default_role")]
+    default_role: Role,
+    #[serde(default = "default_registration_per_hour")]
+    registration_per_hour: u64,
+    #[serde(default = "default_login_failures_per_5min")]
+    login_failures_per_5min: u64,
+    #[serde(default)]
+    trust_proxy: bool,
 }
 
 impl Default for RawAccounts {
     fn default() -> Self {
         // 整个 `[accounts]` 段缺失时走这里；字段级 serde default 不会生效，
-        // 因此必须显式给出 12，否则 min_password_len 会退化成 0。
-        Self { db: PathBuf::new(), min_password_len: default_min_password_len() }
+        // 因此必须显式给出每个缺省值，否则会静默退化成 0（口令下限）或未知策略。
+        Self {
+            db: PathBuf::new(),
+            min_password_len: default_min_password_len(),
+            registration: default_registration(),
+            default_role: default_default_role(),
+            registration_per_hour: default_registration_per_hour(),
+            login_failures_per_5min: default_login_failures_per_5min(),
+            trust_proxy: false,
+        }
     }
 }
 
-/// 口令最小长度缺省值：12 个字符。
+/// 口令最小长度缺省值。
 fn default_min_password_len() -> usize {
-    12
+    DEFAULT_MIN_PASSWORD_LEN
+}
+
+/// 注册策略缺省值：`approval`（新账户需管理员审批后才可登录）。
+fn default_registration() -> RegistrationPolicy {
+    RegistrationPolicy::Approval
+}
+
+/// 默认角色缺省值：`readwrite`。
+fn default_default_role() -> Role {
+    Role::Readwrite
+}
+
+/// 注册限速缺省值。
+fn default_registration_per_hour() -> u64 {
+    DEFAULT_REGISTRATION_PER_HOUR
+}
+
+/// 登录失败限速缺省值。
+fn default_login_failures_per_5min() -> u64 {
+    DEFAULT_LOGIN_FAILURES_PER_5MIN
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -304,7 +355,7 @@ mod tests {
     use super::{Config, DEFAULT_CACHE_MAX_BYTES};
     use crate::config::env::EnvSource;
     use crate::config::error::ConfigError;
-    use crate::config::model::Role;
+    use crate::config::model::{RegistrationPolicy, Role};
     use crate::test_support::TempDir;
 
     use std::net::SocketAddr;
@@ -364,6 +415,15 @@ bob = { password_sha256 = "00000000000000000000000000000000000000000000000000000
         assert_eq!(config.cache.max_bytes, 214_748_364_800);
         assert_eq!(config.accounts.db, PathBuf::from("/var/lib/netdisk-lfs/accounts.db"));
         assert_eq!(config.accounts.min_password_len, 12);
+        assert_eq!(
+            config.accounts.registration,
+            RegistrationPolicy::Approval,
+            "默认需要管理员审批"
+        );
+        assert_eq!(config.accounts.default_role, Role::Readwrite, "新账户默认读写");
+        assert_eq!(config.accounts.registration_per_hour, 5);
+        assert_eq!(config.accounts.login_failures_per_5min, 10);
+        assert!(!config.accounts.trust_proxy, "默认不信任 X-Forwarded-For");
         assert_eq!(config.auth.users.len(), 2);
         assert_eq!(config.auth.users["alice"].role, Role::Readwrite);
         assert_eq!(config.auth.users["bob"].role, Role::Readonly);
@@ -675,5 +735,46 @@ db = ""
         let message = load_error(VALID_CONFIG, &[("NETDISK_LFS_ENV", "staging")]);
 
         assert!(message.contains("NETDISK_LFS_ENV"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_explicit_registration_fields_when_load_then_parsed() {
+        let anchor = "[accounts]\ndb = \"/var/lib/netdisk-lfs/accounts.db\"";
+        let contents = VALID_CONFIG.replace(
+            anchor,
+            &format!(
+                "{anchor}\nregistration = \"open\"\ndefault_role = \"readonly\"\nregistration_per_hour = 0\nlogin_failures_per_5min = 3\ntrust_proxy = true"
+            ),
+        );
+
+        let config = load(&contents, &[]).expect("显式注册配置应合法");
+
+        assert_eq!(config.accounts.registration, RegistrationPolicy::Open);
+        assert_eq!(config.accounts.default_role, Role::Readonly);
+        assert_eq!(config.accounts.registration_per_hour, 0, "0 = 不限");
+        assert_eq!(config.accounts.login_failures_per_5min, 3);
+        assert!(config.accounts.trust_proxy);
+    }
+
+    #[test]
+    fn given_unknown_registration_policy_when_load_then_rejected() {
+        let anchor = "[accounts]\ndb = \"/var/lib/netdisk-lfs/accounts.db\"";
+        let contents =
+            VALID_CONFIG.replace(anchor, &format!("{anchor}\nregistration = \"invite\""));
+
+        let message = load_error(&contents, &[]);
+
+        assert!(message.contains("registration"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_admin_default_role_when_load_then_rejected() {
+        let anchor = "[accounts]\ndb = \"/var/lib/netdisk-lfs/accounts.db\"";
+        let contents = VALID_CONFIG.replace(anchor, &format!("{anchor}\ndefault_role = \"admin\""));
+
+        let message = load_error(&contents, &[]);
+
+        assert!(message.contains("default_role"), "实际错误：{message}");
+        assert!(message.contains("admin"), "实际错误：{message}");
     }
 }

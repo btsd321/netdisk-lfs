@@ -158,7 +158,7 @@ fn test_config(root: &Path, users: &[(&str, Role)]) -> Config {
             bdpan_min_throughput_bytes_per_sec: 102_400,
         },
         cache: CacheConfig { dir: root.join("cache"), max_bytes: CACHE_MAX_BYTES },
-        accounts: AccountsConfig { db: root.join("accounts.db"), min_password_len: 12 },
+        accounts: AccountsConfig { db: root.join("accounts.db"), ..AccountsConfig::default() },
         auth: AuthConfig { users: auth_users },
         runtime_env: RuntimeEnv::Dev,
         data_dir: Some(root.to_path_buf()),

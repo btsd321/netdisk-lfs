@@ -12,6 +12,6 @@ mod model;
 pub use env::{EnvSource, NETDISK_LFS_CONFIG};
 pub use error::ConfigError;
 pub use model::{
-    AccountsConfig, AuthConfig, CacheConfig, Config, Role, RuntimeEnv, ServerConfig, StorageConfig,
-    UserConfig,
+    AccountsConfig, AuthConfig, CacheConfig, Config, RegistrationPolicy, Role, RuntimeEnv,
+    ServerConfig, StorageConfig, UserConfig,
 };
