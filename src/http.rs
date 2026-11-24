@@ -89,6 +89,12 @@ pub(crate) fn config_admin_fallback(config: &Config, name: &str) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
+/// 账户库已接入但读写失败（磁盘、锁、库损坏）时的 503 文案。
+///
+/// 与 [`ACCOUNTS_NOT_CONFIGURED_MESSAGE`] 分开：一个说「这个实例没配账户库」，
+/// 一个说「配了但暂时用不了」，运维看到后该查的方向完全不同。
+pub(crate) const ACCOUNTS_UNAVAILABLE_MESSAGE: &str = "账户库暂时不可用，请稍后重试";
+
 /// 回写给客户端与反向代理的请求 id 头。
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 

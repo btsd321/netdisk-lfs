@@ -2,8 +2,8 @@
 //!
 //! 契约见 `specs/api.md`「公共约定」「状态码约定」：错误体恒为
 //! `{"message":"...","request_id":"..."}`，`Content-Type` 为
-//! `application/vnd.git-lfs+json`；401 额外带
-//! `LFS-Authenticate: Basic realm="netdisk-lfs"`。request id 与响应头保持同值，
+//! `application/vnd.git-lfs+json`；401 额外带 `LFS-Authenticate` 与标准
+//! `WWW-Authenticate`（浏览器靠后者弹 Basic 登录框）。request id 与响应头保持同值，
 //! 便于客户端报障时直接对日志。
 
 use axum::body::Body;
@@ -16,8 +16,10 @@ use thiserror::Error;
 use super::{LFS_MEDIA_TYPE, REQUEST_ID_HEADER, RequestId};
 use crate::store::StoreError;
 
-/// 401 的认证挑战头；头名与取值由 `specs/api.md` 固定。
+/// 401 的认证挑战头；头名与取值由 `specs/api.md` 固定（git-lfs 客户端只认它）。
 const AUTHENTICATE_HEADER: &str = "lfs-authenticate";
+/// 标准认证挑战头：浏览器只认 `WWW-Authenticate` 才会弹 Basic 登录框，
+/// `/admin` 这类网页端点依赖它；与 `lfs-authenticate` 同时下发，互不冲突。
 const AUTHENTICATE_CHALLENGE: &str = "Basic realm=\"netdisk-lfs\"";
 
 /// LFS 错误体。
@@ -155,6 +157,10 @@ impl ApiError {
             Self::Unauthorized(_) => {
                 headers
                     .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+                headers.insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(AUTHENTICATE_CHALLENGE),
+                );
             },
             Self::TooManyRequests { retry_after_secs, .. } => {
                 // RFC 9110 §10.2.3：429 应告诉客户端多久后可以重试。
@@ -187,9 +193,9 @@ impl IntoResponse for ApiError {
 /// 账户库故障（503）也要带它：客户端需要知道该用哪套凭据重试，而不是误以为
 /// 这个端点不需要认证。
 pub(crate) fn with_auth_challenge(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+    let headers = response.headers_mut();
+    headers.insert(AUTHENTICATE_HEADER, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
+    headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(AUTHENTICATE_CHALLENGE));
     response
 }
 

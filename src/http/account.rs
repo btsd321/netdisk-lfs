@@ -16,15 +16,20 @@ use serde::{Deserialize, Serialize};
 use super::auth::AuthUser;
 use super::error::ApiError;
 use super::{
-    ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, config_admin_fallback, config_username,
-    json_with_status, passwords,
+    ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
+    config_admin_fallback, config_username, json_with_status, passwords,
 };
 use crate::accounts::{AccountError, User, UserStatus, validate_password};
 use crate::config::Role;
 
-/// 账户库未接入时的 503。
-fn accounts_unavailable() -> ApiError {
+/// 账户库未接入（`accounts: None`）时的 503。
+fn accounts_disabled() -> ApiError {
     ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned())
+}
+
+/// 账户库已接入但读写失败时的 503：与「没配账户库」区分开，排障方向不同。
+fn accounts_unavailable() -> ApiError {
+    ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned())
 }
 
 /// `GET /account/me` 的响应体。
@@ -73,7 +78,7 @@ pub(crate) async fn me(
     Extension(request_id): Extension<RequestId>,
 ) -> Response {
     let Some(users) = state.accounts() else {
-        return accounts_unavailable().into_response_with(&request_id);
+        return accounts_disabled().into_response_with(&request_id);
     };
     match users.get(&auth.username).await {
         Ok(Some(user)) => {
@@ -123,7 +128,7 @@ async fn change_password_inner(
     body: &[u8],
 ) -> Result<(), ApiError> {
     let Some(users) = state.accounts() else {
-        return Err(accounts_unavailable());
+        return Err(accounts_disabled());
     };
     let change: PasswordChange = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("请求体不是合法 JSON：{error}")))?;
@@ -162,7 +167,7 @@ async fn change_password_inner(
     })?;
     users.update_password_hash(&user.username, &new_hash).await.map_err(|error| {
         tracing::error!(username = %user.username, error = %error, "写入口令哈希失败");
-        ApiError::Internal("更新口令失败".to_owned())
+        accounts_unavailable()
     })?;
     tracing::info!(username = %user.username, "账户自助修改口令成功");
     Ok(())
@@ -193,7 +198,7 @@ pub(crate) async fn delete_self(
 
 async fn delete_self_inner(state: &AppState, auth: &AuthUser, body: &[u8]) -> Result<(), ApiError> {
     let Some(users) = state.accounts() else {
-        return Err(accounts_unavailable());
+        return Err(accounts_disabled());
     };
     let request: DeleteAccount = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("请求体不是合法 JSON：{error}")))?;

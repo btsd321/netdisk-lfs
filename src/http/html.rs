@@ -33,7 +33,8 @@ button { padding: .55rem 1rem; border: 0; border-radius: .375rem; background: #1
 button.danger { background: #b42318; }
 .hint { color: #59636e; font-size: .9rem; }
 .error { color: #b42318; }
-nav.filters { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1rem 0; font-size: .9rem; }
+nav.filters, nav.pager { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1rem 0;
+                           font-size: .9rem; }
 table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .9rem; }
 th, td { border-bottom: 1px solid #d0d7de; padding: .4rem .5rem; text-align: left;
          vertical-align: top; }

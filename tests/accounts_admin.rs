@@ -517,6 +517,35 @@ async fn given_wrong_content_type_when_admin_write_then_415() {
 }
 
 #[tokio::test]
+async fn given_unauthenticated_when_admin_page_then_401_with_www_authenticate() {
+    let app = TestApp::new();
+
+    // 浏览器只有看到标准 `WWW-Authenticate` 才会弹 Basic 登录框，`/admin` 靠它才打得开；
+    // `lfs-authenticate` 仍是 git-lfs 客户端的契约，两个都要有。
+    let (status, headers, _) = app
+        .send(request(Method::GET, "/admin", None, Some("text/html"), None, String::new()))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"netdisk-lfs\""),
+        "缺少 WWW-Authenticate 时浏览器不会弹登录框"
+    );
+    assert_eq!(
+        headers.get("lfs-authenticate").and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"netdisk-lfs\""),
+        "git-lfs 客户端仍依赖 lfs-authenticate"
+    );
+
+    // JSON 端点同样两个头都带。
+    let (status, headers, _) =
+        app.send_json(api(Method::GET, "/admin/users", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.get(header::WWW_AUTHENTICATE).is_some());
+    assert!(headers.get("lfs-authenticate").is_some());
+}
+
+#[tokio::test]
 async fn given_no_account_store_when_admin_endpoints_then_503() {
     let app = TestApp::without_accounts();
 
@@ -529,6 +558,28 @@ async fn given_no_account_store_when_admin_endpoints_then_503() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(content_type(&headers).starts_with("text/html"));
     assert!(body_text(body).contains("账户库未启用"), "应说明原因，而不是空表格");
+}
+
+#[tokio::test]
+async fn given_corrupt_row_when_admin_reads_then_503_says_temporarily_unavailable() {
+    // 直接写一行 role 非法的记录：账户库「已接入但读不出来」，不是「没配账户库」。
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed("broken", "wizard", "active");
+
+    let (status, headers, body) =
+        app.send_json(api(Method::GET, "/admin/users", "root", PASSWORD, None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_error_contract(&headers, &body);
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("暂时不可用"), "应提示可重试：{body}");
+    assert!(!message.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
+
+    let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(body);
+    assert!(body.contains("暂时不可用"), "管理页也应给出可重试的文案：{body}");
+    assert!(!body.contains("未启用"), "已接入账户库时不得说「未启用」：{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,6 +1127,57 @@ async fn given_admin_page_when_get_then_table_with_escaped_username() {
     let unknown = body_text(unknown);
     assert!(unknown.contains("无法识别的状态过滤"), "应提示过滤值无效：{unknown}");
     assert!(unknown.contains("&lt;script&gt;"), "回显必须转义：{unknown}");
+}
+
+#[tokio::test]
+async fn given_many_accounts_when_admin_page_then_second_page_reachable() {
+    let app = TestApp::new();
+    app.create_user("root", PASSWORD, Role::Admin, UserStatus::Active).await;
+    app.seed_many(105);
+
+    // 第一页：100 行（root + seed000..seed098），有「下一页」、没有「上一页」。
+    let (status, _, body) = app.send(page_get("/admin", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains("seed098"));
+    assert!(!body.contains("seed099"), "第 101 行不属于第一页：{body}");
+    assert!(body.contains(r#"href="/admin?offset=100""#), "应有下一页链接：{body}");
+    assert!(!body.contains("上一页"), "第一页不应有上一页：{body}");
+
+    // 第二页：剩下 6 行（seed099..seed104），有「上一页」、没有「下一页」。
+    let (status, _, body) = app.send(page_get("/admin?offset=100", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains("seed099"), "第二页应包含第 101 行：{body}");
+    assert!(body.contains("seed104"), "第二页应包含最后一行：{body}");
+    assert!(!body.contains("seed000"), "第一行不应出现在第二页：{body}");
+    assert!(body.contains("← 上一页"), "第二页应有上一页：{body}");
+    assert!(!body.contains("下一页"), "第二页已是最后一页：{body}");
+    // 翻页链接与表单都要带上当前偏移，操作完回到同一页。
+    assert!(body.contains(r#"name="offset" value="100""#), "表单应回传页码：{body}");
+
+    // 带状态过滤时，翻页链接保留 status。
+    let (status, _, body) = app.send(page_get("/admin?status=active", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body_text(body).contains(r#"href="/admin?status=active&offset=100""#));
+
+    let (status, _, body) =
+        app.send(page_get("/admin?status=active&offset=100", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_text(body);
+    assert!(body.contains(r#"href="/admin?status=active""#), "上一页应保留过滤：{body}");
+    assert!(body.contains(r#"name="status" value="active""#), "表单应回传过滤：{body}");
+
+    // 表单提交后的 303 也回到同一页。
+    let (status, headers, _) =
+        app.send(form_post("/admin/users/seed000/disable", "root", PASSWORD, "offset=100")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/admin?offset=100");
+
+    // 非法 offset 是 400 错误页，而不是静默回到第一页。
+    let (status, headers, body) = app.send(page_get("/admin?offset=abc", "root", PASSWORD)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_html_error(status, &headers, &body_text(body));
 }
 
 #[tokio::test]

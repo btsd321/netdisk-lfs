@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use super::error::ApiError;
 use super::html::{escape_html, html_response, page_shell, parse_form};
 use super::{
-    ACCOUNTS_NOT_CONFIGURED_MESSAGE, AppState, RequestId, config_username, json_with_status,
-    passwords,
+    ACCOUNTS_NOT_CONFIGURED_MESSAGE, ACCOUNTS_UNAVAILABLE_MESSAGE, AppState, RequestId,
+    config_username, json_with_status, passwords,
 };
 use crate::accounts::{UserStatus, validate_password, validate_username};
 use crate::config::RegistrationPolicy;
@@ -250,7 +250,7 @@ async fn register(
         Ok(None) => {},
         Err(error) => {
             tracing::error!(username = %payload.username, error = %error, "注册时查询账户库失败");
-            return Err(ApiError::Unavailable(ACCOUNTS_NOT_CONFIGURED_MESSAGE.to_owned()));
+            return Err(ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned()));
         },
     }
 
@@ -283,7 +283,7 @@ async fn register(
         },
         Err(error) => {
             tracing::error!(username = %payload.username, error = %error, "写入新账户失败");
-            Err(ApiError::Internal("创建账户失败".to_owned()))
+            Err(ApiError::Unavailable(ACCOUNTS_UNAVAILABLE_MESSAGE.to_owned()))
         },
     }
 }
