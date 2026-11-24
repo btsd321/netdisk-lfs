@@ -271,17 +271,60 @@ pub(crate) fn json_response<T: Serialize>(value: &T, request_id: &RequestId) -> 
     }
 }
 
-/// 对象内容端点（PUT 上传 / GET 下载）的相对路径。
+/// action URL 的基地址：优先配置的 `public_base`，否则按请求头推导。
+///
+/// **git-lfs 3.4.1 实测拒绝相对 href**（报 `missing protocol: "/lfs/objects/..."`），
+/// 所以 batch 必须下发绝对 URL。反代场景要求代理透传 `Host` 与
+/// `X-Forwarded-Proto`（Caddy 的 reverse_proxy 默认会传）；`public_base` 非空时
+/// 直接用它，适合反代改写了主机名或端口的情形。
+pub(crate) fn action_base(config: &Config, headers: &axum::http::HeaderMap) -> String {
+    let configured = config.server.public_base.trim_end_matches('/');
+    if !configured.is_empty() {
+        return configured.to_owned();
+    }
+    // scheme 大小写不敏感（RFC 3986 §3.1），代理可能发 "HTTPS"/"Https"；
+    // 逗号列表取第一个（多级代理会追加）。
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').next().unwrap_or(value).trim())
+        .filter(|value| value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https"))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "http".to_owned());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback_authority(config));
+    format!("{proto}://{host}")
+}
+
+/// 没有 Host 头时的兜底 authority：取监听地址，至少要带端口。
+///
+/// 监听在通配地址（0.0.0.0 / [::]）时换成本机回环——`0.0.0.0:9001` 作为 URL 主机
+/// 不可连接，而回环在直连场景下至少可达。
+fn fallback_authority(config: &Config) -> String {
+    let listen = config.server.listen;
+    if listen.ip().is_unspecified() {
+        format!("127.0.0.1:{}", listen.port())
+    } else {
+        listen.to_string()
+    }
+}
+
+/// 对象内容端点（PUT 上传 / GET 下载）的绝对 URL。
 ///
 /// batch 下发的 `href` 与 transfer 注册的路由必须同源，否则客户端会拿着一个
 /// 本服务没有的地址去传输。两个助手集中在本模块，路由装配与 batch 协商都从这里取。
-pub(crate) fn object_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}")
+pub(crate) fn object_href(base: &str, oid: &Oid) -> String {
+    format!("{base}/lfs/objects/{oid}")
 }
 
-/// 上传后校验端点的相对路径。
-pub(crate) fn verify_href(oid: &Oid) -> String {
-    format!("/lfs/objects/{oid}/verify")
+/// 上传后校验端点的绝对 URL。
+pub(crate) fn verify_href(base: &str, oid: &Oid) -> String {
+    format!("{base}/lfs/objects/{oid}/verify")
 }
 
 /// 为每个请求建 span，记录状态码与耗时，并回写 `x-request-id`。
@@ -332,12 +375,97 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{
-        OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, object_href, outcome_for_status, verify_href,
+        OUTCOME_FAILED, OUTCOME_OK, OUTCOME_REJECTED, action_base, object_href, outcome_for_status,
+        verify_href,
     };
+    use crate::config::{AuthConfig, CacheConfig, Config, RuntimeEnv, ServerConfig, StorageConfig};
     use crate::store::Oid;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn test_config(public_base: &str, listen: &str) -> Config {
+        Config {
+            server: ServerConfig {
+                listen: listen.parse().expect("合法监听地址"),
+                public_base: public_base.to_owned(),
+            },
+            storage: StorageConfig {
+                objects_root: "/apps/bdpan/lfs".to_owned(),
+                tmp_root: "/apps/bdpan/lfs/tmp".to_owned(),
+                bdpan_bin: "/bin/true".into(),
+                max_object_bytes: 1024,
+                max_bdpan_procs: 1,
+            },
+            cache: CacheConfig { dir: std::env::temp_dir(), max_bytes: 0 },
+            auth: AuthConfig::default(),
+            runtime_env: RuntimeEnv::Dev,
+            data_dir: None,
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("头名合法"),
+                HeaderValue::from_str(value).expect("头值合法"),
+            );
+        }
+        map
+    }
 
     fn oid() -> Oid {
         Oid::parse(&"0123456789abcdef".repeat(4)).expect("合法 oid")
+    }
+
+    #[test]
+    fn given_headers_when_action_base_then_derivation_edges_covered() {
+        // public_base 优先，并去掉尾斜杠。
+        assert_eq!(
+            action_base(
+                &test_config("https://lfs.example.com/", "127.0.0.1:9001"),
+                &HeaderMap::new()
+            ),
+            "https://lfs.example.com"
+        );
+        // 只有 Host：默认 http。
+        assert_eq!(
+            action_base(&test_config("", "127.0.0.1:9001"), &headers(&[("host", "lfs.test")])),
+            "http://lfs.test"
+        );
+        // scheme 大小写不敏感（RFC 3986），代理可能发 HTTPS/Https。
+        assert_eq!(
+            action_base(
+                &test_config("", "127.0.0.1:9001"),
+                &headers(&[("host", "lfs.test"), ("x-forwarded-proto", "HTTPS")])
+            ),
+            "https://lfs.test"
+        );
+        // 多级代理的逗号列表取第一个有效值。
+        assert_eq!(
+            action_base(
+                &test_config("", "127.0.0.1:9001"),
+                &headers(&[("host", "lfs.test"), ("x-forwarded-proto", "https, http")])
+            ),
+            "https://lfs.test"
+        );
+        // 不认识的 scheme 回退 http，不把错误值塞进 URL。
+        assert_eq!(
+            action_base(
+                &test_config("", "127.0.0.1:9001"),
+                &headers(&[("host", "lfs.test"), ("x-forwarded-proto", "h2")])
+            ),
+            "http://lfs.test"
+        );
+        // 没有 Host：用监听地址兜底，且必须带端口（直接本机访问可达）。
+        assert_eq!(
+            action_base(&test_config("", "127.0.0.1:9001"), &HeaderMap::new()),
+            "http://127.0.0.1:9001"
+        );
+        // 监听通配地址时换环回，0.0.0.0 作为 URL 主机不可连接。
+        assert_eq!(
+            action_base(&test_config("", "0.0.0.0:9001"), &HeaderMap::new()),
+            "http://127.0.0.1:9001"
+        );
     }
 
     #[test]
@@ -349,20 +477,23 @@ mod tests {
     }
 
     #[test]
-    fn given_oid_when_hrefs_then_relative_paths() {
+    fn given_base_when_hrefs_then_absolute_urls() {
         let oid = oid();
+        let base = "http://127.0.0.1:9001";
 
-        assert_eq!(object_href(&oid), format!("/lfs/objects/{oid}"));
-        assert_eq!(verify_href(&oid), format!("/lfs/objects/{oid}/verify"));
-        assert!(object_href(&oid).starts_with('/'), "href 必须是相对路径");
+        assert_eq!(object_href(base, &oid), format!("{base}/lfs/objects/{oid}"));
+        assert_eq!(verify_href(base, &oid), format!("{base}/lfs/objects/{oid}/verify"));
+        // git-lfs 3.4.1 拒绝相对 href（missing protocol），必须带 scheme。
+        assert!(object_href(base, &oid).starts_with("http://"));
     }
 
     #[test]
     fn given_uppercase_oid_when_href_then_normalized_lowercase() {
         let raw = "ABCDEF01".repeat(8);
         let oid = Oid::parse(&raw).expect("合法 oid");
+        let base = "https://lfs.example.com";
 
-        assert_eq!(object_href(&oid), format!("/lfs/objects/{}", raw.to_lowercase()));
-        assert!(verify_href(&oid).ends_with("/verify"));
+        assert_eq!(object_href(base, &oid), format!("{base}/lfs/objects/{}", raw.to_lowercase()));
+        assert!(verify_href(base, &oid).ends_with("/verify"));
     }
 }

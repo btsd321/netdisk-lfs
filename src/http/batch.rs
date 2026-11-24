@@ -4,7 +4,8 @@
 //!
 //! - 单个对象的错误写进 `objects[].error`，HTTP 仍是 200；只有整体失败
 //!   （请求体非法、批次超限、`bdpan` 失败）才用 4xx/5xx；
-//! - `href` 一律返回**相对路径**，由客户端按请求 URL 解析，避免反代后主机名错乱。
+//! - `href` 必须是**绝对 URL**（git-lfs 3.4.1 拒绝相对路径，实测报 `missing protocol`）：
+//!   优先用 `server.public_base`，为空时按请求的 `Host` 与 `X-Forwarded-Proto` 推导。
 //!
 //! 上传协商只在对象不存在时给 `upload` action；已存在则不给（客户端据此跳过传输），
 //! 但附带 `verify` 让客户端补一次校验。
@@ -21,7 +22,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use super::error::ApiError;
-use super::{AppState, RequestId, json_response, object_href, verify_href};
+use super::{AppState, RequestId, action_base, json_response, object_href, verify_href};
 use crate::config::Role;
 use crate::store::{ObjectMeta, Oid, StoreError};
 
@@ -98,6 +99,7 @@ pub(crate) async fn handle(
     State(state): State<AppState>,
     Extension(role): Extension<Role>,
     Extension(request_id): Extension<RequestId>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
@@ -107,7 +109,10 @@ pub(crate) async fn handle(
         objects = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
     );
-    let outcome = negotiate(&state, role, &request_id, &body).instrument(span.clone()).await;
+    // git-lfs 要求 action href 是绝对 URL（相对路径会被拒），基地址优先取
+    // `server.public_base`，否则按 Host / X-Forwarded-Proto 推导。
+    let base = action_base(state.config(), &headers);
+    let outcome = negotiate(&state, role, &request_id, &base, &body).instrument(span.clone()).await;
     span.record("duration_ms", started.elapsed().as_secs_f64() * 1_000.0);
     let response = match outcome {
         Ok(response) => json_response(&response, &request_id),
@@ -124,6 +129,7 @@ async fn negotiate(
     state: &AppState,
     role: Role,
     request_id: &RequestId,
+    base: &str,
     body: &[u8],
 ) -> Result<BatchResponse, ApiError> {
     let request: BatchRequest = serde_json::from_slice(body)
@@ -218,12 +224,14 @@ async fn negotiate(
         // 存储层返回的对象大小是服务端权威值：客户端声明的 size 可能来自过期的
         // pointer 文件，不能原样回显——客户端用它当下载预期大小。
         let response = match (operation, existing) {
-            (Operation::Download, Some(meta)) => ObjectResponse::for_download(oid, meta.size),
+            (Operation::Download, Some(meta)) => ObjectResponse::for_download(base, oid, meta.size),
             (Operation::Download, None) => {
                 ObjectResponse::with_error(oid, *size, 404, "object not found".to_owned())
             },
-            (Operation::Upload, Some(meta)) => ObjectResponse::for_existing_upload(oid, meta.size),
-            (Operation::Upload, None) => ObjectResponse::for_upload(oid, *size),
+            (Operation::Upload, Some(meta)) => {
+                ObjectResponse::for_existing_upload(base, oid, meta.size)
+            },
+            (Operation::Upload, None) => ObjectResponse::for_upload(base, oid, *size),
         };
         objects.push(response);
     }
@@ -267,10 +275,10 @@ impl ObjectResponse {
     }
 
     /// 可下载：给 `download` action，`header` 按 api.md 显式回空对象。
-    fn for_download(oid: &Oid, size: u64) -> Self {
+    fn for_download(base: &str, oid: &Oid, size: u64) -> Self {
         Self {
             actions: Some(Actions {
-                download: Some(Action::new(object_href(oid), Some(BTreeMap::new()))),
+                download: Some(Action::new(object_href(base, oid), Some(BTreeMap::new()))),
                 ..Actions::default()
             }),
             ..Self::new(oid, size)
@@ -278,13 +286,13 @@ impl ObjectResponse {
     }
 
     /// 需要上传：给 `upload` 与 `verify`，前者声明 `Content-Type`。
-    fn for_upload(oid: &Oid, size: u64) -> Self {
+    fn for_upload(base: &str, oid: &Oid, size: u64) -> Self {
         let mut header = BTreeMap::new();
         header.insert("Content-Type".to_owned(), "application/octet-stream".to_owned());
         Self {
             actions: Some(Actions {
-                upload: Some(Action::new(object_href(oid), Some(header))),
-                verify: Some(Action::new(verify_href(oid), None)),
+                upload: Some(Action::new(object_href(base, oid), Some(header))),
+                verify: Some(Action::new(verify_href(base, oid), None)),
                 ..Actions::default()
             }),
             ..Self::new(oid, size)
@@ -292,10 +300,10 @@ impl ObjectResponse {
     }
 
     /// 已存在：不给 `upload`（客户端据此跳过传输），只给 `verify` 供补校验。
-    fn for_existing_upload(oid: &Oid, size: u64) -> Self {
+    fn for_existing_upload(base: &str, oid: &Oid, size: u64) -> Self {
         Self {
             actions: Some(Actions {
-                verify: Some(Action::new(verify_href(oid), None)),
+                verify: Some(Action::new(verify_href(base, oid), None)),
                 ..Actions::default()
             }),
             ..Self::new(oid, size)
@@ -320,7 +328,7 @@ struct Actions {
 /// 一个 action 的目标与附加请求头。
 #[derive(Debug, Serialize)]
 struct Action {
-    /// 相对路径，由客户端按请求 URL 解析。
+    /// 绝对 URL（含 scheme 与 authority），由 [`super::action_base`] 拼出。
     href: String,
     /// 客户端调用该 action 时要带的头；`None` 时整个字段省略（verify 即如此）。
     #[serde(skip_serializing_if = "Option::is_none")]
