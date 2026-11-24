@@ -15,8 +15,17 @@ pub(crate) fn init(runtime_env: RuntimeEnv) -> Result<(), tracing_subscriber::ut
         RuntimeEnv::Dev => "netdisk_lfs=debug,info",
         RuntimeEnv::Prod => "netdisk_lfs=info,warn",
     };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(err) => {
+            // RUST_LOG 确有设置但解析失败（如 netdisk_lfs=deubg）时提醒运维：
+            // 此处日志尚未安装，静默回退会让调级失效无从察觉。
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("RUST_LOG 解析失败（{err}），回退默认级别 {default_filter}");
+            }
+            EnvFilter::new(default_filter)
+        },
+    };
     let registry = tracing_subscriber::registry().with(filter);
 
     match runtime_env {

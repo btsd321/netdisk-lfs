@@ -18,7 +18,9 @@ impl TempDir {
     pub(crate) fn new(prefix: &str) -> Self {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("{prefix}-{}-{seq}", std::process::id()));
-        fs::create_dir_all(&path).expect("创建临时目录");
+        // 独占创建：路径唯一是构造出来的约定，碰撞（同 PID 复用 + 上次残留）
+        // 应当响亮失败而不是静默复用旧目录。
+        fs::create_dir(&path).expect("创建临时目录");
         Self { path }
     }
 

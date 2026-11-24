@@ -48,9 +48,18 @@ impl Config {
         let storage = StorageConfig {
             objects_root: validate_remote_root(&storage.objects_root, "storage.objects_root")?,
             tmp_root: validate_remote_root(&storage.tmp_root, "storage.tmp_root")?,
-            bdpan_bin: env.path(env::BDPAN_BIN).or(storage.bdpan_bin).ok_or_else(|| {
-                ConfigError::invalid("缺少 storage.bdpan_bin，且未设置 BDPAN_BIN")
-            })?,
+            bdpan_bin: {
+                let path = env.path(env::BDPAN_BIN).or(storage.bdpan_bin).ok_or_else(|| {
+                    ConfigError::invalid("缺少 storage.bdpan_bin，且未设置 BDPAN_BIN")
+                })?;
+                if !path.is_absolute() {
+                    return Err(ConfigError::invalid(format!(
+                        "storage.bdpan_bin 必须是绝对路径，实际为 {}",
+                        path.display()
+                    )));
+                }
+                path
+            },
             max_object_bytes: storage.max_object_bytes,
             max_bdpan_procs: storage.max_bdpan_procs,
         };
@@ -102,6 +111,14 @@ impl Config {
             return Err(ConfigError::invalid("cache.max_bytes 必须大于 0"));
         }
         for (name, user) in &self.auth.users {
+            if name.is_empty() {
+                return Err(ConfigError::invalid("auth.users 的用户名不能为空"));
+            }
+            if name.contains(':') {
+                return Err(ConfigError::invalid(format!(
+                    "auth.users 用户名 {name} 不允许包含 ':'，否则 Basic Auth 的 user:password 拆分有歧义"
+                )));
+            }
             if user.password_sha256.is_empty() {
                 return Err(ConfigError::invalid(format!(
                     "auth.users.{name}.password_sha256 不能为空"
@@ -113,10 +130,18 @@ impl Config {
 }
 
 /// 去掉尾部 `/` 并拒绝空路径；网盘路径统一成不带尾斜杠的形式，便于后续拼接。
+///
+/// 同时拒绝 `.` / `..` 路径段：后续会在 root 下拼接对象子路径再交给 bdpan，
+/// 词法逃逸（如 `/apps/bdpan/../etc`）必须在这里拦截。
 fn validate_remote_root(raw: &str, key: &str) -> Result<String, ConfigError> {
     let trimmed = raw.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(ConfigError::invalid(format!("{key} 不能为空")));
+    }
+    if trimmed.split('/').any(|segment| segment == "." || segment == "..") {
+        return Err(ConfigError::invalid(format!(
+            "{key} 不允许包含 . 或 .. 路径段，实际为 {trimmed}"
+        )));
     }
     Ok(trimmed.to_owned())
 }
@@ -366,6 +391,40 @@ dir = "/var/lib/netdisk-lfs/cache"
         let message = load_error(&contents, &[]);
 
         assert!(message.contains("/apps/bdpan"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_dotdot_segment_in_remote_root_when_load_then_rejected() {
+        let contents = VALID_CONFIG.replace(
+            "objects_root = \"/apps/bdpan/lfs\"",
+            "objects_root = \"/apps/bdpan/lfs/../..\"",
+        );
+        let tmp = VALID_CONFIG.replace(
+            "tmp_root = \"/apps/bdpan/lfs/tmp\"",
+            "tmp_root = \"/apps/bdpan/lfs/tmp/../..\"",
+        );
+
+        assert!(load_error(&contents, &[]).contains("路径段"), "实际错误见上");
+        assert!(load_error(&tmp, &[]).contains("路径段"), "实际错误见上");
+    }
+
+    #[test]
+    fn given_relative_bdpan_bin_when_load_then_rejected() {
+        let contents =
+            VALID_CONFIG.replace("bdpan_bin = \"/usr/local/bin/bdpan\"", "bdpan_bin = \"bdpan\"");
+
+        let message = load_error(&contents, &[]);
+
+        assert!(message.contains("绝对路径"), "实际错误：{message}");
+    }
+
+    #[test]
+    fn given_empty_or_colon_username_when_load_then_rejected() {
+        let empty = VALID_CONFIG.replace("bob = { password_sha256", "\"\" = { password_sha256");
+        let colon = VALID_CONFIG.replace("bob = { password_sha256", "\"a:b\" = { password_sha256");
+
+        assert!(load_error(&empty, &[]).contains("用户名不能为空"), "实际错误见上");
+        assert!(load_error(&colon, &[]).contains("':'"), "实际错误见上");
     }
 
     #[test]

@@ -27,7 +27,11 @@ impl EnvSource {
     ///
     /// 只解析文件、不修改进程环境，避免全局副作用影响测试与后续库调用。
     pub(crate) fn load(dotenv_path: &Path) -> Result<Self, ConfigError> {
-        let mut vars: HashMap<String, String> = std::env::vars().collect();
+        // 跳过非 UTF-8 的环境变量：vars() 遇到它们会 panic，而本模块
+        // 只消费少量 ASCII 键，忽略个别异常项比未类型化的启动崩溃更可接受。
+        let mut vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
         for (key, value) in read_dotenv(dotenv_path)? {
             vars.entry(key).or_insert(value);
         }
@@ -83,16 +87,17 @@ mod tests {
 
     #[test]
     fn given_dotenv_with_comments_and_quotes_when_load_then_values_are_trimmed() {
+        // 用测试专用键名，避免断言受宿主进程环境（如 CI 导出的同名变量）影响。
         let dir = TempDir::new("netdisk-lfs-dotenv");
         let path = dir.write(
             ".env",
-            "# 本机数据目录\nNETDISK_LFS_DATA_DIR=\"/tmp/netdisk-lfs-data\"\nNETDISK_LFS_ENV=dev\n",
+            "# 本机数据目录\nNETDISK_LFS_TEST_TRIM_A=\"/tmp/netdisk-lfs-data\"\nNETDISK_LFS_TEST_TRIM_B=dev\n",
         );
 
         let env = EnvSource::load(&path).expect("加载 .env");
 
-        assert_eq!(env.get(NETDISK_LFS_DATA_DIR), Some("/tmp/netdisk-lfs-data"));
-        assert_eq!(env.get("NETDISK_LFS_ENV"), Some("dev"));
+        assert_eq!(env.get("NETDISK_LFS_TEST_TRIM_A"), Some("/tmp/netdisk-lfs-data"));
+        assert_eq!(env.get("NETDISK_LFS_TEST_TRIM_B"), Some("dev"));
     }
 
     #[test]
@@ -100,7 +105,7 @@ mod tests {
         let dir = TempDir::new("netdisk-lfs-dotenv-missing");
         let env = EnvSource::load(&dir.path().join(".env")).expect("缺失 .env 不报错");
 
-        assert_eq!(env.get(NETDISK_LFS_DATA_DIR), None);
+        assert_eq!(env.get("NETDISK_LFS_TEST_NEVER_SET"), None);
     }
 
     #[test]
