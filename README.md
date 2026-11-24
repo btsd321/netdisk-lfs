@@ -42,6 +42,8 @@ git lfs push --all origin main
   （system unit、`Restart=always`、只监听回环，对外一律经反向代理）
 - 配置样例：[config.toml.example](config.toml.example)
   （复制到 `/etc/netdisk-lfs/config.toml`，权限 `600`）
+- 一键脚本：[scripts/deploy.sh](scripts/deploy.sh) / [scripts/uninstall.sh](scripts/uninstall.sh)
+  （默认装到 `/opt/netdisk-lfs`；卸载默认保留配置与数据）
 - 观测端点：`GET /healthz`（无认证；`bdpan` 探活降级时回 **503**）、
   `GET /metrics`（Prometheus 文本，仅缓存维度）
 
