@@ -30,7 +30,14 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 日志可能尚未初始化，直接写 stderr，保证启动失败一定有输出。
+            // thiserror 的 Display 只含最外层信息，逐层展开 source 链才能
+            // 区分 EADDRINUSE / EACCES 这类根因。
             eprintln!("启动失败：{err}");
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                eprintln!("  原因：{cause}");
+                source = cause.source();
+            }
             ExitCode::FAILURE
         },
     }
@@ -97,6 +104,9 @@ async fn run(config: Config) -> Result<(), StartupError> {
 }
 
 /// Ctrl+C 与 SIGTERM 都触发优雅退出：停止接收新请求，等在途请求结束。
+///
+/// 信号源注册失败只降级为忽略该源，绝不让本 future 提前结束——
+/// `with_graceful_shutdown` 把返回视作停机指令，提前 resolve 等于误停机。
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -105,25 +115,28 @@ async fn shutdown_signal() {
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 tokio::select! {
-                    result = tokio::signal::ctrl_c() => log_ctrl_c(result),
+                    () = wait_ctrl_c() => {},
                     _ = sigterm.recv() => info!("收到 SIGTERM，开始优雅退出"),
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "监听 SIGTERM 失败，仅响应 Ctrl+C");
-                log_ctrl_c(tokio::signal::ctrl_c().await);
+                wait_ctrl_c().await;
             },
         }
     }
     #[cfg(not(unix))]
-    log_ctrl_c(tokio::signal::ctrl_c().await);
+    wait_ctrl_c().await;
 }
 
-/// 记录 Ctrl+C 的等待结果；信号注册失败不阻止进程继续服务。
-fn log_ctrl_c(result: std::io::Result<()>) {
-    match result {
+/// 等待 Ctrl+C；注册失败时保持 pending（忽略该信号源），避免误触发停机。
+async fn wait_ctrl_c() {
+    match tokio::signal::ctrl_c().await {
         Ok(()) => info!("收到 Ctrl+C，开始优雅退出"),
-        Err(err) => tracing::warn!(error = %err, "监听 Ctrl+C 失败"),
+        Err(err) => {
+            tracing::warn!(error = %err, "监听 Ctrl+C 失败，忽略该信号源");
+            std::future::pending::<()>().await;
+        },
     }
 }
 

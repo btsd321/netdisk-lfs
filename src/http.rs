@@ -61,12 +61,13 @@ async fn request_span(request: Request, next: Next) -> Response {
     response
 }
 
-/// 形如 `18f2c3a4b5e-0`：时间戳保证按时间有序，序号保证同毫秒内唯一。
+/// 形如 `0000018f2c3a4b5-00000042`：毫秒与序号都是定长十六进制，
+/// 同进程内字符串排序与生成顺序一致，可作日志关联键。
 fn next_request_id() -> String {
     let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0);
-    format!("{millis:x}-{seq:x}")
+    format!("{millis:012x}-{seq:08x}")
 }
